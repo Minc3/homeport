@@ -220,7 +220,8 @@ sudo ./deploy/uninstall.sh          # add --purge to drop the config and state
 
 It reverts the routing and nftables changes before it removes anything, and
 leaves the tunnels and the overlay address alone. [SETUP.md](deploy/SETUP.md)
-section 12 covers the ordering and what survives.
+section 13 covers the ordering and what survives; section 12 covers updating a
+host, which is the same install script run again.
 
 ## Building from source
 

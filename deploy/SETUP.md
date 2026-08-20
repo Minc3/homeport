@@ -895,7 +895,101 @@ disarm too.
 
 ---
 
-## 12. Taking it off a host
+## 12. Updating a host
+
+Re-run its install script. That is the upgrade path, and the scripts are
+written for it: an existing bootstrap file is left alone, so no arguments are
+needed on a re-run.
+
+```sh
+cd /path/to/homeport && git pull
+sudo ./deploy/install-frontend.sh          # on the datacentre box
+sudo ./deploy/install-backend.sh           # on the box at the house
+sudo ./deploy/install-linker.sh            # on each extra host, if any
+```
+
+No `--psk` the second time. Passing `--force-config` is the only way to rewrite
+the bootstrap file, and on the backend and a linker it then needs `--psk` with
+it, or the secret is blanked and the agent refuses to start.
+
+**Order does not matter here**, unlike a revert or an uninstall. Nothing is
+being taken down, and neither agent depends on the other's version: the probe
+packet is a fixed 66-byte format and the control frames are newline-delimited
+JSON, so a mixed pair works for as long as those hold. A host that is briefly
+missing is one the other end already knows how to survive.
+
+**Do not copy the binary over the running one.** Linux refuses to open a
+running executable for writing, which is why doing it by hand needs a
+`systemctl stop` first. The scripts install to `failover-backend.new` and `mv`
+it into place instead: a rename swaps the directory entry and leaves the
+running process on the old inode, so the service is only away for the restart
+itself. They also refresh the systemd unit and `daemon-reload`, which a
+hand-copy skips — a unit change in the commit would otherwise never land.
+
+**Where the binary comes from.** With a Go toolchain on the host the script
+builds from the working tree. Without one it uses the committed
+`build/failover-*`, which is why a box that only ever receives artefacts is a
+supported case. Those are refreshed with `make build linker` on a machine that
+does have Go, and committed alongside the change — including for portal work,
+because the CSS and JavaScript are embedded in the frontend binary and a
+source-only change never reaches a host installing from `build/`.
+
+From a workstation instead, without a clone on the host:
+
+```sh
+make test
+make deploy-frontend FRONTEND_HOST=root@dc.example.net
+make deploy-backend  BACKEND_HOST=root@home.example.net
+make deploy-linker   LINKER_HOST=root@gs1        # one host at a time
+```
+
+### What a restart costs
+
+**The frontend.** Probing stops for the second or two the process is away. The
+installed route and the nftables tables stay exactly as they are — the unit
+does not tear anything down on stop, deliberately, so traffic keeps flowing on
+whichever path was chosen. `decisionSeq` is seeded from the wall clock rather
+than reset, so the backend does not ignore the decisions of a restarted
+frontend as stale. The portal is unavailable for the same second or two.
+
+**The backend.** All three paths stop answering at once, which is not the same
+as one path failing: with no eligible path the selector keeps the last route
+rather than moving traffic, so an update cannot bump you onto LTE. What you
+will see is a "no usable path" alert and event, then the active path back
+within a few seconds and the standby paths reading `down` for up to a minute
+while they re-earn `RecoverThreshold` at the 5s standby cadence. Usage deltas
+buffered on disk survive the restart and are delivered afterwards.
+
+**A linker.** Nothing at all. Its overlay address, rule and route are left in
+place on stop, for the same reason the frontend's route is: removing them
+because the agent restarted would drop every session on that host.
+
+### Checking it took
+
+The portal header shows the running build of the frontend and the last one the
+backend reported, and each extra host's is on its card under **Extra hosts**.
+On a host itself:
+
+```sh
+failover-frontend -version
+failover-backend -version
+failover-linker -version
+failoverctl version
+```
+
+A version that has not moved means the binary was not replaced — most often
+`build/` was stale on a host with no Go toolchain, so the script installed the
+same file again.
+
+**There is nothing to migrate.** The configuration is one JSON blob in SQLite
+and the bootstrap files are not rewritten, so an update carries both across
+untouched. A build that adds settings finds them at their zero value in an old
+config and fills them in on load, which is `model.Normalise`'s job — you do not
+need to open Settings and save to pick up new defaults.
+
+---
+
+## 13. Taking it off a host
 
 `deploy/uninstall.sh` is the counterpart to the three install scripts, and it
 does what they did backwards: revert the system changes, stop and disable the

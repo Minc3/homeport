@@ -213,7 +213,9 @@ sudo ./deploy/install-backend.sh --psk <the value it printed>
 
 Both are safe to re-run — that is how you upgrade — and leave an existing
 bootstrap file alone unless `--force-config` is given. `--help` lists the
-overlay and portal address options.
+overlay and portal address options. [SETUP.md](deploy/SETUP.md) section 12
+covers updating: what a restart of each agent costs, and why replacing a binary
+by hand needs a `systemctl stop` while the script does not.
 
 To build on a workstation and push instead:
 
