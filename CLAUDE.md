@@ -860,7 +860,20 @@ is a reasonable hardening step and is documented as one.
 frontend it sets the FORWARD policy to drop, which discards DNAT'd traffic; the
 agent inserts exceptions into `DOCKER-USER` (`sysx.EnsureForwardExceptions`),
 matched by destination and connection state, never by source - a reply's source
-is rewritten back before the forward hook runs. On the backend a container on a
+is rewritten back before the forward hook runs.
+
+**The backend needs the same treatment the moment a linker exists behind it,
+and for a long time it did not have it.** Until then the backend terminated
+everything and forwarded nothing, so a drop-policy forward chain had nothing of
+its to drop. With a linker, every packet in both directions is forwarded
+through it, and on a backend that runs containers they were all dropped -
+routing correct on all three hosts, `ip route get` answering perfectly, and the
+linker's control channel timing out with nothing in any log.
+`sysx.EnsureOverlayForwardExceptions` accepts the overlay range in both
+directions, and both are needed: the request carries the linker's address as
+the destination and every answer carries it as the source. Nothing here is
+translated, which is why matching on source is right here and wrong on the
+frontend. Installed only where linkers are configured. On the backend a container on a
 bridge network defeats the source-based return rule, because the reply is
 routed while it still carries the container's address; `sysx.BuildReturnRuleset`
 marks connections arriving from a tunnel and restores the mark on replies only.

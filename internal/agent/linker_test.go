@@ -169,3 +169,45 @@ func TestNoOverlayLocalRuleWithoutASubnet(t *testing.T) {
 		}
 	}
 }
+
+// The backend forwards for a linker, and a box that runs containers has a
+// drop-policy forward chain waiting for it. This is the fault that made a
+// perfectly routed linker look dead: every packet crossed the FORWARD hook and
+// was dropped there, with nothing in any log and correct routing on every host.
+func TestLinkersInstallForwardExceptionsForTheOverlayRange(t *testing.T) {
+	kernel := backendKernel()
+	kernel["nft -a list chain ip filter DOCKER-USER"] = "table ip filter {\n chain DOCKER-USER {\n }\n}\n"
+
+	a, q := agentForReconcile(t, kernel)
+	cfg := a.cfg
+	cfg.Overlay.Subnet = "10.99.0.0/24"
+	cfg.Linkers = []proto.LinkerRoute{{OverlayIP: "10.99.0.3", LanIP: "10.1.1.4"}}
+
+	a.applyPlumbing(context.Background(), cfg)
+
+	if q.wrote("nft insert rule ip filter DOCKER-USER ip daddr 10.99.0.0/24 accept") != 1 {
+		t.Errorf("no forward exception for traffic to a linker; writes were %v", q.writes())
+	}
+	if q.wrote("nft insert rule ip filter DOCKER-USER ip saddr 10.99.0.0/24 accept") != 1 {
+		t.Errorf("no forward exception for traffic from a linker; writes were %v", q.writes())
+	}
+}
+
+// And a site with no linkers forwards nothing, so it must not touch a chain it
+// has no business in - the same invariant as the route above, one layer down.
+func TestNoLinkersTouchesNoForwardChain(t *testing.T) {
+	kernel := backendKernel()
+	kernel["nft -a list chain ip filter DOCKER-USER"] = "table ip filter {\n chain DOCKER-USER {\n }\n}\n"
+
+	a, q := agentForReconcile(t, kernel)
+	cfg := a.cfg
+	cfg.Linkers = nil
+
+	a.applyPlumbing(context.Background(), cfg)
+
+	for _, w := range q.writes() {
+		if strings.Contains(w, "DOCKER-USER") {
+			t.Errorf("a site with no linkers wrote to DOCKER-USER: %q", w)
+		}
+	}
+}

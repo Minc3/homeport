@@ -767,6 +767,18 @@ ip route replace default via 192.168.1.2 table 200
 Check them with `ip rule show | grep 10.99.0.3` and `ip route show table 200`,
 substituting the table number if this host uses another one.
 
+**If the backend runs Docker, check its forward policy.** `iptables -S FORWARD`
+showing `-P FORWARD DROP` is Docker's doing, and the backend now forwards every
+packet to and from this host. The agent inserts the two exceptions it needs
+into `DOCKER-USER` as soon as a linker is configured, so an up-to-date backend
+handles it; on an older one the symptom is this host being unreachable while
+`ip route get` answers correctly on all three machines, and the manual form is:
+
+```sh
+sudo nft insert rule ip filter DOCKER-USER ip daddr 10.99.0.0/24 accept
+sudo nft insert rule ip filter DOCKER-USER ip saddr 10.99.0.0/24 accept
+```
+
 There is no observe mode and none is needed. Only packets sourced from the
 overlay address match that rule, and nothing on the box uses that address unless
 a service was deliberately bound to it — so until something opts in, the rules

@@ -356,3 +356,52 @@ func TestEgressMarkIsClearOfEveryOtherMark(t *testing.T) {
 		seen[m.value] = m.name
 	}
 }
+
+// A host that forwards overlay traffic needs an exception in both directions,
+// and the backend is such a host the moment a linker exists behind it. Docker
+// leaves the FORWARD policy at drop, and a drop in another chain cannot be
+// rescued from ours, so the accepts go where Docker leaves room for them.
+func TestOverlayForwardExceptionsCoverBothDirections(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"nft -a list chain ip filter DOCKER-USER": "table ip filter {\n chain DOCKER-USER {\n }\n}\n",
+	}}
+	if err := EnsureOverlayForwardExceptions(context.Background(), f, "10.99.0.0/24"); err != nil {
+		t.Fatalf("EnsureOverlayForwardExceptions: %v", err)
+	}
+	// Published traffic arrives addressed to the linker; everything the linker
+	// sends carries its overlay address as the source. Matching one direction
+	// only lets the request through and drops the answer.
+	if !f.ran(`nft insert rule ip filter DOCKER-USER ip daddr 10.99.0.0/24 accept comment "failover_overlay"`) {
+		t.Errorf("no accept for traffic to the overlay range: %v", f.calls)
+	}
+	if !f.ran(`nft insert rule ip filter DOCKER-USER ip saddr 10.99.0.0/24 accept comment "failover_overlay"`) {
+		t.Errorf("no accept for traffic from the overlay range: %v", f.calls)
+	}
+}
+
+// Its own comment, or removing one feature's rules would take another's with
+// them - and each of the three is removable on its own by design.
+func TestOverlayForwardCommentIsDistinct(t *testing.T) {
+	for _, other := range []string{forwardComment, egressForwardComment} {
+		if strings.Contains(commentNeedle(overlayForwardComment), commentNeedle(other)) ||
+			strings.Contains(commentNeedle(other), commentNeedle(overlayForwardComment)) {
+			t.Errorf("comment %q collides with %q", overlayForwardComment, other)
+		}
+	}
+}
+
+// No chain, no rules, no error: a host without Docker has nothing to work
+// around and must issue nothing at all.
+func TestOverlayForwardExceptionsSkipWhenNoDockerChain(t *testing.T) {
+	f := &fakeRunner{fail: map[string]string{
+		"nft -a list chain ip filter DOCKER-USER": "No such file or directory",
+	}}
+	if err := EnsureOverlayForwardExceptions(context.Background(), f, "10.99.0.0/24"); err != nil {
+		t.Fatalf("a host with no DOCKER-USER chain must not error: %v", err)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "insert rule") {
+			t.Errorf("inserted a rule into a chain that does not exist: %s", c)
+		}
+	}
+}

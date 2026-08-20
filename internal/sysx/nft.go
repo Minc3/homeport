@@ -304,6 +304,12 @@ func RemoveReturnRuleset(ctx context.Context, r Runner) {
 // own, so it can find them again to remove them.
 const forwardComment = "failover"
 
+// overlayForwardComment marks the exceptions a host needs when it *forwards*
+// overlay traffic rather than terminating it - the backend, once there are
+// linkers behind it. Distinct from the other two so each feature's rules can
+// be found and removed on their own.
+const overlayForwardComment = "failover_overlay"
+
 // egressForwardComment marks the exception for backend-originated traffic, so
 // that toggling that feature off leaves the published exceptions in place.
 const egressForwardComment = "failover_egress"
@@ -367,6 +373,64 @@ func EnsureForwardExceptions(ctx context.Context, r Runner, dataPrefix string) e
 		}
 	}
 	return nil
+}
+
+// EnsureOverlayForwardExceptions lets overlay traffic cross a host that routes
+// it onward, when something else owns a drop-policy forward chain.
+//
+// The backend terminated everything until linkers existed, so it never
+// forwarded a packet and never needed this. With a linker behind it, every
+// packet in both directions is forwarded: in on a tunnel and out to the LAN
+// for published traffic, in on the LAN and out a tunnel for the linker's own
+// control channel and egress. Docker sets the filter table's FORWARD policy to
+// drop, and an accept in the agent's own table cannot rescue a packet another
+// chain drops, so the exceptions go in the chain Docker leaves for the purpose.
+//
+// Both directions, unlike the frontend's, and that difference is the point: on
+// the frontend a reply's source is rewritten back to the public address before
+// the forward hook sees it, so a source match never fires. Nothing is
+// translated here. The overlay address is on the packet in both directions,
+// which is what makes matching it precise rather than broad - that range
+// carries this system's traffic and nothing else.
+//
+// Does nothing when no such chain exists, which is the common case, and the
+// caller does nothing at all unless linkers are configured.
+func EnsureOverlayForwardExceptions(ctx context.Context, r Runner, overlayPrefix string) error {
+	if overlayPrefix == "" {
+		return nil
+	}
+	existing, err := r.Run(ctx, "nft", "-a", "list", "chain", "ip", "filter", DockerUserChain)
+	if err != nil {
+		return nil // no Docker, nothing to work around
+	}
+
+	// Against the prefix rather than the comment alone, for the reason the
+	// frontend's does: a subnet set later widens this, and a rule pinned to the
+	// old prefix would drop exactly the traffic the change was made to carry.
+	dropStaleForwardRules(ctx, r, existing, overlayForwardComment, "daddr", overlayPrefix)
+	dropStaleForwardRules(ctx, r, existing, overlayForwardComment, "saddr", overlayPrefix)
+
+	rules := [][]string{
+		{"ip", "daddr", overlayPrefix, "accept"},
+		{"ip", "saddr", overlayPrefix, "accept"},
+	}
+	for _, rule := range rules {
+		if hasForwardRule(existing, overlayForwardComment, rule) {
+			continue
+		}
+		args := append([]string{"insert", "rule", "ip", "filter", DockerUserChain}, rule...)
+		args = append(args, "comment", fmt.Sprintf("%q", overlayForwardComment))
+		if _, err := r.Run(ctx, "nft", args...); err != nil {
+			return fmt.Errorf("insert overlay forward exception: %w", err)
+		}
+	}
+	return nil
+}
+
+// RemoveOverlayForwardExceptions withdraws them, by comment, leaving every
+// other rule in a chain the agent does not own alone.
+func RemoveOverlayForwardExceptions(ctx context.Context, r Runner) {
+	removeCommentedForwardRules(ctx, r, overlayForwardComment)
 }
 
 // hasForwardRule reports whether a chain listing already carries this exact

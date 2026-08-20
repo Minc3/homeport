@@ -246,6 +246,26 @@ func (a *Agent) applyPlumbing(ctx context.Context, cfg proto.BackendConfig) {
 	// unless the frontend's DNAT points at them, and that is gated by the
 	// frontend's own mode. Having the route already in place is what makes
 	// arming take effect immediately rather than a reconcile tick later.
+	// ...and permission to forward to them at all. This host terminated
+	// everything until linkers existed, so a drop-policy forward chain - which
+	// is what Docker leaves behind on a box that runs containers - had nothing
+	// of ours to drop. Now it has: every packet to or from a linker crosses
+	// this host's FORWARD hook, and a drop there is a timeout, which reads as
+	// the far host being down.
+	//
+	// Installed for real in observe mode, like the rest of the plumbing above:
+	// an accept moves no traffic on its own, and without it the linker's
+	// control channel cannot come up to be observed. Only when there are
+	// linkers, so a site with none issues nothing - invariant 19.
+	if len(cfg.Linkers) > 0 {
+		// The subnet, which a site with linkers always has: the portal refuses a
+		// linker row without one, because the frontend could not route to it.
+		if err := sysx.EnsureOverlayForwardExceptions(ctx, real, cfg.Overlay.Subnet); err != nil {
+			a.log.Warn("forward exceptions for the overlay range not installed; "+
+				"traffic to and from extra hosts will be dropped by the forward policy", "err", err)
+		}
+	}
+
 	for _, l := range cfg.Linkers {
 		if err := sysx.EnsureLinkerHostRoute(ctx, real, l.OverlayIP, l.LanIP); err != nil {
 			a.log.Error("cannot install the route to a linker; anything published there will time out with nothing in any log",
@@ -732,6 +752,10 @@ func (a *Agent) Revert(ctx context.Context) {
 	for _, l := range cfg.Linkers {
 		sysx.RemoveLinkerHostRoute(ctx, r, l.OverlayIP)
 	}
+	// By comment, so an operator's own rules in a chain this agent does not own
+	// are untouched. A site with no linkers never had them, and the listing then
+	// carries nothing of ours to find.
+	sysx.RemoveOverlayForwardExceptions(ctx, r)
 
 	// Both sources, because both were installed: the backend's own address
 	// always, and the overlay range wherever a subnet is configured.
