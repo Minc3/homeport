@@ -189,6 +189,10 @@ receives its configuration over the control channel and caches it locally.
   and policy routes its own agent installed. WireGuard tunnels are untouched,
   because the agent never created them, and so is the overlay address, because
   something may still be bound to it.
+- **Uninstall is the same order**: `sudo ./deploy/uninstall.sh` on each host,
+  frontend first. It reverts before it removes anything, and stops rather than
+  strand rules the binary it is about to delete is the only thing that can take
+  down.
 
 ## Build and install
 
@@ -236,6 +240,24 @@ generated portal password to the journal, exactly once:
 ```sh
 journalctl -u failover-frontend | grep 'portal account created'
 ```
+
+## Uninstall
+
+One script for all three roles, which it works out from what is installed:
+
+```sh
+sudo ./deploy/uninstall.sh                 # revert, stop, remove the binaries
+sudo ./deploy/uninstall.sh --purge         # ... and the config and state
+```
+
+Run it on the frontend first, then the backend, then any linkers — the ordering
+in [SETUP.md](deploy/SETUP.md) section 8, for the same reason. It reverts while
+the agent is still installed and refuses to go further if that fails, since the
+binary is the only thing that knows which rules and priorities are this
+system's. The bootstrap file and the state directory survive unless `--purge` is
+given, and `--purge` copies the database aside first, because the usage ledger
+in it cannot be recreated. WireGuard is never touched, and neither is the
+overlay address unless `--overlay` says so.
 
 **Before any of this, read [deploy/SETUP.md](deploy/SETUP.md).** The agents
 assume the WireGuard tunnels and pfSense policy routing are already correct,

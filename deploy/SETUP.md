@@ -871,3 +871,68 @@ invariant 13 behaving correctly. Run `failoverctl revert` before wiping if you
 want a genuinely bare frontend to test against, and `failover-backend -revert`
 on the backend for the same reason: its reply rules and marking table survive a
 disarm too.
+
+---
+
+## 12. Taking it off a host
+
+`deploy/uninstall.sh` is the counterpart to the three install scripts, and it
+does what they did backwards: revert the system changes, stop and disable the
+unit, remove the unit file and the binaries, and — only when asked — remove the
+bootstrap file and the state directory. It works out which agent this host runs
+from what is installed, and refuses to guess if there are two.
+
+```sh
+sudo ./deploy/uninstall.sh              # on the frontend
+sudo ./deploy/uninstall.sh              # then the backend
+sudo ./deploy/uninstall.sh              # then each linker
+```
+
+**That order, for the reason in section 8.** Taking the backend's reply path
+down while the frontend is still armed and DNATing breaks every published
+service on the spot: the requests keep arriving down the tunnel and the replies
+leave by the LAN to pfSense, where the client's flow has no state. The script
+prints the reminder on the frontend and asks before it does anything, and
+`--yes` skips the question for a scripted run.
+
+It needs nothing from the repository, so a copy of the file is enough on a host
+where the clone is already gone.
+
+**What it keeps by default.** The bootstrap file and the state directory, so a
+reinstall picks up the same shared secret and, on the frontend, the same
+configuration and usage ledger. `--purge` removes both, copying
+`failover.db` to `/root/failover.db.<timestamp>.bak` on the way past — the
+ledger is the part that cannot be recreated, and losing it mid-period tells both
+LTE paths they have a full month of headroom. `--no-backup` if you mean it.
+
+**What it never touches.** WireGuard, on any host and with any flag: the agents
+did not create the tunnels and nothing in the script reads `/etc/wireguard`.
+Nor routing tables that belong to the host — a revert deletes the entries this
+system installed, by the priority it found them at, and never flushes a table,
+so a box that already policy-routes keeps its own rules in 100, 200 and 101-103.
+
+**The overlay address stays too**, for the same reason `revert` leaves it: a
+service may still be bound to it. `--overlay` removes it, and removes `dummy0`
+with it only if nothing else is on the device.
+
+**It stops rather than strand rules.** The revert runs first, while the agent is
+still installed, because the binary is the only thing that knows which rules,
+routes and priorities belong to this system. If it fails — a crashed frontend
+with no control socket, a missing bootstrap file — nothing is removed and the
+script says how to finish the revert by hand. `--force` accepts the leftovers
+and continues, and prints what is still on the host.
+
+A stopped frontend is not itself a problem: the revert goes over the local
+control socket, so the script starts the unit for the purpose and stops it
+again. That installs nothing new — an armed agent's rules are on the host
+whether the process is running or not.
+
+**Doing it by hand** is four steps, and the script exists because the first one
+is easy to skip:
+
+```sh
+failoverctl revert                       # or failover-{backend,linker} -revert
+systemctl disable --now failover-frontend
+rm /etc/systemd/system/failover-frontend.service && systemctl daemon-reload
+rm /usr/local/bin/failover-frontend /usr/local/bin/failoverctl
+```

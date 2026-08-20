@@ -212,6 +212,16 @@ Both start in **observe mode**: they probe, decide and log, and change nothing
 until you arm them from the portal. Both are safe to re-run, which is how you
 upgrade.
 
+Taking it off again is one script per host, frontend first:
+
+```sh
+sudo ./deploy/uninstall.sh          # add --purge to drop the config and state
+```
+
+It reverts the routing and nftables changes before it removes anything, and
+leaves the tunnels and the overlay address alone. [SETUP.md](deploy/SETUP.md)
+section 12 covers the ordering and what survives.
+
 ## Building from source
 
 To build you need **Go 1.25 or newer** and `git`. Debian 13 ships `golang-go`
