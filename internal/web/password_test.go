@@ -20,7 +20,7 @@ func passwordServer(t *testing.T) *Server {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	s := New(nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(nil, st, slog.New(slog.NewTextHandler(io.Discard, nil)), "test-psk")
 	if err := st.CreateUser("admin", "first-run-password"); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}

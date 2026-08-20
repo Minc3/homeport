@@ -723,14 +723,26 @@ Each extra host runs `failover-linker`. It holds the overlay address, routes
 anything sent from it to the backend, and does nothing else — no tunnels, no
 probes, no decisions.
 
+**Take the command from the portal.** Save the row first (next section), then
+expand **Set up &lt;name&gt;** underneath the Linkers table: it prints this
+host's install command with every value already in it — the shared secret, the
+overlay address, the backend's LAN address, the subnet and the routing table —
+and the `/etc/failover/linker.json` it would write, for a host with no clone of
+the repo on it. Both carry the real secret, so they are worth reading before
+they are pasted anywhere.
+
+By hand it is:
+
 ```sh
 sudo ./deploy/install-linker.sh --psk <the frontend's psk> \
-     --overlay-ip 10.99.0.3 --backend-lan 192.168.1.2
+     --overlay-ip 10.99.0.3 --backend-lan 192.168.1.2 \
+     --subnet 10.99.0.0/24 --table 200
 ```
 
-Or paste the config the portal generated for this host into
-`/etc/failover/linker.json` and start the unit — the installer is doing the same
-thing with a little more checking.
+`--subnet` defaults to the /24 the overlay addresses sit in and `--table` to
+200, so both can be left out on a stock site. Set `--table` when this box
+already policy-routes — a second ISP, a VPN — and give it the same number as the
+row in the portal.
 
 `--backend-lan` is the backend's address on **this** network, not its overlay
 address: overlay traffic reaches the backend as a neighbour on the LAN, and the
@@ -745,7 +757,8 @@ ip rule  add from 10.99.0.3 lookup 200
 ip route replace default via 192.168.1.2 table 200
 ```
 
-Check them with `ip rule show | grep 10.99.0.3` and `ip route show table 200`.
+Check them with `ip rule show | grep 10.99.0.3` and `ip route show table 200`,
+substituting the table number if this host uses another one.
 
 There is no observe mode and none is needed. Only packets sourced from the
 overlay address match that rule, and nothing on the box uses that address unless

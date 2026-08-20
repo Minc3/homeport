@@ -38,6 +38,14 @@ BACKEND_IP=10.99.0.2
 # gets a range that contains them rather than the shipped one that would not.
 SUBNET=""
 SUBNET_GIVEN=0
+# The routing table this host uses for overlay traffic. It belongs to this
+# machine's own namespace, not to this system, so it is a real setting rather
+# than a constant: the first deployment landed on a box already using 200 for
+# its second ISP and the agent wrote its default route straight over that
+# host's. It must match the Table column in the portal's linker row - the rule
+# it names is what carries the control channel, so the agent needs the value
+# before it can be told anything.
+TABLE=200
 FORCE_CONFIG=0
 START=1
 
@@ -60,6 +68,11 @@ usage: sudo $0 --psk <hex> --overlay-ip <ip> --backend-lan <ip> [options]
                       agent itself does not read it yet.
   --frontend-ip <ip>  frontend overlay address (default $FRONTEND_IP)
   --backend-ip <ip>   backend overlay address (default $BACKEND_IP)
+  --table <n>         routing table for overlay traffic on this host,
+                      1-252, default $TABLE. Must match the Table column in
+                      this host's row in the portal. Pick another number if
+                      this box already policy-routes - a second ISP, a VPN -
+                      or the agent writes its default route over that one.
   --force-config      overwrite an existing $CONFIG. Needs --psk with it, or
                       the secret would be blanked.
   --no-start          install but do not enable or start the service
@@ -73,6 +86,7 @@ while [ $# -gt 0 ]; do
 	--overlay-ip) OVERLAY_IP="$2"; shift 2 ;;
 	--backend-lan) BACKEND_LAN="$2"; shift 2 ;;
 	--subnet) SUBNET="$2"; SUBNET_GIVEN=1; shift 2 ;;
+	--table) TABLE="$2"; shift 2 ;;
 	--frontend-ip) FRONTEND_IP="$2"; shift 2 ;;
 	--backend-ip) BACKEND_IP="$2"; shift 2 ;;
 	--force-config) FORCE_CONFIG=1; shift ;;
@@ -121,6 +135,19 @@ if [ ! -f "$CONFIG" ] || [ "$FORCE_CONFIG" -eq 1 ]; then
 	}
 	[ -n "$OVERLAY_IP" ] || { echo "error: --overlay-ip is required, e.g. 10.99.0.3" >&2; exit 2; }
 	[ -n "$BACKEND_LAN" ] || { echo "error: --backend-lan is required, e.g. 192.168.1.2" >&2; exit 2; }
+
+	# 253-255 are default/main/local: writing a default route into one of them
+	# redirects the whole host, which is the opposite of what a linker is for.
+	case "$TABLE" in
+	'' | *[!0-9]*)
+		echo "error: --table $TABLE is not a number; it must be between 1 and 252" >&2
+		exit 2
+		;;
+	esac
+	if [ "$TABLE" -lt 1 ] || [ "$TABLE" -gt 252 ]; then
+		echo "error: --table $TABLE is out of range; it must be between 1 and 252" >&2
+		exit 2
+	fi
 
 	if [ "$OVERLAY_IP" = "$FRONTEND_IP" ] || [ "$OVERLAY_IP" = "$BACKEND_IP" ]; then
 		echo "error: --overlay-ip $OVERLAY_IP is already the frontend's or the backend's address" >&2
@@ -253,6 +280,10 @@ if [ -f "$CONFIG" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
 	OVERLAY_IP="$(sed -n 's/.*"overlay_ip"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n1)"
 	BACKEND_LAN="$(sed -n 's/.*"backend_lan"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n1)"
 	SUBNET="$(sed -n 's/.*"subnet"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n1)"
+	existing_table="$(sed -n 's/.*"table"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$CONFIG" | head -n1)"
+	if [ -n "$existing_table" ]; then
+		TABLE="$existing_table"
+	fi
 	if [ -z "$OVERLAY_IP" ] || [ -z "$BACKEND_LAN" ]; then
 		echo "error: cannot read overlay_ip and backend_lan out of $CONFIG" >&2
 		echo "       the agent still reads the file itself, so it may be fine - but this" >&2
@@ -277,7 +308,8 @@ else
   },
   "linker": {
     "overlay_ip": "$OVERLAY_IP",
-    "backend_lan": "$BACKEND_LAN"
+    "backend_lan": "$BACKEND_LAN",
+    "table": $TABLE
   }
 }
 EOF
@@ -304,10 +336,10 @@ if [ "$START" -eq 1 ]; then
 	else
 		warn "$OVERLAY_IP is not on any interface - check: journalctl -u $UNIT -n 30"
 	fi
-	if ip route show default table 200 2>/dev/null | grep -q "$BACKEND_LAN"; then
-		echo "  overlay table 200 points at $BACKEND_LAN"
+	if ip route show default table "$TABLE" 2>/dev/null | grep -q "$BACKEND_LAN"; then
+		echo "  overlay table $TABLE points at $BACKEND_LAN"
 	else
-		warn "table 200 has no route to $BACKEND_LAN - check: journalctl -u $UNIT -n 30"
+		warn "table $TABLE has no route to $BACKEND_LAN - check: journalctl -u $UNIT -n 30"
 	fi
 else
 	echo "  --no-start given; run: systemctl enable --now $UNIT"
@@ -344,7 +376,7 @@ Liveness is checked from here:
 
   systemctl status $UNIT
   ip rule show | grep $OVERLAY_IP
-  ip route show table 200
+  ip route show table $TABLE
 
 And from the backend, once both halves are in place:
 

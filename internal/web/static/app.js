@@ -621,14 +621,52 @@ function linkerRow(l, onRemove, onChange) {
   );
 }
 
-// The config the linker host needs, ready to paste. The secret is deliberately
-// not filled in: the frontend holds only the derived key, never the passphrase,
-// and plumbing the raw secret into the portal so it could be displayed would be
-// a real downgrade for one saved copy-paste.
-function linkerConfigText(l, ov, backendLan) {
+// Copy to the clipboard, in a page that is usually not a secure context.
+//
+// The portal is served over plain HTTP on a WireGuard address, so
+// navigator.clipboard is undefined in every browser that follows the spec -
+// which made the Copy button a no-op reporting failure. execCommand is
+// deprecated and works here, so it is the fallback rather than the exception.
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      toast('Copied');
+      return;
+    }
+  } catch { /* fall through to the old way */ }
+  const ta = el('textarea', { style: 'position:fixed;opacity:0' });
+  ta.value = text;
+  document.body.append(ta);
+  ta.select();
+  const ok = document.execCommand('copy');
+  ta.remove();
+  toast(ok ? 'Copied' : 'Could not copy — select it and copy by hand', !ok);
+}
+
+// The shared secret, fetched only when somebody opens a linker's setup block.
+//
+// It is not in the configuration - it lives in the bootstrap file, which the
+// portal cannot edit - so it comes from its own endpoint. Kept for the life of
+// the page once asked for, because the two blocks below both need it and
+// re-fetching per keystroke while a row is being typed would be silly.
+const PSK_PLACEHOLDER = 'PASTE-FROM-/etc/failover/frontend.json';
+let pskCache = null;
+
+async function ensurePSK() {
+  if (pskCache) return pskCache;
+  try {
+    const r = await api('/api/psk');
+    pskCache = r.psk || null;
+  } catch { /* an older frontend, or no secret to show */ }
+  return pskCache;
+}
+
+// The config the linker host needs, ready to paste.
+function linkerConfigText(l, ov, backendLan, psk) {
   return JSON.stringify({
     role: 'linker',
-    psk: 'PASTE-FROM-/etc/failover/frontend.json',
+    psk: psk || PSK_PLACEHOLDER,
     state_dir: '/var/lib/failover',
     overlay: {
       frontend_ip: ov.frontend_ip,
@@ -640,6 +678,29 @@ function linkerConfigText(l, ov, backendLan) {
     },
     linker: { overlay_ip: l.overlay_ip, backend_lan: backendLan, table: l.table || 200 },
   }, null, 2);
+}
+
+// The one command that sets a linker up, with this row's values already in it.
+//
+// Every argument here is something the portal knows and the operator would
+// otherwise be reading off two hosts and retyping. The overlay addresses are
+// only passed when they are not the shipped ones, so the usual case stays
+// short enough to read before running it.
+function linkerInstallText(l, ov, backendLan, psk) {
+  const args = [
+    `--psk ${psk || PSK_PLACEHOLDER}`,
+    `--overlay-ip ${l.overlay_ip}`,
+    `--backend-lan ${backendLan || '<the backend\'s address on that network>'}`,
+    `--subnet ${ov.subnet || '<overlay.subnet is not set on this site>'}`,
+    `--table ${l.table || 200}`,
+  ];
+  if (ov.frontend_ip && ov.frontend_ip !== '10.99.0.1') args.push(`--frontend-ip ${ov.frontend_ip}`);
+  if (ov.backend_ip && ov.backend_ip !== '10.99.0.2') args.push(`--backend-ip ${ov.backend_ip}`);
+  return [
+    `# on ${l.name || l.overlay_ip}, in a clone of the repo`,
+    'sudo ./deploy/install-linker.sh \\',
+    ...args.map((a, i) => `  ${a}${i === args.length - 1 ? '' : ' \\'}`),
+  ].join('\n');
 }
 
 function renderSettings() {
@@ -993,20 +1054,45 @@ function renderSettings() {
 
   const linkerBody = el('tbody', {});
   const linkerConfigs = el('div', {});
+  // Everything needed to bring one of these hosts up, with this row's values
+  // already filled in. Two ways, because a host may not have the repo on it:
+  // the install script, and the config file it would have written.
+  //
+  // The secret is fetched only when a block is opened, so it is not sitting in
+  // the page for every visit to Settings.
   const renderLinkerConfigs = () => {
     linkerConfigs.textContent = '';
     for (const l of c.linkers) {
       if (!l.enabled || !l.overlay_ip) continue;
-      const pre = el('pre', { class: 'config-block', text: linkerConfigText(l, c.overlay, c.backend_lan) });
-      linkerConfigs.append(el('details', {},
-        el('summary', { text: `/etc/failover/linker.json for ${l.name || l.overlay_ip}` }),
-        pre,
+
+      const cmd = el('pre', { class: 'config-block', text: linkerInstallText(l, c.overlay, c.backend_lan, pskCache) });
+      const cfgPre = el('pre', { class: 'config-block', text: linkerConfigText(l, c.overlay, c.backend_lan, pskCache) });
+      const fill = (psk) => {
+        cmd.textContent = linkerInstallText(l, c.overlay, c.backend_lan, psk);
+        cfgPre.textContent = linkerConfigText(l, c.overlay, c.backend_lan, psk);
+      };
+
+      const block = el('details', {},
+        el('summary', { text: `Set up ${l.name || l.overlay_ip}` }),
+        el('p', { class: 'hint', text: 'Run this on that host, in a clone of the repo. It writes the config below, installs the unit and starts the agent. Nothing has to be run on the backend.' }),
+        cmd,
         el('div', { class: 'row' }, el('button', {
-          class: 'btn', type: 'button',
-          onclick: () => navigator.clipboard.writeText(pre.textContent).then(
-            () => toast('Config copied'), () => toast('Could not copy', true)),
-        }, 'Copy')),
-      ));
+          class: 'btn', type: 'button', onclick: () => copyText(cmd.textContent),
+        }, 'Copy command')),
+        el('p', { class: 'hint', text: 'Without the repo on that host: write this as /etc/failover/linker.json, owned by root and mode 0600, then install the binary and unit from deploy/ and start failover-linker.' }),
+        cfgPre,
+        el('div', { class: 'row' }, el('button', {
+          class: 'btn', type: 'button', onclick: () => copyText(cfgPre.textContent),
+        }, 'Copy config')),
+        el('p', { class: 'hint', text: 'Both carry this site’s shared secret. It must match the frontend exactly — that is what the linker authenticates with, and a mismatch shows up as a host that never connects.' }),
+      );
+      block.addEventListener('toggle', async () => {
+        if (!block.open || pskCache) return;
+        const psk = await ensurePSK();
+        if (psk) fill(psk);
+        else toast('Could not read the shared secret; it is in /etc/failover/frontend.json on this host', true);
+      });
+      linkerConfigs.append(block);
     }
   };
   const renderLinkers = () => {

@@ -23,6 +23,9 @@
     "overlay_ip": "10.99.0.3",
 
     "_backend_lan": "The backend's address on THIS network - the next hop, not its overlay address. Overlay traffic reaches the backend as a neighbour on the LAN, and the backend puts it on whichever tunnel is active.",
-    "backend_lan": "192.168.1.2"
+    "backend_lan": "192.168.1.2",
+
+    "_table": "The routing table this host uses for overlay traffic, 1-252, default 200. It belongs to this machine, not to this system: pick another number if the box already policy-routes for a second ISP or a VPN, or the agent writes its default route over that one. Must match the Table column in this host's row in the portal - the agent reads it here, before any channel exists to be told it.",
+    "table": 200
   }
 }

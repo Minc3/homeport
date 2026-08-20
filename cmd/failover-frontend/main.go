@@ -93,7 +93,7 @@ func run(log *slog.Logger, cfgPath, adminUser string) error {
 	notifier.SetConfig(cfg.Notify)
 
 	eng := engine.New(log, st, notifier, cfg, boot.Key(), boot.StateDir)
-	portal := web.New(eng, st, log)
+	portal := web.New(eng, st, log, boot.PSK)
 
 	password, err := portal.EnsureAdmin(adminUser)
 	if err != nil {

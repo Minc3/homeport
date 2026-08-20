@@ -473,6 +473,22 @@ func overlayContains(ov model.OverlayConfig, ip string) bool {
 	return addr != nil && netw.Contains(addr)
 }
 
+// handlePSK returns the shared secret, for the linker setup instructions.
+//
+// A linker's bootstrap file needs the identical string, and every other value
+// in that file is already on this page - so without this the one thing that
+// cannot be copied from the portal is the one thing that is unforgiving about
+// typos. See the note on Server.psk for what is and is not being given away.
+func (s *Server) handlePSK(w http.ResponseWriter, r *http.Request) {
+	if s.psk == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": "this frontend has no shared secret to show",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"psk": s.psk})
+}
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	limit := intParam(r, "limit", 100)
 	if limit > 500 {

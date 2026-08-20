@@ -36,7 +36,7 @@ func TestStatusAPICarriesTheFieldsTheDashboardReads(t *testing.T) {
 	eng := engine.New(log, st, notify.New(log), model.Defaults(), []byte("secret"), t.TempDir())
 	eng.SetBackendInfo("backend-build-under-test", "backend-host")
 
-	srv := New(eng, st, log)
+	srv := New(eng, st, log, "test-psk")
 	rec := httptest.NewRecorder()
 	// trusted: this exercises the payload, not the login flow.
 	srv.Handler(true).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))

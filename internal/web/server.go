@@ -52,6 +52,20 @@ type Server struct {
 	st  *store.Store
 	log *slog.Logger
 
+	// The shared secret, as typed into the bootstrap file rather than the
+	// derived key the engine holds. It exists here only to be handed back to
+	// an authenticated operator setting up a linker: that host needs the same
+	// string, and the alternative was reading it off the frontend over SSH and
+	// retyping it beside four other values that the portal already knows.
+	//
+	// It is served by one endpoint, behind the same session as everything
+	// else, and the page asks for it only when somebody opens a linker's setup
+	// block. Anyone who can reach that endpoint can already revert the system,
+	// arm it, or change the portal password, so the secret is not the weakest
+	// thing behind this login - but it is the longest-lived, so it is not put
+	// in the page unless it was asked for.
+	psk string
+
 	mu       sync.Mutex
 	attempts map[string]*attemptRecord
 }
@@ -62,11 +76,12 @@ type attemptRecord struct {
 }
 
 // New builds the portal server.
-func New(eng *engine.Engine, st *store.Store, log *slog.Logger) *Server {
+func New(eng *engine.Engine, st *store.Store, log *slog.Logger, psk string) *Server {
 	return &Server{
 		eng:      eng,
 		st:       st,
 		log:      log.With("component", "portal"),
+		psk:      psk,
 		attempts: map[string]*attemptRecord{},
 	}
 }
@@ -111,6 +126,7 @@ func (s *Server) Handler(trusted bool) http.Handler {
 		mux.Handle(pattern, s.requireAuth(trusted, h))
 	}
 	api("GET /api/status", s.handleStatus)
+	api("GET /api/psk", s.handlePSK)
 	api("GET /api/config", s.handleGetConfig)
 	api("PUT /api/config", s.handlePutConfig)
 	api("GET /api/events", s.handleEvents)
