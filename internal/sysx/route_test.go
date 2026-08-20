@@ -166,7 +166,7 @@ func TestControlRouteSelectsOnMarkNotAddresses(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		"ip rule show": "0:\tfrom all lookup local\n32766:\tfrom all lookup main\n",
 	}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
 	if !f.ran("ip rule add fwmark 0x100 lookup 100") {
@@ -179,6 +179,70 @@ func TestControlRouteSelectsOnMarkNotAddresses(t *testing.T) {
 	}
 	if !f.ran("ip route replace 10.99.0.2/32 dev wg-nbn src 10.99.0.1 table 100") {
 		t.Errorf("expected the control route in table 100, got calls: %v", f.calls)
+	}
+}
+
+// The control table must carry the whole overlay range once a subnet is set.
+//
+// The frontend's control listener is marked, and an accepted connection
+// inherits the mark, so every reply on a control channel is steered into this
+// table - a linker's included. With only the backend's /32 here, a linker's
+// SYN-ACK matched nothing, fell through to main, and in observe mode main has
+// no overlay route at all: the reply left by the public interface and the
+// linker retried forever against a frontend that was answering.
+func TestControlRouteCoversTheOverlayRange(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show":                         "0:\tfrom all lookup local\n",
+		"ip route show 10.99.0.2/32 table 100": "10.99.0.2 dev wg-nbn scope link src 10.99.0.1\n",
+	}}
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.0/24", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+		t.Fatalf("EnsureControlRoute: %v", err)
+	}
+	if !f.ran("ip route replace 10.99.0.0/24 dev wg-nbn src 10.99.0.1 table 100") {
+		t.Errorf("the overlay range is not in the control table: %v", f.calls)
+	}
+	// And the host route it supersedes, which is more specific and would keep
+	// the backend's own channel pinned to whichever tunnel was active when the
+	// subnet was set.
+	if !f.ran("ip route del 10.99.0.2/32 table 100") {
+		t.Errorf("the superseded host route was left in the control table: %v", f.calls)
+	}
+}
+
+// A site with no subnet must issue exactly what it always did - invariant 19.
+func TestControlRouteWithoutSubnetIsUnchanged(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{"ip rule show": "0:\tfrom all lookup local\n"}}
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+		t.Fatalf("EnsureControlRoute: %v", err)
+	}
+	if !f.ran("ip route replace 10.99.0.2/32 dev wg-nbn src 10.99.0.1 table 100") {
+		t.Errorf("expected the host route in table 100, got: %v", f.calls)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "ip route del") {
+			t.Errorf("a site with no subnet has nothing to supersede, but ran: %s", c)
+		}
+	}
+}
+
+// Revert takes its own routes out of the control table by name. Flushing it
+// would take an operator's own entries with it: 100 is a number, not this
+// system's property. Invariant 8.
+func TestRemoveControlRouteNeverFlushes(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 100": "29999:\tfrom all fwmark 0x100 lookup 100\n",
+	}}
+	RemoveControlRoute(context.Background(), f, "10.99.0.0/24", "10.99.0.2", "10.99.0.1")
+	for _, c := range f.calls {
+		if strings.Contains(c, "route flush") {
+			t.Errorf("revert flushed a table it does not own: %s", c)
+		}
+	}
+	if !f.ran("ip route del 10.99.0.0/24 table 100") || !f.ran("ip route del 10.99.0.2/32 table 100") {
+		t.Errorf("both control routes should be removed by name, got: %v", f.calls)
+	}
+	if !f.ran("ip rule del fwmark 0x100 lookup 100 pref 29999") {
+		t.Errorf("the control rule should be removed at the priority it was found at, got: %v", f.calls)
 	}
 }
 
@@ -385,7 +449,7 @@ func TestProbeRuleIsFoundWhenTheTableHasAName(t *testing.T) {
 func TestTableOneHundredRulesAreFoundWhenTheTableHasAName(t *testing.T) {
 	named := "29999:\tfrom all fwmark 0x100 lookup uplink\n"
 	f := &fakeRunner{replies: map[string]string{"ip rule show table 100": named}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
 	if f.ran("ip rule add") {
@@ -425,7 +489,7 @@ func TestControlAndReturnMarkRulesCarryAnExplicitPriority(t *testing.T) {
 	}
 
 	f := &fakeRunner{replies: map[string]string{"ip rule show table 100": ""}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
 	want := "ip rule add fwmark 0x100 lookup 100 pref " + strconv.Itoa(ControlRulePref)
@@ -455,7 +519,7 @@ func TestMovingARuleAddsBeforeItDeletes(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		"ip rule show table 100": "30000:\tfrom all fwmark 0x100 lookup 100\n",
 	}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
 	add := f.index("ip rule add fwmark 0x100 lookup 100 pref " + strconv.Itoa(ControlRulePref))

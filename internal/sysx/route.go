@@ -581,7 +581,7 @@ const ReturnMarkRulePref = ProbeRulePrefBase - 2
 // originates from its overlay address match it. DNAT'd client traffic carries
 // a real client source address and never matches, which is what keeps observe
 // mode honest: published traffic still cannot reach the backend.
-func EnsureControlRoute(ctx context.Context, r Runner, backendIP, frontendIP, iface string) error {
+func EnsureControlRoute(ctx context.Context, r Runner, routePrefix, backendIP, frontendIP, iface string) error {
 	// Filtered by the kernel, for the reason listRulesInTable exists: a host
 	// that has named table 100 makes every "lookup 100" text match fail, and
 	// this would then re-add its rule on every tick and log "File exists"
@@ -628,17 +628,63 @@ func EnsureControlRoute(ctx context.Context, r Runner, backendIP, frontendIP, if
 		_, _ = r.Run(ctx, "ip", "rule", "del", "from", frontendIP, "to", backendIP, "lookup", table)
 	}
 
-	_, err = r.Run(ctx, "ip", "route", "replace", backendIP+"/32",
-		"dev", iface, "src", frontendIP, "table", table)
-	return err
+	// The whole overlay range, not just the backend's address, once a subnet
+	// is configured.
+	//
+	// The listening socket carries ControlMark, and an accepted connection
+	// inherits it, so every reply the frontend sends on a control channel is
+	// steered into this table - including replies to a linker. With only the
+	// backend's /32 here a linker's SYN-ACK matched nothing, fell through to
+	// main, and in observe mode main has no overlay route at all: the reply
+	// left by the public interface and vanished. The linker retried forever
+	// with "dial 10.99.0.1:51998: i/o timeout" while its SYN was arriving
+	// perfectly, and the backend's own channel stayed up throughout, because
+	// the backend is the one address this table knew.
+	if _, err := r.Run(ctx, "ip", "route", "replace", routePrefix,
+		"dev", iface, "src", frontendIP, "table", table); err != nil {
+		return err
+	}
+
+	// And the host route it supersedes, for the same reason invariant 21 gives
+	// on the main table: replace writes the new prefix and leaves the old one
+	// alone, and the /32 is more specific - so the backend's control channel
+	// would stay pinned to whichever tunnel was active when the subnet was set
+	// while everything else followed the failover.
+	host := backendIP + "/32"
+	if routePrefix != host {
+		if via, err := RouteVia(ctx, r, host, ControlTable); err == nil && via != "" {
+			_, _ = r.Run(ctx, "ip", "route", "del", host, "table", table)
+		}
+	}
+	return nil
 }
 
 // RemoveControlRoute undoes EnsureControlRoute.
-func RemoveControlRoute(ctx context.Context, r Runner, backendIP, frontendIP string) {
+func RemoveControlRoute(ctx context.Context, r Runner, routePrefix, backendIP, frontendIP string) {
 	table := strconv.Itoa(ControlTable)
-	_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", fmt.Sprintf("0x%x", ControlMark), "lookup", table)
+	mark := fmt.Sprintf("0x%x", ControlMark)
+
+	// By the priority it is actually at, and every stray at another one: `ip
+	// rule del` given only a selector drops one arbitrary match, so a duplicate
+	// left by a build that pinned no priority would survive the revert.
+	if existing, err := listRulesInTable(ctx, r, ControlTable); err == nil {
+		for _, pref := range markRulePrefs(existing, mark, "") {
+			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark,
+				"lookup", table, "pref", strconv.Itoa(pref))
+		}
+	} else {
+		_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", table)
+	}
 	_, _ = r.Run(ctx, "ip", "rule", "del", "from", frontendIP, "to", backendIP, "lookup", table)
-	_, _ = r.Run(ctx, "ip", "route", "flush", "table", table)
+
+	// The routes by name, never a flush of the table. The number belongs to the
+	// host rather than to this system - invariant 8 - and a frontend that
+	// already policy-routes may keep its own entries in 100, which a flush
+	// would take with it while reporting a clean revert.
+	_, _ = r.Run(ctx, "ip", "route", "del", routePrefix, "table", table)
+	if host := backendIP + "/32"; routePrefix != host {
+		_, _ = r.Run(ctx, "ip", "route", "del", host, "table", table)
+	}
 }
 
 // EnsureSysctls relaxes reverse-path filtering. During a switch the forward

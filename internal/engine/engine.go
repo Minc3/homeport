@@ -637,7 +637,7 @@ func (e *Engine) applyActivePath(ctx context.Context, p model.PathConfig) error 
 	// too - it is source-selected, so it carries no published traffic. Failing
 	// to move it would leave the channel pinned to a tunnel that may be the one
 	// that just died.
-	if err := sysx.EnsureControlRoute(ctx, e.realRunner(),
+	if err := sysx.EnsureControlRoute(ctx, e.realRunner(), cfg.Overlay.RoutePrefix(),
 		cfg.Overlay.BackendIP, cfg.Overlay.FrontendIP, p.Iface); err != nil {
 		e.log.Warn("control-channel route not updated", "iface", p.Iface, "err", err)
 	}
@@ -781,7 +781,7 @@ func (e *Engine) applySystemConfig(ctx context.Context) {
 	if active == 0 {
 		for _, p := range cfg.Paths {
 			if sysx.IfaceExists(p.Iface) {
-				if err := sysx.EnsureControlRoute(ctx, real,
+				if err := sysx.EnsureControlRoute(ctx, real, cfg.Overlay.RoutePrefix(),
 					cfg.Overlay.BackendIP, cfg.Overlay.FrontendIP, p.Iface); err != nil {
 					e.log.Warn("control-channel route not seeded", "iface", p.Iface, "err", err)
 				} else {
@@ -1106,8 +1106,13 @@ func (e *Engine) reconcileRouting(ctx context.Context) {
 	// The control channel is source-selected and carries no published traffic,
 	// so it is repaired in observe mode too - losing it is what makes the
 	// backend look permanently unreachable in the portal.
-	if via, err := sysx.RouteVia(ctx, real, cfg.Overlay.BackendIP+"/32", sysx.ControlTable); err == nil && via != ap.Iface {
-		if err := sysx.EnsureControlRoute(ctx, real,
+	//
+	// Read back by the prefix that was installed, never by an address inside
+	// it: `ip route show` filters on an exact prefix, so asking about the
+	// backend's /32 on a site with a subnet answers "no route" on every tick
+	// and reinstalls what is already there. Invariant 20.
+	if via, err := sysx.RouteVia(ctx, real, cfg.Overlay.RoutePrefix(), sysx.ControlTable); err == nil && via != ap.Iface {
+		if err := sysx.EnsureControlRoute(ctx, real, cfg.Overlay.RoutePrefix(),
 			cfg.Overlay.BackendIP, cfg.Overlay.FrontendIP, ap.Iface); err != nil {
 			e.log.Warn("cannot restore the control-channel route", "iface", ap.Iface, "err", err)
 		} else {
@@ -1684,7 +1689,8 @@ func (e *Engine) Revert(ctx context.Context) {
 		}
 	}
 	sysx.RemoveProbeRoutes(ctx, runner, cfg.Paths, cfg.Overlay.RoutePrefix())
-	sysx.RemoveControlRoute(ctx, runner, cfg.Overlay.BackendIP, cfg.Overlay.FrontendIP)
+	sysx.RemoveControlRoute(ctx, runner, cfg.Overlay.RoutePrefix(),
+		cfg.Overlay.BackendIP, cfg.Overlay.FrontendIP)
 	sysx.RemoveForwardExceptions(ctx, runner)
 	sysx.RemoveEgressForwardException(ctx, runner)
 

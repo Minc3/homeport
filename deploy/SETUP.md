@@ -535,12 +535,19 @@ are configuring a host by hand.
    for that account. If you never wrote it down, `sudo failoverctl passwd` on
    the frontend sets a new one and prints it — it asks for no old password,
    because anyone who can run it is already root on the box.
-4. Leave it for a few days. Watch the portal. You are looking for paths that
+4. **Tick the services this site actually serves.** Settings → Published
+   services ships four examples — 27015/udp, 27020/udp, 80/tcp, 443/tcp — and
+   every one of them is disabled. Each row is a DNAT rule, so enabling one
+   publishes that port on the frontend's public address to whatever is
+   listening at the far end; that is not something a fresh install should do
+   because nobody deleted a row. Nothing is published until you tick it and
+   save, and nothing takes effect until the agent is armed.
+5. Leave it for a few days. Watch the portal. You are looking for paths that
    flap, quotas that count at a plausible rate, and a decision history that
    matches what actually happened.
-5. Compare the metered figures against your carrier's own portal and adjust the
+6. Compare the metered figures against your carrier's own portal and adjust the
    per-path **calibration %** until they agree.
-6. Arm it from the portal, or `failoverctl mode armed`.
+7. Arm it from the portal, or `failoverctl mode armed`.
 
 If anything goes wrong, `failoverctl revert` removes the nftables tables and
 every policy route the *frontend* installed, including the egress table from

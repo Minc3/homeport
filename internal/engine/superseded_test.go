@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/quinlan102/homeport/internal/model"
@@ -20,6 +21,10 @@ func TestSupersededHostRouteIsRemovedOnceASubnetIsSet(t *testing.T) {
 	kernel["ip route show 10.99.0.0/24"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
 	// The leftover from before the subnet was configured.
 	kernel["ip route show 10.99.0.2/32"] = "10.99.0.2 dev wg-nbn scope link src 10.99.0.1"
+	// The control table carries the same widening and is cleaned the same way;
+	// this test is about the main one, so it starts finished.
+	kernel["ip route show 10.99.0.0/24 table 100"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.2/32 table 100"] = ""
 
 	e, q := engineForReconcile(t, kernel)
 	e.cfg.Overlay.Subnet = "10.99.0.0/24"
@@ -49,6 +54,10 @@ func TestSupersededRemovalIsNotRepeated(t *testing.T) {
 	kernel := healthyKernel()
 	kernel["ip route show 10.99.0.0/24"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
 	kernel["ip route show 10.99.0.2/32"] = "" // already cleaned
+	// The control table is a separate copy of the same widening, and these
+	// tests are about the main one, so it starts in its finished state.
+	kernel["ip route show 10.99.0.0/24 table 100"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.2/32 table 100"] = ""
 
 	e, q := engineForReconcile(t, kernel)
 	e.cfg.Overlay.Subnet = "10.99.0.0/24"
@@ -67,6 +76,8 @@ func TestSupersededHostRouteSurvivesObserveMode(t *testing.T) {
 	kernel := healthyKernel()
 	kernel["ip route show 10.99.0.0/24"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
 	kernel["ip route show 10.99.0.2/32"] = "10.99.0.2 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.0/24 table 100"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.2/32 table 100"] = ""
 
 	e, q := engineForReconcile(t, kernel)
 	e.cfg.Overlay.Subnet = "10.99.0.0/24"
@@ -75,7 +86,14 @@ func TestSupersededHostRouteSurvivesObserveMode(t *testing.T) {
 
 	e.reconcileRouting(context.Background())
 
-	if q.count("ip route del") != 0 {
-		t.Fatalf("observe mode must not withdraw an installed route; writes were %v", q.writes())
+	// The main-table route specifically. The control table is a different
+	// matter and is repaired for real in observe mode - it carries only marked
+	// control connections, never published traffic - so the /32 it supersedes
+	// goes in both modes, which is why this counts the withdrawal that would
+	// actually move traffic rather than every delete.
+	for _, w := range q.writes() {
+		if strings.HasPrefix(w, "ip route del") && !strings.Contains(w, "table") {
+			t.Fatalf("observe mode must not withdraw an installed route; writes were %v", q.writes())
+		}
 	}
 }

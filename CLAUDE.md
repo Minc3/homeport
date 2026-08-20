@@ -1075,8 +1075,11 @@ Defaults (`model.Defaults()`) match the intended deployment: NBN/LTE1/LTE2 at
 priorities 1/2/3, tables 101/102/103, marks `0x101`/`0x102`/`0x103`, 250ms
 active and 5s standby probing, 8 losses to condemn (~2s detection), 90s
 failback hold-down, 60 GB and 20 GB quotas resetting on the 1st in
-`Australia/Sydney`, services `27015/udp`, `27020/udp`, `80/tcp`, `443/tcp`, and
-**observe mode**.
+`Australia/Sydney`, and **observe mode**. The four example services —
+`27015/udp`, `27020/udp`, `80/tcp`, `443/tcp` — ship **disabled**: a row is a
+DNAT rule, and a fresh install must not publish a port on the strength of
+nobody having deleted it. Arming is when the shipped list would have gone live,
+which is why observe mode is not the answer to this on its own.
 
 Ports in use: probe `51999/udp`, control `51998/tcp`, tunnels
 `51820`/`51821`/`51822` (distinct so pfSense can policy-route by source port),

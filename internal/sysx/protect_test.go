@@ -8,7 +8,7 @@ import (
 )
 
 func protectCfg() model.Config {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	cfg.Frontend.PublicIface = "eth0"
 	cfg.Protect.Enabled = true
 	return cfg
@@ -18,7 +18,7 @@ func protectCfg() model.Config {
 // never asked for it is a feature that drops their traffic for reasons they
 // cannot see, so "off" has to mean no table at all - not an empty one.
 func TestProtectionOffGeneratesNothing(t *testing.T) {
-	if got := BuildProtectRuleset(ProtectSpecFrom(model.Defaults())); got != "" {
+	if got := BuildProtectRuleset(ProtectSpecFrom(defaultsPublishing())); got != "" {
 		t.Fatalf("a site with protection off generated a ruleset:\n%s", got)
 	}
 }

@@ -14,7 +14,7 @@ import (
 // owners. Everything generated from it must be identical to what was generated
 // before linker support existed.
 func linkerless() model.Config {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	cfg.Frontend.PublicIface = "eth0"
 	cfg.Frontend.PublicIP = "203.0.113.10"
 	return cfg

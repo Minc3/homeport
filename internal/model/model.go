@@ -701,11 +701,21 @@ func Defaults() Config {
 				MinDwellSec:  300,
 			},
 		},
+		// Shipped as examples, and every one of them disabled.
+		//
+		// They are the ports this system was built for, so they are worth
+		// having in the table as a starting shape - but a service row is a DNAT
+		// rule, and enabling one publishes a port on the frontend's public
+		// address to whatever happens to be listening at the far end. A fresh
+		// install should not be doing that because nobody deleted a row: the
+		// operator ticks what this site actually serves. Observe mode delays
+		// that rather than preventing it - arming a site is the moment the
+		// shipped list would have gone live.
 		Services: []Service{
-			{Name: "gmod", Proto: "udp", Port: 27015, Enabled: true},
-			{Name: "gmod-hltv", Proto: "udp", Port: 27020, Enabled: true},
-			{Name: "http", Proto: "tcp", Port: 80, Enabled: true},
-			{Name: "https", Proto: "tcp", Port: 443, Enabled: true},
+			{Name: "gmod", Proto: "udp", Port: 27015},
+			{Name: "gmod-hltv", Proto: "udp", Port: 27020},
+			{Name: "http", Proto: "tcp", Port: 80},
+			{Name: "https", Proto: "tcp", Port: 443},
 		},
 		Notify: NotifyConfig{
 			Enabled: false, Kind: "ntfy",

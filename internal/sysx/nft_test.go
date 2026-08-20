@@ -8,8 +8,22 @@ import (
 	"github.com/quinlan102/homeport/internal/model"
 )
 
+// defaultsPublishing is Defaults() with the shipped example services ticked on.
+//
+// They ship disabled, because a fresh install must not publish ports on the
+// strength of nobody having deleted a row. These tests are about what a
+// published service generates, so they turn the examples on rather than
+// inventing a parallel list that could drift from the real one.
+func defaultsPublishing() model.Config {
+	cfg := model.Defaults()
+	for i := range cfg.Services {
+		cfg.Services[i].Enabled = true
+	}
+	return cfg
+}
+
 func TestRulesetNeverMasquerades(t *testing.T) {
-	rs := BuildRuleset(model.Defaults())
+	rs := BuildRuleset(defaultsPublishing())
 	// Leaving the source address alone is the entire reason the game server
 	// and the web server see real client IPs. A masquerade rule sneaking in
 	// would silently replace every client address with the frontend's.
@@ -21,7 +35,7 @@ func TestRulesetNeverMasquerades(t *testing.T) {
 }
 
 func TestRulesetPublishesEnabledServices(t *testing.T) {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	cfg.Frontend.PublicIface = "eth0"
 	rs := BuildRuleset(cfg)
 
@@ -39,7 +53,7 @@ func TestRulesetPublishesEnabledServices(t *testing.T) {
 }
 
 func TestRulesetSkipsDisabledServices(t *testing.T) {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	cfg.Services[0].Enabled = false // gmod
 	rs := BuildRuleset(cfg)
 	if strings.Contains(rs, "dport 27015") {
@@ -48,7 +62,7 @@ func TestRulesetSkipsDisabledServices(t *testing.T) {
 }
 
 func TestRulesetPortRange(t *testing.T) {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	cfg.Services = []model.Service{{Name: "gmod", Proto: "udp", Port: 27015, PortEnd: 27020, Enabled: true}}
 	rs := BuildRuleset(cfg)
 	if !strings.Contains(rs, "udp dport 27015-27020") {
@@ -57,7 +71,7 @@ func TestRulesetPortRange(t *testing.T) {
 }
 
 func TestRulesetIsAtomicReplace(t *testing.T) {
-	rs := BuildRuleset(model.Defaults())
+	rs := BuildRuleset(defaultsPublishing())
 	// create-then-delete-then-define, so loading it is atomic and never leaves
 	// the box with half a ruleset.
 	create := strings.Index(rs, "table ip failover\n")
@@ -68,7 +82,7 @@ func TestRulesetIsAtomicReplace(t *testing.T) {
 }
 
 func TestRulesetScopesToPublicIP(t *testing.T) {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	cfg.Frontend.PublicIP = "203.0.113.10"
 	rs := BuildRuleset(cfg)
 	if !strings.Contains(rs, "ip daddr 203.0.113.10") {
@@ -155,7 +169,7 @@ func TestForwardExceptionsSkippedWithoutDocker(t *testing.T) {
 // one, for traffic going the other way. Merging them would make the assertion
 // above unenforceable.
 func TestEgressRulesetIsASeparateTableFromThePublishedOne(t *testing.T) {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	cfg.Frontend.BackendEgress = true
 
 	if NFTEgressTable == NFTTable {
@@ -175,7 +189,7 @@ func TestEgressRulesetIsASeparateTableFromThePublishedOne(t *testing.T) {
 // advertised at an address with no port forward behind it - and none at all
 // while a CGNAT'd LTE path is carrying traffic.
 func TestEgressRulesetRewritesOnlyBackendOriginatedTraffic(t *testing.T) {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	cfg.Frontend.BackendEgress = true
 	cfg.Frontend.PublicIface = "eth0"
 	cfg.Frontend.PublicIP = "51.161.196.207"
@@ -196,7 +210,7 @@ func TestEgressRulesetRewritesOnlyBackendOriginatedTraffic(t *testing.T) {
 // With no public IP configured there is no address to snat to, so it has to
 // masquerade instead of silently rewriting to nothing.
 func TestEgressRulesetMasqueradesWhenNoPublicIPIsKnown(t *testing.T) {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	cfg.Frontend.BackendEgress = true
 	cfg.Frontend.PublicIface = "eth0"
 	cfg.Frontend.PublicIP = ""
@@ -210,7 +224,7 @@ func TestEgressRulesetMasqueradesWhenNoPublicIPIsKnown(t *testing.T) {
 // but empty" and actually remove the table. Rendering an empty table instead
 // would leave it loaded and translating with nothing in the config to explain it.
 func TestEgressRulesetIsEmptyWhenDisabled(t *testing.T) {
-	cfg := model.Defaults()
+	cfg := defaultsPublishing()
 	if rs := BuildEgressRuleset(cfg); rs != "" {
 		t.Errorf("egress ruleset should be empty when disabled, got:\n%s", rs)
 	}
