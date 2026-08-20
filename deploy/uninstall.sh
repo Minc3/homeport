@@ -2,13 +2,14 @@
 #
 # Remove a failover agent from this host - frontend, backend or linker.
 #
-#   sudo ./deploy/uninstall.sh                  # revert, stop, remove binaries
-#   sudo ./deploy/uninstall.sh --purge          # ... and the config and state
+#   sudo ./deploy/uninstall.sh                  # remove the agent and its files
+#   sudo ./deploy/uninstall.sh --keep-state     # ... but keep the database
 #
-# This is the counterpart to the three install scripts, and it does the four
-# things they did, backwards: it reverts the system changes, stops and disables
-# the unit, removes the unit file and the binaries, and - only when asked -
-# removes the bootstrap config and the state directory.
+# This is the counterpart to the three install scripts, and it does what they
+# did, backwards: it reverts the system changes, stops and disables the unit,
+# and removes the unit file, the binaries, the bootstrap config and the state
+# directory. Uninstalled means gone, so keeping things is what takes a flag.
+# The frontend's database is copied aside before it goes.
 #
 # It needs nothing from the repository, so it can be copied to a host on its
 # own. The role is worked out from what is installed here.
@@ -37,7 +38,8 @@ BIN_DIR=/usr/local/bin
 CONF_DIR=/etc/failover
 
 ROLE=""
-PURGE=0
+KEEP_CONFIG=0
+KEEP_STATE=0
 BACKUP=1
 REVERT=1
 OVERLAY=0
@@ -51,11 +53,15 @@ usage: sudo $0 [options]
   --frontend         uninstall the frontend (detected if only one is present)
   --backend          uninstall the backend
   --linker           uninstall the linker
-  --purge            also remove $CONF_DIR/<role>.json and the state directory.
-                     Without this the shared secret and, on the frontend, the
-                     database survive - so a reinstall picks up where it left
-                     off.
-  --no-backup        do not copy failover.db aside before purging it. The
+  --keep-config      leave $CONF_DIR/<role>.json in place, so a reinstall
+                     picks up the same shared secret. It is the one value on
+                     this host that cannot be recovered from anywhere else,
+                     though the other hosts have the same string.
+  --keep-state       leave the state directory in place. On the frontend that
+                     is the database: the whole configuration and the usage
+                     ledger, which is what a reinstall would otherwise start
+                     from nothing.
+  --no-backup        do not copy failover.db aside before removing it. The
                      ledger is the part that cannot be recreated: losing it
                      resets metered-byte accounting mid-period, so both LTE
                      paths believe they have a full month of headroom.
@@ -78,7 +84,14 @@ while [ $# -gt 0 ]; do
 	--frontend) ROLE=frontend; shift ;;
 	--backend) ROLE=backend; shift ;;
 	--linker) ROLE=linker; shift ;;
-	--purge) PURGE=1; shift ;;
+	--keep-config) KEEP_CONFIG=1; shift ;;
+	--keep-state) KEEP_STATE=1; shift ;;
+	--purge)
+		# It was opt-in for one day. Anything that learned the old spelling
+		# should say so rather than quietly doing something else.
+		echo "note: --purge is the default now; --keep-config and --keep-state are the opposites" >&2
+		shift
+		;;
 	--no-backup) BACKUP=0; shift ;;
 	--no-revert) REVERT=0; shift ;;
 	--overlay) OVERLAY=1; shift ;;
@@ -186,8 +199,14 @@ echo "  stop and disable:       $UNIT"
 bins=""
 for b in $BINARIES; do bins="$bins $BIN_DIR/$b"; done
 echo "  remove binaries:       $bins"
-if [ "$PURGE" -eq 1 ]; then
+if [ "$KEEP_CONFIG" -eq 1 ]; then
+	echo "  keep config:            $CONFIG"
+else
 	echo "  remove config:          $CONFIG (the shared secret goes with it)"
+fi
+if [ "$KEEP_STATE" -eq 1 ]; then
+	echo "  keep state:             $STATE_DIR"
+else
 	echo "  remove state:           $STATE_DIR"
 	if [ "$ROLE" = frontend ]; then
 		if [ "$BACKUP" -eq 1 ]; then
@@ -196,8 +215,6 @@ if [ "$PURGE" -eq 1 ]; then
 			echo "  database:               $DB_PATH (NOT backed up)"
 		fi
 	fi
-else
-	echo "  keep config and state:  $CONFIG, $STATE_DIR (--purge to remove)"
 fi
 if [ "$OVERLAY" -eq 1 ]; then
 	echo "  remove overlay address: ${OVERLAY_IP:-unknown} on $OVERLAY_DEV"
@@ -382,10 +399,10 @@ done
 # an operator has put beside its files. Whatever is left is reported instead.
 # ---------------------------------------------------------------------------
 
-if [ "$PURGE" -eq 1 ]; then
+if [ "$KEEP_CONFIG" -eq 0 ] || [ "$KEEP_STATE" -eq 0 ]; then
 	say "Removing configuration and state"
 
-	if [ "$ROLE" = frontend ] && [ -f "$DB_PATH" ] && [ "$BACKUP" -eq 1 ]; then
+	if [ "$KEEP_STATE" -eq 0 ] && [ "$ROLE" = frontend ] && [ -f "$DB_PATH" ] && [ "$BACKUP" -eq 1 ]; then
 		backup="/root/failover.db.$(date +%Y%m%d-%H%M%S).bak"
 		cp -a "$DB_PATH" "$backup"
 		chmod 0600 "$backup"
@@ -394,24 +411,26 @@ if [ "$PURGE" -eq 1 ]; then
 		echo "  is a matter of copying it back before the new agent first starts"
 	fi
 
-	case "$ROLE" in
-	frontend) files="failover.db failover.db-wal failover.db-shm ruleset.nft egress.nft protect.nft" ;;
-	backend) files="backend-config.json usage-buffer.jsonl meter-state.json return.nft egress.nft" ;;
-	linker) files="linker-return.nft linker-egress.nft" ;;
-	esac
-	for f in $files; do
-		[ -e "$STATE_DIR/$f" ] || continue
-		rm -f "$STATE_DIR/$f"
-		echo "  removed $STATE_DIR/$f"
-	done
-	# The database can sit outside the state directory, and the frontend's
-	# control socket lives in a subdirectory of it.
-	if [ "$ROLE" = frontend ]; then
-		rm -f "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"
-		rm -rf "$STATE_DIR/ctl"
+	if [ "$KEEP_STATE" -eq 0 ]; then
+		case "$ROLE" in
+		frontend) files="failover.db failover.db-wal failover.db-shm ruleset.nft egress.nft protect.nft" ;;
+		backend) files="backend-config.json usage-buffer.jsonl meter-state.json return.nft egress.nft" ;;
+		linker) files="linker-return.nft linker-egress.nft" ;;
+		esac
+		for f in $files; do
+			[ -e "$STATE_DIR/$f" ] || continue
+			rm -f "$STATE_DIR/$f"
+			echo "  removed $STATE_DIR/$f"
+		done
+		# The database can sit outside the state directory, and the frontend's
+		# control socket lives in a subdirectory of it.
+		if [ "$ROLE" = frontend ]; then
+			rm -f "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm"
+			rm -rf "$STATE_DIR/ctl"
+		fi
 	fi
 
-	if [ -f "$CONFIG" ]; then
+	if [ "$KEEP_CONFIG" -eq 0 ] && [ -f "$CONFIG" ]; then
 		rm -f "$CONFIG"
 		echo "  removed $CONFIG"
 	fi
@@ -445,12 +464,14 @@ if [ "$OVERLAY" -eq 0 ] && [ -n "$OVERLAY_IP" ]; then
 	echo "  - $OVERLAY_IP on $OVERLAY_DEV. Remove it with"
 	echo "    'ip addr del $OVERLAY_IP/32 dev $OVERLAY_DEV', or re-run with --overlay."
 fi
-if [ "$PURGE" -eq 0 ]; then
+if [ "$KEEP_CONFIG" -eq 1 ]; then
+	echo "  - $CONFIG, so a reinstall keeps the shared secret."
+fi
+if [ "$KEEP_STATE" -eq 1 ]; then
 	if [ "$ROLE" = frontend ]; then
-		echo "  - $CONFIG and $STATE_DIR, so a reinstall keeps the shared secret, the"
-		echo "    configuration and the usage ledger."
+		echo "  - $STATE_DIR, so a reinstall keeps the configuration and the usage ledger."
 	else
-		echo "  - $CONFIG and $STATE_DIR, so a reinstall keeps the shared secret."
+		echo "  - $STATE_DIR."
 	fi
 fi
 
