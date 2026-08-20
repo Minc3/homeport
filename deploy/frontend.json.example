@@ -1,0 +1,26 @@
+{
+  "_comment": "Install as /etc/failover/frontend.json with mode 0600. Everything else is configured in the portal.",
+
+  "role": "frontend",
+
+  "_psk": "Must be identical on both hosts. Generate one with: openssl rand -hex 32",
+  "psk": "CHANGE-ME-openssl-rand-hex-32",
+
+  "state_dir": "/var/lib/failover",
+  "db_path": "/var/lib/failover/failover.db",
+
+  "_portal_listen": "Bind to the admin WireGuard address, not the public one. WireGuard already does the encryption and peer authentication, so there is no certificate to manage and no public TCP surface to scan.",
+  "portal_listen": "10.98.0.2:8080",
+
+  "overlay": {
+    "_comment": "These two addresses never change. Failover swaps only the interface behind them, which is why live game sessions and established TCP connections survive a switch.",
+    "frontend_ip": "10.99.0.1",
+    "backend_ip": "10.99.0.2",
+    "_device": "Optional. The dummy interface the overlay address lives on; defaults to dummy0. Set it here on both hosts, not in the portal - the two must agree and the change would tear down the channel it has to travel over.",
+    "device": "dummy0",
+    "_subnet": "Only for a site that runs linker agents - extra hosts published through this backend. Leave it out otherwise: a site with one host at the far end has no reason to route a range down its tunnel. Must be identical on both hosts, and covered by AllowedIPs on the frontend's peers - the shipped setup already puts 10.99.0.0/24 there.",
+    "subnet": "",
+    "probe_port": 51999,
+    "control_port": 51998
+  }
+}

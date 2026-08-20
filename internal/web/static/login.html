@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Failover &ndash; sign in</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+<div class="login-wrap">
+  <form class="login-card" id="login" method="post" action="/api/login">
+    <h1>Path failover</h1>
+    <p class="hint">Reached over the admin tunnel.</p>
+    <label>
+      <span class="hint">Username</span>
+      <input name="username" autocomplete="username" autofocus required>
+    </label>
+    <label>
+      <span class="hint">Password</span>
+      <input name="password" type="password" autocomplete="current-password" required>
+    </label>
+    <button class="btn primary" type="submit" style="width:100%">Sign in</button>
+    <p class="hint" id="error" style="color:var(--bad)"></p>
+  </form>
+</div>
+<script src="/login.js"></script>
+</body>
+</html>

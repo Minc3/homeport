@@ -1,0 +1,41 @@
+[Unit]
+Description=Path failover frontend (probing, route selection, DNAT, portal)
+Documentation=https://github.com/quinlan102/homeport
+# wg-admin carries the portal bind address, so the process cannot start until
+# the interface exists. Without this ordering the first boot attempt fails to
+# bind and systemd restart-loops until wg-quick catches up.
+After=network-online.target nftables.service wg-quick@wg-admin.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/failover-frontend -config /etc/failover/frontend.json
+Restart=always
+RestartSec=3
+
+# The agent manipulates routing and nftables, so it needs these. It does not
+# need anything else.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+
+StateDirectory=failover
+ConfigurationDirectory=failover
+ProtectSystem=strict
+ReadWritePaths=/var/lib/failover
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=no
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# Deliberately not stopped on shutdown of the network: the last installed route
+# should survive, so traffic keeps flowing on whichever path was chosen even
+# while the agent is restarting.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

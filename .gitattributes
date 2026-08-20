@@ -1,0 +1,19 @@
+# Line endings are LF in the repository, on every platform.
+#
+# Development happens on Windows and deployment is Debian, so without this the
+# working tree gets CRLF from core.autocrlf while the committed blobs stay LF.
+# Nothing breaks, but `gofmt -l` then reports every Go file as unformatted -
+# the difference is the line endings and nothing else - which makes the check
+# CLAUDE.md tells you to run useless, and `gofmt -w ./cmd ./internal` rewrites
+# the whole tree and buries the change it was run alongside.
+#
+# The shell scripts and unit files are the load-bearing case rather than a
+# tidiness one: they are executed on Debian, and CRLF in a shebang line is a
+# "bad interpreter" error that names a file that plainly exists.
+* text=auto eol=lf
+
+# Real binaries, left alone.
+*.db binary
+*.png binary
+*.jpg binary
+*.ico binary

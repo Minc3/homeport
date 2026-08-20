@@ -1,0 +1,28 @@
+{
+  "_comment": "Install as /etc/failover/linker.json with mode 0600. Only needed on an extra host behind the backend - most sites never run one. See SETUP.md section 10.",
+
+  "role": "linker",
+
+  "_psk": "Must match the frontend exactly.",
+  "psk": "CHANGE-ME-openssl-rand-hex-32",
+
+  "state_dir": "/var/lib/failover",
+
+  "overlay": {
+    "_comment": "The same addressing as the frontend and backend. subnet must be set here and in both of their bootstrap files, and covered by AllowedIPs on the frontend's WireGuard peers - the shipped setup uses 10.99.0.0/24. A peer that excludes this host drops its traffic before it reaches the tunnel interface, silently.",
+    "frontend_ip": "10.99.0.1",
+    "backend_ip": "10.99.0.2",
+    "subnet": "10.99.0.0/24",
+    "device": "dummy0",
+    "probe_port": 51999,
+    "control_port": 51998
+  },
+
+  "linker": {
+    "_overlay_ip": "This host's own overlay address. Inside the subnet above, and unique among the linkers. Services are published here by setting 'Published to' to this address in the portal.",
+    "overlay_ip": "10.99.0.3",
+
+    "_backend_lan": "The backend's address on THIS network - the next hop, not its overlay address. Overlay traffic reaches the backend as a neighbour on the LAN, and the backend puts it on whichever tunnel is active.",
+    "backend_lan": "192.168.1.2"
+  }
+}

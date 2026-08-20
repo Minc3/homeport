@@ -1,0 +1,38 @@
+[Unit]
+Description=Path failover backend (probe responder, return routing, LTE metering)
+Documentation=https://github.com/quinlan102/homeport
+# nftables.service flushes the ruleset when it starts, and the backend now
+# installs two tables of its own (failover_return, and failover_egress when
+# egress networks are configured). The reconcilers repair routes and
+# rp_filter but not nftables, so a late nftables.service would take the
+# return marking away with nothing to notice - published replies would then
+# leave by the LAN default route instead of the tunnel.
+After=network-online.target nftables.service wg-quick@wg-nbn.service wg-quick@wg-lte1.service wg-quick@wg-lte2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/failover-backend -config /etc/failover/backend.json
+Restart=always
+RestartSec=3
+
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+
+StateDirectory=failover
+ConfigurationDirectory=failover
+ProtectSystem=strict
+ReadWritePaths=/var/lib/failover
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

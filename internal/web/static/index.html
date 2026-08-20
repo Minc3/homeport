@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Failover</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:,">
+</head>
+<body>
+
+<header>
+  <h1>Path failover</h1>
+  <span id="mode-badge" class="badge">&hellip;</span>
+  <span id="active-badge" class="badge">&hellip;</span>
+  <span id="backend-badge" class="badge">&hellip;</span>
+  <span id="versions" class="versions"></span>
+  <span class="spacer"></span>
+  <nav>
+    <button data-tab="dashboard" class="active">Dashboard</button>
+    <button data-tab="settings">Settings</button>
+    <button data-tab="events">Activity</button>
+  </nav>
+  <button class="btn" id="logout">Log out</button>
+</header>
+
+<main>
+  <div id="held" class="alert hidden">
+    <h3>No usable path</h3>
+    <p id="held-reason"></p>
+    <div id="held-actions" class="row"></div>
+  </div>
+
+  <div id="observe" class="alert info hidden">
+    <h3>Observe mode</h3>
+    <p>Decisions are being computed and logged, but nothing is applied to routing or nftables.
+       Watch this for a while, then arm it when the picture looks right.</p>
+    <div class="row"><button class="btn primary" id="arm">Arm it</button></div>
+  </div>
+
+  <!-- The loudest thing on the page, because it is the fault that hides
+       best: two tunnels on one internet service still probe perfectly, so
+       every path reads healthy and the failover has nowhere to go. -->
+  <div id="endpoint-clash" class="alert hidden">
+    <h3>Two tunnels are on the same WAN</h3>
+    <p id="endpoint-clash-detail"></p>
+    <p>Each tunnel is supposed to ride its own internet service. These are arriving from
+       one public address, so there is only one link underneath them &mdash; they will fail
+       together, and failing over from one to the other achieves nothing.</p>
+    <p>On pfSense: policy-route each tunnel to a <strong>single gateway</strong>, never a
+       gateway group, and set gateway monitoring <strong>action</strong> to disabled for each
+       gateway. By default pfSense withdraws the policy route for a gateway it thinks is
+       down and the traffic falls through to the default one, which is exactly this.</p>
+  </div>
+
+  <div id="stale-rules" class="alert hidden">
+    <h3>Disarmed, but rules are still live</h3>
+    <p>The agent has stopped making changes, but the nftables rules and routes it
+       installed while armed are still in place &mdash; removing them would drop every
+       published service instantly. Use <strong>Revert all system changes</strong> in
+       Settings to take them down.</p>
+  </div>
+
+  <section id="tab-dashboard">
+    <div id="cards" class="cards"></div>
+
+    <div id="linkers-section" class="hidden">
+      <h2 class="section-head">Extra hosts</h2>
+      <div id="linkers" class="cards"></div>
+    </div>
+
+    <!-- Absent unless protection is switched on and its rules are really
+         loaded. What a limiter has dropped is the only thing that separates
+         "this threshold is too tight" from "the service is broken". -->
+    <div id="protect-section" class="hidden">
+      <h2 class="section-head">Protection</h2>
+      <div class="card" id="protect-body"></div>
+    </div>
+  </section>
+
+  <section id="tab-settings" class="hidden">
+    <form id="settings-form"></form>
+  </section>
+
+  <section id="tab-events" class="hidden">
+    <div class="card table-wrap">
+      <table>
+        <thead><tr><th>When</th><th>Kind</th><th>Message</th></tr></thead>
+        <tbody id="events-body"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

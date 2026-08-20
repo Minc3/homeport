@@ -1,0 +1,243 @@
+package engine
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/quinlan102/homeport/internal/model"
+)
+
+// protectedConfig is a site that has turned on shaping and one rate limit.
+func protectedConfig() model.Config {
+	cfg := model.Defaults()
+	cfg.Mode = model.ModeArmed
+	cfg.Frontend.PublicIface = "eth0"
+	cfg.Protect.Enabled = true
+	cfg.Protect.PacketsPerSec = 400
+	cfg.Paths[0].Shape.ToBackendMbit = 40
+	return cfg
+}
+
+// Observe mode's promise is that nothing the agent does can be felt by a
+// player. A shaper decides what gets dropped and when, so it belongs with the
+// DNAT rules, not with the measurement plumbing that is installed regardless.
+func TestObserveModeShapesNothing(t *testing.T) {
+	cfg := protectedConfig()
+	cfg.Mode = model.ModeObserve
+
+	e, q := engineForReconcile(t, healthyKernel())
+	e.cfg = cfg
+	e.runner = &dryRunner{q}
+
+	e.applyShaping(context.Background(), cfg, e.runner)
+
+	for _, c := range q.writes() {
+		if strings.HasPrefix(c, "tc qdisc replace") || strings.HasPrefix(c, "tc qdisc del") {
+			t.Errorf("observe mode changed the shaping: %q", c)
+		}
+	}
+}
+
+// The same for the limiters: a drop rule loaded in observe mode is traffic
+// being affected by a system that promised not to.
+func TestObserveModeLoadsNoProtectionRules(t *testing.T) {
+	cfg := protectedConfig()
+	cfg.Mode = model.ModeObserve
+
+	e, q := engineForReconcile(t, healthyKernel())
+	e.cfg = cfg
+	gated := &dryRunner{q}
+
+	e.applyProtect(context.Background(), cfg, gated, e.real)
+
+	for _, c := range q.writes() {
+		if strings.HasPrefix(c, "nft -f") {
+			t.Errorf("observe mode loaded a protection ruleset: %q", c)
+		}
+	}
+}
+
+// A site with the feature off must never run nft for it - and must still have
+// the table removed, because turning it off generates nothing to load and an
+// empty load would leave the old rules running.
+func TestDisablingProtectionRemovesTheTable(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Mode = model.ModeArmed
+
+	e, q := engineForReconcile(t, healthyKernel())
+	e.cfg = cfg
+
+	e.applyProtect(context.Background(), cfg, e.runner, e.real)
+
+	if q.count("nft delete table ip failover_protect") != 1 {
+		t.Errorf("the protection table was not removed; writes were %v", q.writes())
+	}
+	if e.protectOn {
+		t.Error("protection is reported as running with the feature off")
+	}
+}
+
+// The queue discipline belongs to the interface, and `wg-quick down` deletes
+// the interface. Nothing else notices: traffic keeps flowing, unshaped, and
+// only the latency-under-load gets quietly worse.
+func TestReconcileRestoresShapingLostWithTheTunnel(t *testing.T) {
+	kernel := healthyKernel()
+	kernel["tc qdisc show dev wg-nbn"] = "qdisc noqueue 0: root refcnt 2"
+	kernel["tc qdisc show dev wg-lte1"] = "qdisc noqueue 0: root refcnt 2"
+	kernel["tc qdisc show dev wg-lte2"] = "qdisc noqueue 0: root refcnt 2"
+
+	e, q := engineForReconcile(t, kernel)
+	e.cfg = protectedConfig()
+
+	e.reconcileRouting(context.Background())
+
+	if q.count("tc qdisc replace dev wg-nbn root cake bandwidth 40mbit") != 1 {
+		t.Errorf("shaping was not restored; writes were %v", q.writes())
+	}
+}
+
+// An intact shaper must be left completely alone. Replacing it on every tick
+// would discard the queue state that is doing the work, ten times a minute.
+func TestReconcileLeavesIntactShapingAlone(t *testing.T) {
+	kernel := healthyKernel()
+	kernel["tc qdisc show dev wg-nbn"] = "qdisc cake 8003: root refcnt 2 bandwidth 40Mbit besteffort overhead 80"
+
+	e, q := engineForReconcile(t, kernel)
+	e.cfg = protectedConfig()
+
+	e.reconcileRouting(context.Background())
+
+	if got := q.writes(); len(got) != 0 {
+		t.Errorf("reconcile wrote %v to a system that was already correct", got)
+	}
+}
+
+// An unshaped path must not even be asked about. This is what keeps a site that
+// never turned shaping on identical to one built before the feature existed.
+func TestReconcileIgnoresPathsWithNoShapingConfigured(t *testing.T) {
+	e, q := engineForReconcile(t, healthyKernel())
+
+	e.reconcileRouting(context.Background())
+
+	for _, c := range q.calls {
+		if strings.HasPrefix(c, "tc ") {
+			t.Errorf("ran tc on a site with no shaping configured: %q", c)
+		}
+	}
+}
+
+// Revert takes down what the agent installed. It must remove the shaper from
+// the tunnels it shaped, and must not touch one it never shaped - that queue
+// discipline belongs to whoever put it there.
+func TestRevertRemovesOnlyTheShapersItInstalled(t *testing.T) {
+	e, q := engineForReconcile(t, healthyKernel())
+	e.cfg = protectedConfig() // only nbn is shaped
+
+	e.Revert(context.Background())
+
+	if q.count("tc qdisc del dev wg-nbn root") != 1 {
+		t.Errorf("did not remove the shaper it installed; writes were %v", q.writes())
+	}
+	for _, iface := range []string{"wg-lte1", "wg-lte2"} {
+		if q.count("tc qdisc del dev "+iface+" root") != 0 {
+			t.Errorf("removed a queue discipline on %s, which this agent never shaped", iface)
+		}
+	}
+	if q.count("nft delete table ip failover_protect") != 1 {
+		t.Errorf("revert left the protection table in place; writes were %v", q.writes())
+	}
+}
+
+// dryRunner reports every command as observed rather than applied, the way the
+// real observe-mode runner does, while still recording what was asked for.
+type dryRunner struct{ *queryRunner }
+
+func (d *dryRunner) Applying() bool { return false }
+
+func (d *dryRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	// Readbacks still have to work in observe mode - measurement is not gated -
+	// so those run for real and everything else is swallowed.
+	if len(args) > 0 && (args[len(args)-1] == "show" || hasArg(args, "show") || name == "sysctl") {
+		return d.queryRunner.Run(ctx, name, args...)
+	}
+	return "", nil
+}
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// The fault this exists to catch, and the reason it gets an alert of its own
+// rather than a mark on a path card: each of these tunnels is healthy, probes
+// perfectly and reports nothing wrong. What has failed is the assumption
+// underneath the whole system - three independent links - and pfSense sending
+// two tunnels out one WAN is invisible from every other signal here.
+func TestTwoTunnelsOnOneServiceAreReported(t *testing.T) {
+	kernel := healthyKernel()
+	kernel["wg show all endpoints"] = "wg-nbn\tkeyA=\t203.0.113.10:51820\n" +
+		"wg-lte1\tkeyB=\t198.51.100.20:41234\n" +
+		"wg-lte2\tkeyC=\t198.51.100.20:52001" // same address, different NAT port
+
+	e, _ := engineForReconcile(t, kernel)
+
+	e.samplePeerEndpoints(context.Background())
+
+	st := e.Status()
+	if len(st.SharedEndpoints) != 1 {
+		t.Fatalf("reported %+v, want the one clash", st.SharedEndpoints)
+	}
+	got := st.SharedEndpoints[0]
+	if got.Address != "198.51.100.20" {
+		t.Errorf("reported address %q", got.Address)
+	}
+	if len(got.Paths) != 2 || got.Paths[0] != "lte1" || got.Paths[1] != "lte2" {
+		t.Errorf("reported paths %v, want lte1 and lte2", got.Paths)
+	}
+	// The address is on the paths themselves too, so a card can say where its
+	// traffic is really arriving from.
+	for _, p := range st.Paths {
+		if p.PeerEndpoint == "" {
+			t.Errorf("path %s reports no endpoint", p.Name)
+		}
+	}
+}
+
+// Three services, three addresses: silence. An alert that fires on a correctly
+// configured system is one nobody reads when it matters.
+func TestSeparateServicesReportNoClash(t *testing.T) {
+	kernel := healthyKernel()
+	kernel["wg show all endpoints"] = "wg-nbn\tkeyA=\t203.0.113.10:51820\n" +
+		"wg-lte1\tkeyB=\t198.51.100.20:41234\n" +
+		"wg-lte2\tkeyC=\t198.51.100.99:52001"
+
+	e, _ := engineForReconcile(t, kernel)
+
+	e.samplePeerEndpoints(context.Background())
+
+	if got := e.Status().SharedEndpoints; len(got) != 0 {
+		t.Errorf("a correctly separated system reported %+v", got)
+	}
+}
+
+// A tunnel that has not handshaked yet has no address to compare, and two of
+// them must not read as two tunnels sharing one - "unknown" is not a value.
+func TestTunnelsWithNoHandshakeAreNotTreatedAsSharing(t *testing.T) {
+	kernel := healthyKernel()
+	kernel["wg show all endpoints"] = "wg-nbn\tkeyA=\t203.0.113.10:51820\n" +
+		"wg-lte1\tkeyB=\t(none)\n" +
+		"wg-lte2\tkeyC=\t(none)"
+
+	e, _ := engineForReconcile(t, kernel)
+
+	e.samplePeerEndpoints(context.Background())
+
+	if got := e.Status().SharedEndpoints; len(got) != 0 {
+		t.Errorf("tunnels with no handshake were reported as sharing an address: %+v", got)
+	}
+}

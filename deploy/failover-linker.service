@@ -1,0 +1,41 @@
+[Unit]
+Description=Path failover linker (overlay address and return routing for one extra host)
+Documentation=https://github.com/quinlan102/homeport
+# No wg-quick ordering: a linker terminates no tunnels. It needs the network up
+# so the backend is reachable as a neighbour, and nothing else.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/failover-linker -config /etc/failover/linker.json
+Restart=always
+RestartSec=3
+
+# Routing, plus one nftables table of its own that marks connections so a
+# containerised service's replies can be routed back. CAP_NET_ADMIN covers
+# `ip rule`, `ip route` and nftables alike.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+StateDirectory=failover
+ConfigurationDirectory=failover
+ProtectSystem=strict
+ReadWritePaths=/var/lib/failover
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# Deliberately not torn down on stop. The overlay address and its route are what
+# make published services on this host reachable; removing them because the
+# agent restarted would drop every session for the few seconds it takes to come
+# back. Use `failover-linker -revert` to actually take them down.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

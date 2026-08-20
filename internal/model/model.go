@@ -1,0 +1,725 @@
+// Package model holds the configuration and runtime types shared by the
+// frontend and backend agents.
+package model
+
+import "time"
+
+// Mode controls whether the frontend is allowed to touch the system.
+const (
+	ModeObserve = "observe" // compute decisions, never apply them
+	ModeArmed   = "armed"   // apply routing and nftables changes
+)
+
+// Health is what the probes say about a path. It is deliberately separate
+// from policy blocks: a path can be perfectly healthy and still unusable
+// because it blew its quota.
+type Health string
+
+const (
+	HealthUnknown Health = "unknown" // no probe result yet
+	HealthUp      Health = "up"
+	HealthSuspect Health = "suspect" // losing probes, not yet condemned
+	HealthDown    Health = "down"
+)
+
+// Block is a policy reason a path may not be selected. Empty means no block.
+type Block string
+
+const (
+	BlockNone       Block = ""
+	BlockQuota      Block = "quota"      // over the monthly cap
+	BlockQuarantine Block = "quarantine" // circuit breaker tripped on flapping
+	BlockDisabled   Block = "disabled"   // switched off in the portal
+	BlockDegraded   Block = "degraded"   // reachable but loss/latency over threshold
+)
+
+// Config is the full user-editable configuration. It lives in SQLite on the
+// frontend; the backend receives the parts it needs over the control channel.
+type Config struct {
+	Mode     string         `json:"mode"`
+	Frontend FrontendConfig `json:"frontend"`
+	Overlay  OverlayConfig  `json:"overlay"`
+	Paths    []PathConfig   `json:"paths"`
+	Probe    ProbeConfig    `json:"probe"`
+	Failover FailoverConfig `json:"failover"`
+	Services []Service      `json:"services"`
+	Linkers  []Linker       `json:"linkers,omitempty"`
+
+	// BackendLAN is the backend's own address on the network its linkers sit
+	// on. The frontend never uses it to route anything - it is the one fact a
+	// linker's config needs that cannot be derived from anything else here, so
+	// holding it lets the portal generate that config instead of the operator
+	// assembling it. Empty on a site with no linkers.
+	BackendLAN string       `json:"backend_lan,omitempty"`
+	Egress     EgressConfig `json:"egress"`
+	Notify     NotifyConfig `json:"notify"`
+
+	// Protect is edge filtering and rate limiting on the frontend. Off, with
+	// every threshold zero, on every site until somebody turns it on.
+	Protect ProtectConfig `json:"protect,omitempty"`
+}
+
+// ProtectConfig is the frontend's filtering of published traffic.
+//
+// One master switch and a set of thresholds, all off by default and each doing
+// nothing at zero. That is not timidity: every one of these can drop a packet a
+// real player sent, and a limit set from a guess produces "some people cannot
+// connect", which is indistinguishable from the service being down. They are
+// meant to be turned on one at a time against the counters the portal shows.
+//
+// The whole table matches only traffic arriving on the public interface, before
+// destination NAT. Nothing here can see a probe, the control channel or any
+// overlay traffic, which is deliberate - the system must never be able to drop
+// its own health checks and conclude a link has failed.
+type ProtectConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Per-source limits. Zero disables each one individually.
+	NewConnsPerSec    int `json:"new_conns_per_sec,omitempty"`    // TCP connection attempts per second
+	MaxConnsPerSource int `json:"max_conns_per_source,omitempty"` // concurrent tracked TCP connections
+	PacketsPerSec     int `json:"packets_per_sec,omitempty"`      // UDP packets per second
+	QueriesPerSec     int `json:"queries_per_sec,omitempty"`      // Source-engine connectionless packets
+
+	// BlockSeconds parks a source that trips one of the above in a set with
+	// this timeout, dropped on sight until it expires. Zero drops only the
+	// excess and never parks anybody, which is the gentler and less effective
+	// setting.
+	BlockSeconds int `json:"block_seconds,omitempty"`
+
+	// Edge hygiene. Cheap, no thresholds, and no legitimate client sends any
+	// of what they drop.
+	DropInvalid  bool `json:"drop_invalid,omitempty"`   // packets conntrack cannot place
+	DropBogusTCP bool `json:"drop_bogus_tcp,omitempty"` // flag combinations no stack sends
+	DropSpoofed  bool `json:"drop_spoofed,omitempty"`   // private and reserved sources from the internet
+}
+
+// Linker is an extra host behind the backend that holds an overlay address.
+//
+// It is declared here rather than discovered because nothing in the system
+// knows the mapping from an overlay address to the machine holding it: the
+// linker agent has no control channel, and the frontend only ever sees the
+// address as a DNAT target. Declaring it in one place is what lets the backend
+// be told, rather than the operator installing a route by hand on a box the
+// whole point of the agents is to stop logging into.
+//
+// Empty list is the state every site starts in and most stay in, and it must
+// generate exactly what a build with no linker support generated - see the
+// multi-host invariant.
+type Linker struct {
+	Name string `json:"name"`
+
+	// OverlayIP is the address the frontend publishes services to, e.g.
+	// 10.99.0.3. It must sit inside Overlay.Subnet.
+	OverlayIP string `json:"overlay_ip"`
+
+	// LanIP is the linker's address on the backend's network - the next hop
+	// the backend forwards to. It is not the overlay address, and the two
+	// names invite exactly that mistake.
+	LanIP string `json:"lan_ip"`
+
+	// Table is the routing table that host uses for its overlay traffic. Zero
+	// means the default.
+	//
+	// Configurable because the number belongs to that machine's own namespace,
+	// not to this system. A linker is somebody's server first, and a box that
+	// already policy-routes - a second ISP, a VPN - may well be using the
+	// default already. Two systems writing one table fight over its default
+	// route, and the loser's traffic goes somewhere nobody intended.
+	Table int `json:"table,omitempty"`
+
+	Enabled bool `json:"enabled"`
+}
+
+// TableOr resolves which routing table a linker uses.
+func (l Linker) TableOr(def int) int {
+	if l.Table != 0 {
+		return l.Table
+	}
+	return def
+}
+
+// Normalise fills in settings that a stored configuration predates.
+//
+// A config written by an older build unmarshals with any newer field at its
+// zero value, and Defaults() only ever applies to a first run - so adding a
+// field silently gives every existing deployment a zero for it. For the quality
+// weights that means every path scoring identically and the portal showing a
+// form full of zeros, which is how this was found.
+//
+// It is deliberately conservative: it fills in a group of settings only when
+// *all* of them are zero, which cannot be a deliberate choice, and leaves an
+// individual zero alone because that is a legitimate value for a margin or a
+// dwell. Call it on load and on save, so a config from an older portal is
+// treated the same as one from an older binary.
+func Normalise(cfg *Config) {
+	if cfg.Failover.Selection == "" {
+		cfg.Failover.Selection = SelectionPriority
+	}
+	q := &cfg.Failover.Quality
+	if q.LossWeight == 0 && q.RTTWeight == 0 && q.JitterWeight == 0 &&
+		q.MarginPct == 0 && q.MinDwellSec == 0 {
+		*q = Defaults().Failover.Quality
+	}
+}
+
+// EgressConfig lists backend-side networks whose outbound traffic should leave
+// through the frontend rather than out the house's own internet service.
+//
+// This is the second half of Frontend.BackendEgress, and it exists because a
+// containerised service cannot use the first half. Binding to the overlay
+// address is enough for anything running on the backend host, but the overlay
+// address does not exist inside a container's network namespace - and the
+// container's packets are forwarded through the host rather than originated on
+// it, so there is no local socket to identify them by either. What is left to
+// match on is where they came from: the bridge network's address range.
+type EgressConfig struct {
+	Sources []EgressSource `json:"sources"`
+}
+
+// EgressSource is one network whose traffic is pulled onto the tunnel.
+type EgressSource struct {
+	Name string `json:"name"` // free text, e.g. "gmod bridge"
+
+	// Host is the overlay address of the agent that owns this network. Empty
+	// means the backend, which is what every row meant before linkers existed.
+	//
+	// Without it the list is global and every agent installs every row. That is
+	// not merely untidy: 172.17.0.0/16 is Docker's default bridge on *every*
+	// machine, and the allocator hands out 172.18, 172.19 and so on in the same
+	// order on each one - so several hosts routinely end up with the identical
+	// subnet. One row would then pull containers onto the tunnel on hosts it
+	// was never meant to touch, silently, and through a metered link.
+	//
+	// The matching rule is that a repeated CIDR *within* one host is an error
+	// while the same CIDR on two different hosts is perfectly normal. See
+	// web.validate.
+	Host string `json:"host"`
+
+	CIDR    string `json:"cidr"` // e.g. 172.18.0.0/16
+	Enabled bool   `json:"enabled"`
+}
+
+// HostOr resolves which agent owns this network, defaulting to the backend.
+func (s EgressSource) HostOr(backendIP string) string {
+	if s.Host != "" {
+		return s.Host
+	}
+	return backendIP
+}
+
+// FrontendConfig describes the datacentre box's public side, used to scope
+// the DNAT rules so they only match traffic arriving from the internet.
+type FrontendConfig struct {
+	PublicIface string `json:"public_iface"` // e.g. eth0
+	PublicIP    string `json:"public_ip"`    // optional; empty matches any address on the interface
+
+	// BackendEgress sends traffic the backend originates from its overlay
+	// address out through the frontend's public address, instead of out the
+	// house's own internet service.
+	//
+	// It exists for game server registration. A Source server is listed in the
+	// server browser at the address Steam observes its heartbeat coming from -
+	// there is no way to declare a different one, deliberately, as anti-
+	// spoofing. Without this the heartbeat leaves via pfSense and the server is
+	// advertised at the home WAN address: not the published address, no port
+	// forward behind it, changes when the service does, and unreachable
+	// entirely while a CGNAT'd LTE path is carrying the traffic. Players who
+	// found the server through the browser would bypass the failover.
+	//
+	// Off by default. It is opt-in because it also puts everything else the
+	// backend sends from the overlay address onto the tunnel, and therefore
+	// through the LTE quota during a failover.
+	BackendEgress bool `json:"backend_egress"`
+}
+
+// OverlayConfig describes the stable addressing that makes failover invisible
+// to clients. Neither address ever changes; only the interface the packets
+// leave through does.
+type OverlayConfig struct {
+	FrontendIP string `json:"frontend_ip"` // e.g. 10.99.0.1
+	BackendIP  string `json:"backend_ip"`  // e.g. 10.99.0.2
+
+	// Device carries the overlay address. It is a dummy interface rather than
+	// one of the tunnels on purpose: the address has to survive any tunnel
+	// going down, or the source address would vanish with the link and the
+	// whole point of the stable addressing would be lost.
+	Device string `json:"device"`
+
+	// Subnet is the range the frontend routes down the active tunnel, instead
+	// of the backend's single address. Empty is the normal case and means
+	// exactly what it always meant: one host at the far end, reached by a /32.
+	//
+	// It is only set on a site that runs linker agents. A site with one host at
+	// the far end has no reason to route a range down its tunnel, so nothing
+	// here is derived or assumed: an empty Subnet keeps the /32 behaviour byte
+	// for byte.
+	//
+	// It also has to be covered by AllowedIPs on the frontend's peers, which is
+	// why the shipped setup puts the whole range there from the start rather
+	// than the backend's address - the narrower value fails silently, and only
+	// on the day a second host appears.
+	//
+	// Like the rest of this struct it is bootstrap-owned, never portal-edited.
+	// Both ends have to agree on it.
+	Subnet string `json:"subnet"` // e.g. 10.99.0.0/24; empty = the backend alone
+
+	ProbePort   int `json:"probe_port"`
+	ControlPort int `json:"control_port"`
+}
+
+// MatchPrefix is what nftables rules match the overlay on, and RoutePrefix is
+// what `ip route` installs and reads back for it.
+//
+// They differ in one respect only: with no subnet configured, MatchPrefix
+// returns the backend's bare address and RoutePrefix an explicit /32. The
+// kernel treats those as identical, but they are what each of the two already
+// generated before this field existed - and a site with no linkers must produce
+// byte-identical rules and commands, or every deployment gets a diff in
+// ruleset.nft for a feature it does not use. Both are pinned by tests.
+//
+// Probing and the control channel deliberately use neither: those address the
+// primary backend specifically and stay a /32 however many hosts sit behind it.
+// Only the published data plane widens.
+func (o OverlayConfig) MatchPrefix() string {
+	if o.Subnet != "" {
+		return o.Subnet
+	}
+	return o.BackendIP
+}
+
+// RoutePrefix is the destination the frontend routes down the active tunnel.
+func (o OverlayConfig) RoutePrefix() string {
+	if o.Subnet != "" {
+		return o.Subnet
+	}
+	return o.BackendIP + "/32"
+}
+
+// PathConfig is one WireGuard tunnel and the policy attached to it.
+type PathConfig struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name"`     // nbn, lte1, lte2
+	Iface    string `json:"iface"`    // wg-nbn, wg-lte1, wg-lte2
+	Priority int    `json:"priority"` // lower wins; 1 = most preferred
+	Table    int    `json:"table"`    // routing table used to probe this path specifically
+	Mark     int    `json:"mark"`     // fwmark selecting that table
+	Enabled  bool   `json:"enabled"`
+	Metered  bool   `json:"metered"` // subject to quota accounting
+	Quota    Quota  `json:"quota"`
+
+	// Shape is the queue discipline for this tunnel. Zero in both directions
+	// means no shaping at all and no tc command is ever issued, which is the
+	// state every existing site is in.
+	Shape ShapeConfig `json:"shape,omitempty"`
+}
+
+// ShapeConfig is the rate each end may put into one tunnel.
+//
+// Two numbers because a queue only controls the direction it sits in front of,
+// and the two ends face opposite ways: the frontend's queue on wg-lte1 governs
+// what arrives at the house, the backend's queue on the same interface governs
+// what leaves it. Naming them after the *link* rather than after the host means
+// the operator enters the two figures a speed test gives them.
+//
+// The value belongs slightly under the real line rate. Set at or above it the
+// queue forms in the carrier's buffer instead of ours and nothing has been
+// gained; that queue is the whole point, because it is the one we can keep
+// short.
+type ShapeConfig struct {
+	ToBackendMbit  float64 `json:"to_backend_mbit,omitempty"`  // frontend egress: the home's download
+	ToFrontendMbit float64 `json:"to_frontend_mbit,omitempty"` // backend egress: the home's upload
+}
+
+// Quota is the monthly data allowance for a metered path.
+type Quota struct {
+	LimitBytes        int64   `json:"limit_bytes"`         // 0 disables the quota
+	CeilingBytes      int64   `json:"ceiling_bytes"`       // absolute stop, 0 = none
+	ResetDay          int     `json:"reset_day"`           // day of month, 1 = the 1st
+	Timezone          string  `json:"timezone"`            // IANA zone for the reset boundary
+	Calibration       float64 `json:"calibration"`         // percent, 100 = no correction
+	OverheadPerPacket int     `json:"overhead_per_packet"` // bytes per packet for WG+UDP+IP
+}
+
+// ProbeConfig tunes end-to-end path testing. These probe the backend
+// through each tunnel, not the state of the tunnel itself.
+type ProbeConfig struct {
+	ActiveIntervalMs  int     `json:"active_interval_ms"`
+	StandbyIntervalMs int     `json:"standby_interval_ms"`
+	TimeoutMs         int     `json:"timeout_ms"`
+	FailThreshold     int     `json:"fail_threshold"`    // consecutive losses before down
+	RecoverThreshold  int     `json:"recover_threshold"` // consecutive successes before up
+	WindowSize        int     `json:"window_size"`       // sliding window for loss and jitter
+	MaxLossPct        float64 `json:"max_loss_pct"`      // above this the path is degraded
+	MaxRTTMs          int     `json:"max_rtt_ms"`        // above this the path is degraded
+}
+
+// Selection is how the engine chooses between eligible paths.
+const (
+	// SelectionPriority is strict priority order: the lowest priority number
+	// that is usable wins, always.
+	SelectionPriority = "priority"
+
+	// SelectionQuality keeps priority order but allows a clearly better path to
+	// take over. "Clearly" is QualityConfig.MarginPct; without a margin the
+	// choice would change on measurement noise, and every change costs players
+	// a freeze.
+	SelectionQuality = "quality"
+)
+
+// FailoverConfig governs how paths are chosen and un-chosen.
+type FailoverConfig struct {
+	HoldDownSec      int `json:"hold_down_sec"`      // higher path must be clean this long before failback
+	FlapWindowSec    int `json:"flap_window_sec"`    // circuit breaker observation window
+	FlapThreshold    int `json:"flap_threshold"`     // failures in window before quarantine
+	QuarantineSec    int `json:"quarantine_sec"`     // initial cooldown
+	QuarantineMaxSec int `json:"quarantine_max_sec"` // cap on exponential backoff
+
+	Selection string        `json:"selection"` // priority (default) or quality
+	Quality   QualityConfig `json:"quality"`
+}
+
+// QualityConfig scores a path from its measurements. Lower is better.
+//
+// The weights are in milliseconds-equivalent, so they can be reasoned about
+// against each other: LossWeight is how many milliseconds of latency one
+// percent of packet loss is considered worth. It defaults high because for a
+// game server that is the truth - a clean 60ms link beats a lossy 30ms one, and
+// a scoring function that says otherwise would move traffic the wrong way.
+type QualityConfig struct {
+	LossWeight   float64 `json:"loss_weight"`   // ms-equivalent per 1% loss
+	RTTWeight    float64 `json:"rtt_weight"`    // multiplier on mean RTT
+	JitterWeight float64 `json:"jitter_weight"` // multiplier on jitter
+
+	// MarginPct is how much better a path must score before it may take traffic
+	// from the preferred one. This is what stops two similar links trading
+	// places on noise: without it, 40ms and 45ms would swap every few seconds
+	// and each swap is a visible stall.
+	MarginPct float64 `json:"margin_pct"`
+
+	// MinDwellSec is the floor under how often quality may move traffic.
+	//
+	// The margin and the hold-down between them make oscillation on noise
+	// impossible - the two comparisons cannot both be satisfied at once, so
+	// there is a dead zone rather than a threshold. What they do not do is cap
+	// how often a *genuine* alternation can switch: two links really taking
+	// turns being much better, which is what a carrier working on a tower
+	// produces, would move traffic every hold-down indefinitely, and every move
+	// costs connected players a freeze.
+	//
+	// It never delays a failover away from a path that has become unusable, nor
+	// a failback to the preferred path. It only rate-limits choosing between
+	// fallbacks that both work. Zero disables it.
+	MinDwellSec int `json:"min_dwell_sec"`
+}
+
+// Service is a published port forwarded from the frontend's public address to
+// the backend's overlay address. DNAT only, never SNAT, so the backend sees
+// the real client IP.
+type Service struct {
+	Name    string `json:"name"`
+	Proto   string `json:"proto"` // tcp or udp
+	Port    int    `json:"port"`
+	PortEnd int    `json:"port_end"` // 0 for a single port
+	Enabled bool   `json:"enabled"`
+
+	// Target is the overlay address this service is published to. Empty means
+	// the backend, which is what every service meant before linkers existed and
+	// what almost every service still means.
+	//
+	// It is an overlay address rather than a host name because that is what the
+	// DNAT rule needs and what the routing already knows how to reach; a name
+	// would be a second thing to keep in step for no gain.
+	Target string `json:"target"`
+
+	// SourceEngine marks a Source-engine game port, which changes nothing
+	// unless protection is on. It is what lets the connectionless packets - the
+	// A2S queries and connection attempts, which are the flood vector - be rate
+	// limited without touching the traffic of players already in the game.
+	SourceEngine bool `json:"source_engine,omitempty"`
+
+	// CeilingPPS caps this service in total, across every client. Zero is no
+	// cap. It exists because the scarce thing is the tunnel, not this box: an
+	// attack that the datacentre link shrugs off will still bury a 20 Mbit LTE
+	// service and bill you for it.
+	CeilingPPS int `json:"ceiling_pps,omitempty"`
+}
+
+// TargetOr resolves where a service is published, defaulting to the backend.
+func (s Service) TargetOr(backendIP string) string {
+	if s.Target != "" {
+		return s.Target
+	}
+	return backendIP
+}
+
+// NotifyConfig configures outbound alerts. Strongly recommended: quota
+// exhaustion parks the system waiting for a human to click approve.
+type NotifyConfig struct {
+	Enabled    bool   `json:"enabled"`
+	Kind       string `json:"kind"` // webhook, ntfy, telegram
+	URL        string `json:"url"`
+	Token      string `json:"token"`
+	OnSwitch   bool   `json:"on_switch"`
+	OnPathDown bool   `json:"on_path_down"`
+	OnQuota    bool   `json:"on_quota"`
+	OnHeld     bool   `json:"on_held"`
+}
+
+// PathState is the live runtime view of one path, as shown in the portal.
+type PathState struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name"`
+	Iface    string `json:"iface"`
+	Priority int    `json:"priority"`
+
+	Health Health `json:"health"`
+	Block  Block  `json:"block"`
+	Active bool   `json:"active"`
+
+	RTTms      float64 `json:"rtt_ms"`
+	JitterMs   float64 `json:"jitter_ms"`
+	LossPct    float64 `json:"loss_pct"`
+	ConsecLoss int     `json:"consec_loss"`
+	ConsecOK   int     `json:"consec_ok"`
+
+	LastReply    time.Time `json:"last_reply"`
+	HandshakeAge float64   `json:"handshake_age_sec"` // corroborating signal only
+
+	// PeerEndpoint is the address this tunnel's peer is currently seen at, as
+	// observed by the frontend. Because the backend dials out from behind
+	// CGNAT, it is the public address of the service that tunnel actually rode
+	// - which is the only direct evidence that pfSense pinned each tunnel to a
+	// different WAN. Two paths showing one address is that fault, and it is
+	// otherwise invisible: all three probe perfectly while there is only one
+	// link underneath them.
+	PeerEndpoint  string    `json:"peer_endpoint,omitempty"`
+	CleanSince    time.Time `json:"clean_since"` // for failback hold-down
+	QuarantineEnd time.Time `json:"quarantine_end"`
+
+	UsedBytes   int64     `json:"used_bytes"`
+	LimitBytes  int64     `json:"limit_bytes"`
+	PeriodStart time.Time `json:"period_start"`
+	PeriodEnd   time.Time `json:"period_end"`
+	GrantUntil  time.Time `json:"grant_until"`
+	GrantBytes  int64     `json:"grant_bytes"`
+}
+
+// Eligible reports whether the selector may choose this path.
+//
+// Suspect counts as eligible: it only means a probe was missed recently, and
+// treating a single lost packet as disqualifying would make the system thrash
+// between tunnels. Sustained loss is caught by the degraded block instead.
+func (p PathState) Eligible() bool {
+	return (p.Health == HealthUp || p.Health == HealthSuspect) && p.Block == BlockNone
+}
+
+// Status is the whole system snapshot the portal renders.
+type Status struct {
+	Mode       string      `json:"mode"`
+	ActivePath int         `json:"active_path"`
+	ActiveName string      `json:"active_name"`
+	Held       bool        `json:"held"` // no eligible path, waiting on approval
+	HeldReason string      `json:"held_reason"`
+	Paths      []PathState `json:"paths"`
+	LastSwitch time.Time   `json:"last_switch"`
+	BackendUp  bool        `json:"backend_up"` // control channel connected
+	// RulesActive reports that traffic-affecting rules are installed. It can be
+	// true while the mode is observe: disarming stops further changes but does
+	// not tear down what is already published.
+	RulesActive bool    `json:"rules_active"`
+	Uptime      float64 `json:"uptime_sec"`
+	DecisionSeq uint64  `json:"decision_seq"`
+
+	// PreferredPath is the most preferred enabled path - the one the system
+	// returns to on its clean streak. Reported so the portal can say whether
+	// traffic is on it or on a fallback without reimplementing the rule, which
+	// would then be free to drift from the selector's own definition.
+	PreferredPath int `json:"preferred_path"`
+
+	// Versions are here because there was no way to tell what a running host
+	// was from the portal, and a stale idea of the deployed build sends any
+	// procedure that depends on it down the wrong path. The backend's arrives
+	// in its Hello frame; it is the last one reported, so it can outlive the
+	// connection - BackendUp is what says whether the channel is live.
+	FrontendVersion string `json:"frontend_version"`
+	BackendVersion  string `json:"backend_version,omitempty"`
+	BackendHost     string `json:"backend_host,omitempty"`
+
+	// LinkerStates is liveness for the extra hosts, and it sits here beside the
+	// paths rather than among them on purpose. A game server box being down is
+	// not a path problem: feeding it to the trackers would make rebooting one
+	// look like a failing tunnel and move traffic to a metered link.
+	LinkerStates []LinkerState `json:"linker_states,omitempty"`
+
+	// Protect is what the edge limiters have actually done. Absent unless the
+	// feature is switched on and its rules are really loaded.
+	Protect *ProtectStatus `json:"protect,omitempty"`
+
+	// SharedEndpoints lists tunnels seen arriving from one public address,
+	// which means they are riding the same internet service. Empty is healthy
+	// and the normal case.
+	//
+	// It is reported separately from the paths, and loudly, because it is not a
+	// path fault: each of those tunnels works perfectly and probes perfectly.
+	// What has failed is the assumption the whole system rests on - that there
+	// are three independent links underneath - and nothing else in here can
+	// see that.
+	SharedEndpoints []SharedEndpoint `json:"shared_endpoints,omitempty"`
+}
+
+// SharedEndpoint is one public address that more than one tunnel is arriving
+// from, and the paths involved.
+type SharedEndpoint struct {
+	Address string   `json:"address"`
+	Paths   []string `json:"paths"`
+}
+
+// ProtectStatus is the running state of the edge filtering.
+//
+// The counters are the whole point of reporting any of this. A limit that is
+// dropping traffic and a service that is broken look identical from outside, so
+// a limiter nobody can see the effect of is worse than no limiter: it turns a
+// tuning mistake into an unexplained outage.
+type ProtectStatus struct {
+	Counters []ProtectCounter `json:"counters,omitempty"`
+	Blocked  []BlockedSource  `json:"blocked,omitempty"`
+}
+
+// ProtectCounter is one limiter's tally since the rules were last loaded.
+// Saving the configuration reloads them, so these reset when you change a
+// setting.
+type ProtectCounter struct {
+	Name    string `json:"name"`
+	Packets int64  `json:"packets"`
+	Bytes   int64  `json:"bytes"`
+}
+
+// BlockedSource is an address parked by a limit, and the seconds it has left.
+type BlockedSource struct {
+	Address    string `json:"address"`
+	ExpiresSec int    `json:"expires_sec"`
+}
+
+// LinkerState is what the frontend knows about one extra host.
+type LinkerState struct {
+	Name      string    `json:"name"`
+	OverlayIP string    `json:"overlay_ip"`
+	LanIP     string    `json:"lan_ip"`
+	Up        bool      `json:"up"`
+	Version   string    `json:"version,omitempty"`
+	Hostname  string    `json:"hostname,omitempty"`
+	Since     time.Time `json:"since,omitempty"`
+
+	// LastSeen is when a frame last arrived from this host, and it is kept
+	// after the connection goes. Since answers how long the host has been
+	// connected; once it is not, the only useful question is how long it has
+	// been quiet - and a blank there reads exactly like a host that has never
+	// connected at all, which is a different fault with a different fix.
+	LastSeen time.Time `json:"last_seen,omitempty"`
+
+	// ConfiguredTable is what the portal holds for this host.
+	ConfiguredTable int `json:"configured_table,omitempty"`
+
+	// Table is what the host reported it is actually using. It can disagree
+	// with the configured value, because that value has to be present in the
+	// host's own bootstrap file before it can be told anything - so the portal
+	// says so rather than letting the two drift unnoticed.
+	Table int `json:"table,omitempty"`
+}
+
+// Defaults returns a configuration matching the agreed design: strict
+// NBN > LTE1 > LTE2 priority, 2-3 second detection, quotas on both LTE paths,
+// and observe mode so a fresh install cannot move traffic until it is armed.
+func Defaults() Config {
+	quota := func(limit int64) Quota {
+		return Quota{
+			LimitBytes:        limit,
+			CeilingBytes:      0,
+			ResetDay:          1,
+			Timezone:          "Australia/Sydney",
+			Calibration:       100,
+			OverheadPerPacket: 60,
+		}
+	}
+	return Config{
+		Mode: ModeObserve,
+		Frontend: FrontendConfig{
+			PublicIface: "eth0",
+		},
+		Overlay: OverlayConfig{
+			FrontendIP:  "10.99.0.1",
+			BackendIP:   "10.99.0.2",
+			Device:      "dummy0",
+			ProbePort:   51999,
+			ControlPort: 51998,
+		},
+		Paths: []PathConfig{
+			{ID: 1, Name: "nbn", Iface: "wg-nbn", Priority: 1, Table: 101, Mark: 0x101, Enabled: true},
+			{ID: 2, Name: "lte1", Iface: "wg-lte1", Priority: 2, Table: 102, Mark: 0x102, Enabled: true, Metered: true, Quota: quota(60 << 30)},
+			{ID: 3, Name: "lte2", Iface: "wg-lte2", Priority: 3, Table: 103, Mark: 0x103, Enabled: true, Metered: true, Quota: quota(20 << 30)},
+		},
+		Probe: ProbeConfig{
+			ActiveIntervalMs: 250,
+			// Standby paths are probed far more slowly than the active one,
+			// because the two answer different questions. The active path is
+			// being watched for failure and every extra second of detection is
+			// a second of dropped traffic; a standby path only has to be
+			// known-good by the time it is needed, and probing it is itself
+			// billed against the LTE quota it is being kept in reserve for.
+			//
+			// At one second a standby tunnel spends roughly 650 MB a month on
+			// probes alone - 66 bytes of payload plus about 60 of encapsulation,
+			// both ways, 86400 times a day. Five seconds costs about 130 MB and
+			// changes nothing that matters: a standby path still condemns after
+			// FailThreshold losses, and failback to a recovered path is governed
+			// by HoldDownSec, which is far longer either way.
+			StandbyIntervalMs: 5000,
+			TimeoutMs:         800,
+			FailThreshold:     8,
+			RecoverThreshold:  10,
+			WindowSize:        60,
+			MaxLossPct:        15,
+			MaxRTTMs:          400,
+		},
+		Failover: FailoverConfig{
+			HoldDownSec:      90,
+			FlapWindowSec:    600,
+			FlapThreshold:    4,
+			QuarantineSec:    300,
+			QuarantineMaxSec: 3600,
+
+			// Strict priority by default. Priority order is not merely a
+			// preference here - it is the cost ordering, NBN being unmetered
+			// and the LTE services capped - so choosing on measurements alone
+			// is opt-in.
+			Selection: SelectionPriority,
+			Quality: QualityConfig{
+				LossWeight:   25, // 1% loss is worth about 25ms of latency
+				RTTWeight:    1,
+				JitterWeight: 3,
+				MarginPct:    25,
+				MinDwellSec:  300,
+			},
+		},
+		Services: []Service{
+			{Name: "gmod", Proto: "udp", Port: 27015, Enabled: true},
+			{Name: "gmod-hltv", Proto: "udp", Port: 27020, Enabled: true},
+			{Name: "http", Proto: "tcp", Port: 80, Enabled: true},
+			{Name: "https", Proto: "tcp", Port: 443, Enabled: true},
+		},
+		Notify: NotifyConfig{
+			Enabled: false, Kind: "ntfy",
+			OnSwitch: true, OnPathDown: true, OnQuota: true, OnHeld: true,
+		},
+	}
+}
+
+// PathByID looks up a path config by its id.
+func (c Config) PathByID(id int) (PathConfig, bool) {
+	for _, p := range c.Paths {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return PathConfig{}, false
+}
