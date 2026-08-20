@@ -62,6 +62,13 @@ func run(log *slog.Logger, cfgPath, adminUser string) error {
 	}
 	defer st.Close()
 
+	// Asked before LoadConfig, which seeds the defaults and would make every
+	// start look like the first one.
+	configured, err := st.HasConfig()
+	if err != nil {
+		return err
+	}
+
 	cfg, err := st.LoadConfig()
 	if err != nil {
 		return err
@@ -69,6 +76,15 @@ func run(log *slog.Logger, cfgPath, adminUser string) error {
 	// The bootstrap file wins for overlay addressing: it is what the backend
 	// was told to dial, and the two must agree before anything else works.
 	cfg.Overlay = boot.Overlay
+	// The public interface is only seeded, and only once. The installer can
+	// discover it and Defaults() cannot - eth0 is wrong on most modern hosts -
+	// but it is a portal setting, so an operator who changes it there must not
+	// find the bootstrap file has quietly put it back on the next restart.
+	if !configured && boot.PublicIface != "" {
+		cfg.Frontend.PublicIface = boot.PublicIface
+		log.Info("first run: seeded the public interface from the bootstrap file",
+			"iface", boot.PublicIface)
+	}
 	if err := st.SaveConfig(cfg); err != nil {
 		return err
 	}

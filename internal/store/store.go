@@ -128,6 +128,23 @@ func (s *Store) Close() error { return s.db.Close() }
 // Configuration
 // ---------------------------------------------------------------------------
 
+// HasConfig reports whether a configuration has ever been stored.
+//
+// It exists so a caller can tell a first-ever start from every later one
+// *before* LoadConfig seeds the defaults, which is the only moment a bootstrap
+// value may be planted in the config without overriding an operator's choice.
+func (s *Store) HasConfig() (bool, error) {
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM config WHERE id = 1`).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check config: %w", err)
+	}
+	return true, nil
+}
+
 // LoadConfig returns the stored configuration, seeding defaults on first run.
 func (s *Store) LoadConfig() (model.Config, error) {
 	var raw string

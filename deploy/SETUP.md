@@ -317,8 +317,12 @@ failover.
 
 ### On the frontend
 
-Portal → Frontend. Set **Public interface** correctly; the default is `eth0` and
-a datacentre box may well name it something else.
+Portal → Frontend. Check **Public interface**. `install-frontend.sh` detects it
+from the default route and asks you to confirm, then seeds it on the agent's
+first start, so on a normal install it is already right. It is worth a look
+anyway, because the value that stands when detection finds nothing is the
+shipped default of `eth0`, and a datacentre box running a modern Debian is
+called something else.
 
 ```sh
 ip route get 1.1.1.1        # the dev it names is the public interface
@@ -485,8 +489,14 @@ are configuring a host by hand.
    ```
 
    The frontend script generates the shared secret and prints it; the backend
-   needs that same value. Both are idempotent, so re-running them is also how
-   you upgrade. They ship in **observe mode**: they probe, decide and log, but
+   needs that same value. It also works out which interface faces the internet
+   and asks you to confirm it, because the egress rule in section 5 and the
+   edge protection rules are both scoped to that interface, and a wrong name
+   never matches anything. `--public-iface ens3` gives it outright, and
+   `--no-ask` takes the detected value without prompting, which is what you
+   want when the script is driven by something other than a person.
+
+   Both are idempotent, so re-running them is also how you upgrade. They ship in **observe mode**: they probe, decide and log, but
    change nothing.
 
    Re-running to upgrade never rewrites an existing bootstrap file. If you do

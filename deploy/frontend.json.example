@@ -12,6 +12,9 @@
   "_portal_listen": "Bind to the admin WireGuard address, not the public one. WireGuard already does the encryption and peer authentication, so there is no certificate to manage and no public TCP surface to scan.",
   "portal_listen": "10.98.0.2:8080",
 
+  "_public_iface": "The interface facing the internet, e.g. ens3. Written by install-frontend.sh, which detects it from the default route and asks you to confirm. It seeds Frontend -> Public interface the first time the agent creates its database and is ignored on every start after that, so the portal stays the place to change it. Leave it out to keep the shipped default of eth0.",
+  "public_iface": "eth0",
+
   "overlay": {
     "_comment": "These two addresses never change. Failover swaps only the interface behind them, which is why live game sessions and established TCP connections survive a switch.",
     "frontend_ip": "10.99.0.1",

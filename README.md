@@ -200,7 +200,8 @@ On the VPS:
 sudo ./deploy/install-frontend.sh
 ```
 
-It prints a shared secret, the portal address and a one-time admin password.
+It works out which interface faces the internet and asks you to confirm it,
+then prints a shared secret, the portal address and a one-time admin password.
 Then at home:
 
 ```sh

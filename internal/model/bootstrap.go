@@ -21,6 +21,22 @@ type Bootstrap struct {
 	PortalListen string        `json:"portal_listen"` // frontend only, e.g. 10.98.0.2:8080
 	Overlay      OverlayConfig `json:"overlay"`       // backend needs this before config is pushed
 	Linker       LinkerInfo    `json:"linker"`        // linker only
+
+	// PublicIface seeds Frontend.PublicIface the first time the database is
+	// created, and is ignored on every start after that. Frontend only.
+	//
+	// It is here because it is the one setting the installer can discover and
+	// the shipped default cannot: Defaults() says eth0, and a datacentre box
+	// running a modern Debian names it ens3 or enp1s0. Getting it wrong is
+	// silent - the egress and protection rules are scoped to it, so they simply
+	// never match - which is exactly the kind of fault worth removing from the
+	// first install rather than documenting.
+	//
+	// Deliberately a seed and not an override. Overlay addressing is bootstrap
+	// authoritative because both hosts must agree on it; this is one host's
+	// local fact, it is editable in the portal, and a value that quietly
+	// reappeared on every restart would be worse than no value at all.
+	PublicIface string `json:"public_iface,omitempty"`
 }
 
 // LinkerInfo is the local topology a linker cannot be told over the wire.

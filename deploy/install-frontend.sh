@@ -23,6 +23,8 @@ CONFIG="$CONF_DIR/frontend.json"
 
 PSK=""
 PORTAL=""
+PUBLIC_IFACE=""
+ASK=1
 FRONTEND_IP=10.99.0.1
 BACKEND_IP=10.99.0.2
 # Empty is the normal case: one host at the far end. Only a site running
@@ -41,6 +43,10 @@ usage: sudo $0 [options]
                      Generated if omitted and no config exists yet.
   --portal <addr>    portal listen address. Defaults to the address on
                      wg-admin, port 8080, e.g. 10.98.0.2:8080.
+  --public-iface <n> the interface facing the internet, e.g. ens3. Detected
+                     from the default route, and confirmed with you when this
+                     is run on a terminal.
+  --no-ask           never prompt; take the detected value or leave it unset.
   --frontend-ip <ip> frontend overlay address (default $FRONTEND_IP)
   --backend-ip <ip>  backend overlay address (default $BACKEND_IP)
   --subnet <cidr>    overlay subnet, e.g. 10.99.0.0/24. Only for a site with
@@ -55,6 +61,8 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--psk) PSK="$2"; shift 2 ;;
 	--portal) PORTAL="$2"; shift 2 ;;
+	--public-iface) PUBLIC_IFACE="$2"; shift 2 ;;
+	--no-ask) ASK=0; shift ;;
 	--frontend-ip) FRONTEND_IP="$2"; shift 2 ;;
 	--backend-ip) BACKEND_IP="$2"; shift 2 ;;
 	--subnet) SUBNET="$2"; shift 2 ;;
@@ -153,6 +161,78 @@ if [ -z "$PORTAL" ]; then
 	fi
 fi
 
+# An existing bootstrap file is never rewritten, so on an upgrade there is
+# nothing to ask about: the answer would only be discarded.
+if [ -f "$CONFIG" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
+	WRITE_CONFIG=0
+else
+	WRITE_CONFIG=1
+fi
+
+# ---------------------------------------------------------------------------
+# Public interface
+#
+# The interface facing the internet. It scopes the egress source NAT and every
+# protection rule, and the shipped default is eth0, which a datacentre box
+# running a modern Debian is not called. Getting it wrong is silent: a rule
+# scoped to an interface that does not exist simply never matches, and the
+# heartbeat keeps leaving by pfSense.
+#
+# Detected here and written into the bootstrap file, which seeds it into the
+# portal's configuration the first time the agent creates its database. After
+# that the portal owns it.
+# ---------------------------------------------------------------------------
+
+detect_public_iface() {
+	local dev=""
+	# `ip route get` rather than reading the default route directly: it resolves
+	# policy routing as well, and it is the same command SETUP.md tells you to
+	# run to answer this question by hand.
+	dev="$(ip -4 route get 1.1.1.1 2>/dev/null |
+		awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+	if [ -z "$dev" ]; then
+		dev="$(ip -4 route show default 2>/dev/null |
+			awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+	fi
+	# Never one of this system's own interfaces. If the default route already
+	# points down a tunnel something is wrong that guessing cannot fix.
+	case "$dev" in
+	lo | wg-* | dummy*) dev="" ;;
+	esac
+	printf '%s' "$dev"
+}
+
+if [ "$WRITE_CONFIG" -eq 1 ]; then
+	say "Public interface"
+	detected="$(detect_public_iface)"
+	if [ -n "$PUBLIC_IFACE" ]; then
+		echo "  using $PUBLIC_IFACE, given on the command line"
+	elif [ "$ASK" -eq 1 ] && [ -r /dev/tty ]; then
+		answer=""
+		if [ -n "$detected" ]; then
+			printf '  which interface faces the internet? [%s] ' "$detected"
+		else
+			printf '  which interface faces the internet? (none detected, blank to skip) '
+		fi
+		read -r answer </dev/tty || answer=""
+		PUBLIC_IFACE="${answer:-$detected}"
+	else
+		PUBLIC_IFACE="$detected"
+		if [ -n "$PUBLIC_IFACE" ]; then
+			echo "  detected $PUBLIC_IFACE"
+		fi
+	fi
+
+	if [ -n "$PUBLIC_IFACE" ]; then
+		if ! ip link show "$PUBLIC_IFACE" >/dev/null 2>&1; then
+			warn "$PUBLIC_IFACE does not exist on this host - check the name, or set it later in the portal"
+		fi
+	else
+		warn "could not work out the public interface; the portal default of eth0 will stand"
+		warn "set it in Settings -> Frontend, or re-run with --public-iface <name>"
+	fi
+fi
+
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
@@ -178,8 +258,16 @@ echo "  /etc/systemd/system/$UNIT"
 # ---------------------------------------------------------------------------
 
 say "Bootstrap configuration"
-if [ -f "$CONFIG" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
+if [ "$WRITE_CONFIG" -eq 0 ]; then
 	echo "  $CONFIG exists, leaving it alone (--force-config to replace)"
+	# Nothing is lost by not rewriting it: public_iface only ever seeds a
+	# database that does not exist yet, so on a host that has already run the
+	# agent the portal holds the value and is the only place to change it.
+	echo "  the public interface is a portal setting once the agent has started:"
+	echo "  Settings -> Frontend -> Public interface"
+	if [ -n "$PUBLIC_IFACE" ]; then
+		warn "--public-iface $PUBLIC_IFACE was ignored: it seeds a first install only"
+	fi
 	chown root:root "$CONFIG"
 	chmod 0600 "$CONFIG"
 else
@@ -195,6 +283,7 @@ else
   "state_dir": "$STATE_DIR",
   "db_path": "$STATE_DIR/failover.db",
   "portal_listen": "$PORTAL",
+  "public_iface": "$PUBLIC_IFACE",
   "overlay": {
     "frontend_ip": "$FRONTEND_IP",
     "backend_ip": "$BACKEND_IP",

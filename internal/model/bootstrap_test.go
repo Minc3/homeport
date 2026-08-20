@@ -48,3 +48,34 @@ func TestFrontendBootstrapIsUnaffectedByLinkerChecks(t *testing.T) {
 		t.Fatalf("a frontend config must still load: %v", err)
 	}
 }
+
+// public_iface is a frontend-only seed for the first start. It is optional, and
+// LoadBootstrap must neither require it nor invent one: an absent value means
+// the shipped default stands.
+func TestPublicIfaceIsOptionalAndCarriedThrough(t *testing.T) {
+	dir := t.TempDir()
+
+	with := filepath.Join(dir, "with.json")
+	if err := os.WriteFile(with, []byte(`{"role":"frontend","psk":"x","public_iface":"ens3"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := model.LoadBootstrap(with)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.PublicIface != "ens3" {
+		t.Fatalf("public_iface = %q, want ens3", b.PublicIface)
+	}
+
+	without := filepath.Join(dir, "without.json")
+	if err := os.WriteFile(without, []byte(`{"role":"frontend","psk":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err = model.LoadBootstrap(without)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.PublicIface != "" {
+		t.Fatalf("public_iface = %q, want empty so the portal default stands", b.PublicIface)
+	}
+}
