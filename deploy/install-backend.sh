@@ -98,7 +98,7 @@ fi
 
 say "Building"
 if command -v go >/dev/null 2>&1; then
-	version="$(git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo dev)"
+	version="$(git -C "$REPO" describe --tags --always 2>/dev/null || echo dev)"
 	mkdir -p build
 	echo "  failover-backend ($version)"
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \

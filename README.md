@@ -231,7 +231,7 @@ One command builds all four binaries into `build/`:
 
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-  -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" \
+  -ldflags="-s -w -X main.version=$(git describe --tags --always 2>/dev/null || echo dev)" \
   -o build/ ./cmd/...
 ```
 

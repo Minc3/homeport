@@ -93,7 +93,7 @@ warn() { printf '\033[33mwarning: %s\033[0m\n' "$*" >&2; }
 
 say "Building"
 if command -v go >/dev/null 2>&1; then
-	version="$(git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo dev)"
+	version="$(git -C "$REPO" describe --tags --always 2>/dev/null || echo dev)"
 	mkdir -p build
 	for cmd in failover-frontend failoverctl; do
 		echo "  $cmd ($version)"
