@@ -188,6 +188,27 @@ AllowedIPs = 10.98.0.11/32
 On the laptop or phone, `AllowedIPs = 10.98.0.2/32` routes only the portal
 through the tunnel, so bringing it up does not disturb anything else.
 
+**Bring this up before installing the frontend.** `install-frontend.sh` reads
+the portal's listen address off `wg-admin`, and with the interface down there is
+nothing to read: it falls back to `127.0.0.1:8080`, which is the frontend and
+nowhere else. That is deliberate — a portal on a guessed or public address is
+worse than one that is plainly local — but it is a bootstrap value the portal
+cannot edit, so correcting it afterwards is a file and a restart:
+
+```sh
+systemctl enable --now wg-quick@wg-admin
+ip -4 addr show wg-admin                     # e.g. 10.98.0.2
+editor /etc/failover/frontend.json           # "portal_listen": "10.98.0.2:8080"
+systemctl restart failover-frontend
+```
+
+The script says this at the time and again at the end, and re-running it with
+`--portal 10.98.0.2:8080` will not do it for you: an existing bootstrap file is
+never rewritten without `--force-config`. Nothing else waits on any of this. The
+portal retries its listen every 5s rather than exiting, because it must never be
+able to take the agent down, so probing, decisions and the control channel run
+regardless and `failoverctl status` works over the local socket meanwhile.
+
 ---
 
 ## 3. pfSense

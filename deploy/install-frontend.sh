@@ -42,7 +42,9 @@ usage: sudo $0 [options]
   --psk <hex>        shared secret; must be identical on the backend.
                      Generated if omitted and no config exists yet.
   --portal <addr>    portal listen address. Defaults to the address on
-                     wg-admin, port 8080, e.g. 10.98.0.2:8080.
+                     wg-admin, port 8080, e.g. 10.98.0.2:8080. With that tunnel
+                     down there is no address to read, and the portal falls back
+                     to 127.0.0.1:8080 - local to the frontend and nothing else.
   --public-iface <n> the interface facing the internet, e.g. ens3. Detected
                      from the default route, and confirmed with you when this
                      is run on a terminal.
@@ -134,7 +136,7 @@ for iface in wg-nbn wg-lte1 wg-lte2; do
 done
 
 if ! ip link show wg-admin >/dev/null 2>&1; then
-	warn "wg-admin does not exist - the portal has nothing to bind to yet"
+	warn "wg-admin does not exist - the portal cannot bind until wg-quick brings it up"
 fi
 
 # The tunnels must not install their own routes, or all three fight over the
@@ -149,24 +151,67 @@ done
 # Portal address
 # ---------------------------------------------------------------------------
 
-if [ -z "$PORTAL" ]; then
+# An existing bootstrap file is never rewritten, so on an upgrade there is
+# nothing to ask about: the answer would only be discarded. Decided before the
+# address is worked out, because on a re-run the file already holds one and
+# detecting a second is worse than useless - it would warn about a fallback the
+# agent is never going to use.
+if [ -f "$CONFIG" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
+	WRITE_CONFIG=0
+else
+	WRITE_CONFIG=1
+fi
+
+PORTAL_FALLBACK=0
+
+if [ "$WRITE_CONFIG" -eq 0 ]; then
+	existing_portal="$(sed -n 's/.*"portal_listen"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$CONFIG" | head -n1)"
+	if [ -n "$existing_portal" ]; then
+		if [ -n "$PORTAL" ] && [ "$PORTAL" != "$existing_portal" ]; then
+			warn "--portal $PORTAL was ignored: $CONFIG already sets $existing_portal"
+			warn "  edit it there and restart, or re-run with --force-config"
+		fi
+		PORTAL="$existing_portal"
+	fi
+elif [ -z "$PORTAL" ]; then
 	admin_ip="$(ip -4 -o addr show wg-admin 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
 	if [ -n "$admin_ip" ]; then
 		PORTAL="$admin_ip:8080"
 		echo "  portal will bind $PORTAL (from wg-admin)"
 	else
+		# The usual cause is that the admin tunnel has not been brought up yet,
+		# and the fallback is deliberately a loopback address rather than a
+		# guess: the portal is the only way to arm the agent or approve an
+		# overage, and one bound to a wrong or public address is worse than one
+		# that is plainly local-only. It is a bootstrap value the portal cannot
+		# edit - the address it is served on is not something it can change out
+		# from under itself - so fixing it is a file and a restart.
 		PORTAL="127.0.0.1:8080"
-		warn "could not read an address from wg-admin; defaulting the portal to $PORTAL"
-		warn "pass --portal <ip>:8080 once the admin tunnel is up, or the portal is only reachable locally"
-	fi
-fi
+		PORTAL_FALLBACK=1
+		if ip link show wg-admin >/dev/null 2>&1; then
+			warn "wg-admin has no IPv4 address, so the portal falls back to $PORTAL"
+		else
+			warn "wg-admin is not up, so the portal falls back to $PORTAL"
+		fi
+		warn "which is reachable from this host and nowhere else"
+		cat >&2 <<EOF
 
-# An existing bootstrap file is never rewritten, so on an upgrade there is
-# nothing to ask about: the answer would only be discarded.
-if [ -f "$CONFIG" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
-	WRITE_CONFIG=0
-else
-	WRITE_CONFIG=1
+  Bring the admin tunnel up, then point the portal at it:
+
+    systemctl enable --now wg-quick@wg-admin
+    ip -4 addr show wg-admin
+    editor $CONFIG
+    systemctl restart $UNIT
+
+  The third step is one field - "portal_listen": "10.98.0.2:8080", using the
+  address the second step printed. Or re-run this script with --portal
+  <ip>:8080 and it will write that instead.
+
+  The tunnel itself is /etc/wireguard/wg-admin.conf, which no install script
+  writes; the configuration this expects is in deploy/SETUP.md section 2.
+
+EOF
+	fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -323,6 +368,31 @@ no DNAT until you arm it.
 
 Portal:   http://$PORTAL
 EOF
+
+if [ "$PORTAL_FALLBACK" -eq 1 ]; then
+	cat <<EOF
+
+The portal is on loopback, because wg-admin had no address when this ran, so it
+is reachable from this host and nowhere else. Until the admin tunnel is up,
+'ssh -L 8080:127.0.0.1:8080 <this host>' gets a browser onto it.
+
+To move it onto the tunnel:
+
+  systemctl enable --now wg-quick@wg-admin
+  ip -4 addr show wg-admin
+  editor $CONFIG
+  systemctl restart $UNIT
+
+Set "portal_listen" to that address with :8080 on the end. The tunnel itself is
+/etc/wireguard/wg-admin.conf, and deploy/SETUP.md section 2 is the configuration
+this expects.
+
+Nothing else is waiting on it. The portal retries its listen every 5s rather
+than exiting - it must never be able to take the agent down - so the probing,
+the decisions and the control channel are running either way, and
+'failoverctl status' works over the local socket regardless.
+EOF
+fi
 
 if [ "$START" -eq 1 ]; then
 	# The agent logs JSON, and prints this line exactly once, on first start.
