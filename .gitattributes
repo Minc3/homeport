@@ -17,3 +17,6 @@
 *.png binary
 *.jpg binary
 *.ico binary
+
+# The committed binaries. Never eol-normalised, whatever text=auto decides.
+build/* binary

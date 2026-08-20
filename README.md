@@ -220,6 +220,12 @@ machine and copy the tree across. The installers use a prebuilt binary in
 `build/` when there is no toolchain on the host, so a box that only ever
 receives artefacts is a supported case rather than a workaround.
 
+Those binaries are committed, so a clone has them without building anything.
+They are `linux/amd64`, static, stripped, and stamped with the commit they were
+built from, which `failover-frontend -version` prints. Refresh them with `make
+build linker` and commit the result alongside the change; `make clean` deletes
+them, and the same command puts them back.
+
 One command builds all four binaries into `build/`:
 
 ```sh

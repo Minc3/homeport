@@ -1,4 +1,13 @@
-build/
+# build/ is committed. The installers fall back to the binaries in it when the
+# target has no Go toolchain, which is the normal case on a Debian box that is
+# only ever a deployment target, so an ignored build/ made that fallback a
+# missing file. Anything else that lands in there is not.
+build/*
+!build/failover-frontend
+!build/failover-backend
+!build/failover-linker
+!build/failoverctl
+
 *.db
 *.db-wal
 *.db-shm

@@ -48,6 +48,8 @@ vet:
 fmt:
 	gofmt -w ./cmd ./internal
 
+# build/ is committed, so this deletes tracked files. `make build linker`
+# puts them back, and `git checkout build` restores the committed ones.
 clean:
 	rm -rf build
 
