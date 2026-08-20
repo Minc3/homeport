@@ -1031,8 +1031,8 @@ need to open Settings and save to pick up new defaults.
 
 `deploy/uninstall.sh` is the counterpart to the three install scripts, and it
 does what they did backwards: revert the system changes, stop and disable the
-unit, remove the unit file and the binaries, and — only when asked — remove the
-bootstrap file and the state directory. It works out which agent this host runs
+unit, and remove the unit file, the binaries, the bootstrap file and the state
+directory. It works out which agent this host runs
 from what is installed, and refuses to guess if there are two.
 
 ```sh
@@ -1051,12 +1051,15 @@ prints the reminder on the frontend and asks before it does anything, and
 It needs nothing from the repository, so a copy of the file is enough on a host
 where the clone is already gone.
 
-**What it keeps by default.** The bootstrap file and the state directory, so a
-reinstall picks up the same shared secret and, on the frontend, the same
-configuration and usage ledger. `--purge` removes both, copying
-`failover.db` to `/root/failover.db.<timestamp>.bak` on the way past — the
-ledger is the part that cannot be recreated, and losing it mid-period tells both
-LTE paths they have a full month of headroom. `--no-backup` if you mean it.
+**What it removes.** Everything the install script put on the host: the
+binaries, the unit, the bootstrap file and the state directory. Uninstalled
+means gone, so keeping something is what takes a flag — `--keep-config` leaves
+the bootstrap file, and with it the shared secret, for a reinstall;
+`--keep-state` leaves the state directory, which on the frontend is the
+database. That database is copied to `/root/failover.db.<timestamp>.bak` before
+it goes, because the usage ledger is the part that cannot be recreated: losing
+it mid-period tells both LTE paths they have a full month of headroom.
+`--no-backup` if you mean it.
 
 **What it never touches.** WireGuard, on any host and with any flag: the agents
 did not create the tunnels and nothing in the script reads `/etc/wireguard`.

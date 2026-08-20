@@ -215,7 +215,7 @@ upgrade.
 Taking it off again is one script per host, frontend first:
 
 ```sh
-sudo ./deploy/uninstall.sh          # add --purge to drop the config and state
+sudo ./deploy/uninstall.sh          # --keep-state keeps the database
 ```
 
 It reverts the routing and nftables changes before it removes anything, and

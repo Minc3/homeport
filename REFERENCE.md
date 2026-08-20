@@ -248,17 +248,17 @@ journalctl -u failover-frontend | grep 'portal account created'
 One script for all three roles, which it works out from what is installed:
 
 ```sh
-sudo ./deploy/uninstall.sh                 # revert, stop, remove the binaries
-sudo ./deploy/uninstall.sh --purge         # ... and the config and state
+sudo ./deploy/uninstall.sh                 # remove the agent and its files
+sudo ./deploy/uninstall.sh --keep-state    # ... but keep the database
 ```
 
 Run it on the frontend first, then the backend, then any linkers — the ordering
 in [SETUP.md](deploy/SETUP.md) section 8, for the same reason. It reverts while
 the agent is still installed and refuses to go further if that fails, since the
 binary is the only thing that knows which rules and priorities are this
-system's. The bootstrap file and the state directory survive unless `--purge` is
-given, and `--purge` copies the database aside first, because the usage ledger
-in it cannot be recreated. WireGuard is never touched, and neither is the
+system's. The bootstrap file and the state directory go with it, unless
+`--keep-config` or `--keep-state` says otherwise, and the database is copied to
+/root before it goes because the usage ledger in it cannot be recreated. WireGuard is never touched, and neither is the
 overlay address unless `--overlay` says so.
 
 **Before any of this, read [deploy/SETUP.md](deploy/SETUP.md).** The agents

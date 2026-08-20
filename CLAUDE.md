@@ -83,8 +83,8 @@ failover-linker -revert                       # each extra host, if any
 Removing an agent entirely is `sudo ./deploy/uninstall.sh` on each host, in that
 same order. It runs the revert above first, while the binary that knows what it
 installed is still there, and refuses to remove anything if that fails. Config
-and state survive unless `--purge` is given; WireGuard and the overlay address
-survive regardless.
+and state go with it unless `--keep-config` or `--keep-state` says otherwise;
+WireGuard and the overlay address survive regardless.
 
 - **Commit straight to `main`.** No feature branches, no PRs — this is a
   single-operator repo and the branch would only ever be merged by the person
