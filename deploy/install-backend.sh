@@ -24,11 +24,12 @@ CONFIG="$CONF_DIR/backend.json"
 PSK=""
 FRONTEND_IP=10.99.0.1
 BACKEND_IP=10.99.0.2
-# Empty is the normal case: one host at the far end. Only a site running
-# linker agents sets this, and it must match on every host and be covered by
-# AllowedIPs on the frontend's peers - which the shipped WireGuard setup
-# already is. See SETUP.md section 10.
+# Derived from the overlay addresses below unless --subnet says otherwise: the
+# /24 they sit in, so the shipped 10.99.0.1 and .2 give 10.99.0.0/24. It has to
+# be identical to the frontend's - the two ends disagreeing about the range is
+# a fault nothing reports. See SETUP.md section 10.
 SUBNET=""
+SUBNET_GIVEN=0
 FORCE_CONFIG=0
 START=1
 
@@ -42,8 +43,12 @@ usage: sudo $0 --psk <hex> [options]
                      Required unless $CONFIG already exists.
   --frontend-ip <ip> frontend overlay address (default $FRONTEND_IP)
   --backend-ip <ip>  backend overlay address (default $BACKEND_IP)
-  --subnet <cidr>    overlay subnet, e.g. 10.99.0.0/24. Only for a site with
-                     linker agents; must match on every host.
+  --subnet <cidr>    overlay subnet. Defaults to the /24 the overlay addresses
+                     sit in, e.g. 10.99.0.0/24, and must match the frontend's.
+                     Pass '' for none. On a re-run this is the one field that
+                     can be changed in an existing config: it is patched in
+                     place, leaving the shared secret alone, so it needs no
+                     --force-config and no --psk.
   --force-config     overwrite an existing $CONFIG. Needs --psk with it, or
                      the secret would be blanked.
   --no-start         install but do not enable or start the service
@@ -56,7 +61,7 @@ while [ $# -gt 0 ]; do
 	--psk) PSK="$2"; shift 2 ;;
 	--frontend-ip) FRONTEND_IP="$2"; shift 2 ;;
 	--backend-ip) BACKEND_IP="$2"; shift 2 ;;
-	--subnet) SUBNET="$2"; shift 2 ;;
+	--subnet) SUBNET="$2"; SUBNET_GIVEN=1; shift 2 ;;
 	--force-config) FORCE_CONFIG=1; shift ;;
 	--no-start) START=0; shift ;;
 	-h | --help) usage; exit 0 ;;
@@ -91,6 +96,82 @@ if [ -z "$PSK" ] && [ "$FORCE_CONFIG" -eq 1 ]; then
 	echo "       the current value is in: sudo grep psk $CONFIG" >&2
 	exit 2
 fi
+
+# ---------------------------------------------------------------------------
+# Overlay subnet
+#
+# Derived from the two overlay addresses rather than hardcoded, so a site that
+# moved them somewhere else gets a subnet that actually contains them instead
+# of a default that quietly contains nothing. If they do not share a /24 there
+# is nothing safe to guess, and empty is the answer that changes no rules.
+# ---------------------------------------------------------------------------
+
+derive_subnet() {
+	local a="$1" b="$2"
+	case "$a$b" in
+	*[!0-9.]*) printf ''; return ;;
+	esac
+	local a24 b24
+	a24="$(printf '%s' "$a" | cut -d. -f1-3)"
+	b24="$(printf '%s' "$b" | cut -d. -f1-3)"
+	if [ -n "$a24" ] && [ "$a24" = "$b24" ]; then
+		printf '%s.0/24' "$a24"
+	fi
+}
+
+if [ "$SUBNET_GIVEN" -eq 0 ]; then
+	SUBNET="$(derive_subnet "$FRONTEND_IP" "$BACKEND_IP")"
+	if [ -z "$SUBNET" ]; then
+		warn "$FRONTEND_IP and $BACKEND_IP are not in one /24, so no overlay subnet is set"
+		warn "  pass --subnet <cidr> if this site will run linker agents"
+	fi
+fi
+
+# patch_subnet changes overlay.subnet in an existing bootstrap file and touches
+# nothing else.
+#
+# The whole file is deliberately never rewritten on a re-run, because it holds
+# the shared secret - the one value on a host that cannot be recovered from
+# anywhere else. But the subnet is the one field somebody has a real reason to
+# change later: it cannot be edited from the portal, and without it no linker
+# can be configured at all. So it is edited in place, against a backup, and the
+# result is checked for both keys before the backup is dropped.
+patch_subnet() {
+	local file="$1" want="$2" current backup
+	current="$(sed -n 's/.*"subnet"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n1)"
+	if [ "$current" = "$want" ]; then
+		echo "  overlay subnet is already ${want:-none}"
+		return 0
+	fi
+
+	backup="$file.bak.$$"
+	cp -a "$file" "$backup"
+
+	if grep -q '"subnet"' "$file"; then
+		sed -i "s|\"subnet\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"subnet\": \"$want\"|" "$file"
+	else
+		# Written by an older version of this script, which had no such line.
+		sed -i "s|\(\"backend_ip\"[[:space:]]*:[[:space:]]*\"[^\"]*\",\)|\1\n    \"subnet\": \"$want\",|" "$file"
+	fi
+
+	local now psk
+	now="$(sed -n 's/.*"subnet"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n1)"
+	psk="$(sed -n 's/.*"psk"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n1)"
+	if [ "$now" != "$want" ] || [ -z "$psk" ]; then
+		mv "$backup" "$file"
+		warn "could not set the overlay subnet in $file; it has been left exactly as it was"
+		warn "  edit it by hand: \"subnet\": \"$want\" inside the overlay block"
+		return 1
+	fi
+	rm -f "$backup"
+	echo "  overlay subnet set to ${want:-none} in $file"
+	if [ -z "$want" ]; then
+		warn "clearing it leaves the widened route behind: the agent removes a /32 that a"
+		warn "  subnet superseded, but has no record of a subnet to clean up going the"
+		warn "  other way. Check with: ip route show | grep 10.99"
+	fi
+	return 0
+}
 
 # ---------------------------------------------------------------------------
 # Build
@@ -190,6 +271,11 @@ echo "  /etc/systemd/system/$UNIT"
 say "Bootstrap configuration"
 if [ -f "$CONFIG" ] && [ "$FORCE_CONFIG" -eq 0 ] && [ -z "$PSK" ]; then
 	echo "  $CONFIG exists, leaving it alone (--force-config to replace)"
+	# ...with one exception, and only when asked for explicitly. See
+	# patch_subnet.
+	if [ "$SUBNET_GIVEN" -eq 1 ]; then
+		patch_subnet "$CONFIG" "$SUBNET" || true
+	fi
 	chown root:root "$CONFIG"
 	chmod 0600 "$CONFIG"
 else

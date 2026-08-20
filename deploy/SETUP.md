@@ -630,10 +630,29 @@ Each extra host gets its own overlay address on its own `dummy0` — `10.99.0.3`
 }
 ```
 
-Set it identically in **both** bootstrap files. It is bootstrap-owned rather
-than portal-editable for the same reason as the addresses themselves: both ends
-have to agree, and the change would have to travel over the channel it tears
-down.
+**A current install already has it.** `install-frontend.sh` and
+`install-backend.sh` write the `/24` the two overlay addresses sit in, so a site
+installed with them needs nothing here. That is deliberate: it cannot be edited
+from the portal, so a site without it has to be visited over SSH on both hosts
+before a linker can even be added — and everything it enables is inert while
+there is one host at the far end, because no other address in the range exists.
+`--subnet ''` opts out.
+
+**An older site has it empty**, and the portal refuses to configure a linker
+until both hosts have it. One command each, which patches that single field in
+place and leaves the shared secret alone:
+
+```sh
+sudo ./deploy/install-frontend.sh --subnet 10.99.0.0/24     # on the frontend
+sudo ./deploy/install-backend.sh  --subnet 10.99.0.0/24     # on the backend
+```
+
+Each restarts its own agent at the end, which is what makes the value take
+effect. Both must end up with the identical string.
+
+It is bootstrap-owned rather than portal-editable for the same reason as the
+addresses themselves: both ends have to agree, and the change would have to
+travel over the channel it tears down.
 
 Setting it changes two things on the frontend. It routes the whole range down
 the active tunnel instead of the backend's `/32`, and its egress source NAT and
@@ -658,9 +677,15 @@ the backend's traffic perfectly, and only the linker is unreachable.
 
 The backend side is already `0.0.0.0/0` and needs no change.
 
-The subnet is still opt-in rather than derived, for the reason in section 2's
-note: it widens the route the frontend installs, and a site with one host at the
-far end should not have a range routed down its tunnel for no reason.
+What the subnet costs a single-host site, in full: a `/24` routed down the
+active tunnel instead of the backend's `/32`, a `DOCKER-USER` accept and an
+egress NAT match covering the range rather than one address, and one extra `ip
+rule` on the backend. Every one of them matches only addresses nothing holds
+until a second host exists, which is why the installers write it in advance and
+why the WireGuard side has always shipped wide. Clearing it later is the
+direction with no cleanup: the agent removes a `/32` that a subnet superseded,
+but keeps no record of a subnet to withdraw going the other way, so a widened
+route stays until somebody removes it by hand.
 
 ### Publishing a service to one of them
 

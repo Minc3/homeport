@@ -34,7 +34,10 @@ OVERLAY_IP=""
 BACKEND_LAN=""
 FRONTEND_IP=10.99.0.1
 BACKEND_IP=10.99.0.2
-SUBNET=10.99.0.0/24
+# Derived from the two addresses above after parsing, so a site that moved them
+# gets a range that contains them rather than the shipped one that would not.
+SUBNET=""
+SUBNET_GIVEN=0
 FORCE_CONFIG=0
 START=1
 
@@ -50,10 +53,11 @@ usage: sudo $0 --psk <hex> --overlay-ip <ip> --backend-lan <ip> [options]
   --backend-lan <ip>  the backend's address on this network, e.g. 192.168.1.2.
                       This is the next hop for overlay traffic, not the
                       backend's overlay address.
-  --subnet <cidr>     overlay subnet (default $SUBNET). Must match
-                      overlay.subnet on the frontend and the backend, and
-                      --overlay-ip must be inside it. Recorded here and used to
-                      check that; the agent itself does not read it yet.
+  --subnet <cidr>     overlay subnet. Defaults to the /24 the overlay addresses
+                      sit in, e.g. 10.99.0.0/24. Must match overlay.subnet on
+                      the frontend and the backend, and --overlay-ip must be
+                      inside it. Recorded here and used to check that; the
+                      agent itself does not read it yet.
   --frontend-ip <ip>  frontend overlay address (default $FRONTEND_IP)
   --backend-ip <ip>   backend overlay address (default $BACKEND_IP)
   --force-config      overwrite an existing $CONFIG. Needs --psk with it, or
@@ -68,7 +72,7 @@ while [ $# -gt 0 ]; do
 	--psk) PSK="$2"; shift 2 ;;
 	--overlay-ip) OVERLAY_IP="$2"; shift 2 ;;
 	--backend-lan) BACKEND_LAN="$2"; shift 2 ;;
-	--subnet) SUBNET="$2"; shift 2 ;;
+	--subnet) SUBNET="$2"; SUBNET_GIVEN=1; shift 2 ;;
 	--frontend-ip) FRONTEND_IP="$2"; shift 2 ;;
 	--backend-ip) BACKEND_IP="$2"; shift 2 ;;
 	--force-config) FORCE_CONFIG=1; shift ;;
@@ -81,6 +85,18 @@ done
 if [ "$(id -u)" -ne 0 ]; then
 	echo "error: run this with sudo - it installs a systemd unit and touches routing" >&2
 	exit 1
+fi
+
+if [ "$SUBNET_GIVEN" -eq 0 ]; then
+	f24="$(printf '%s' "$FRONTEND_IP" | cut -d. -f1-3)"
+	b24="$(printf '%s' "$BACKEND_IP" | cut -d. -f1-3)"
+	if [ -n "$f24" ] && [ "$f24" = "$b24" ]; then
+		SUBNET="$f24.0/24"
+	else
+		echo "error: $FRONTEND_IP and $BACKEND_IP are not in one /24; pass --subnet <cidr>" >&2
+		echo "       it must be the same value as overlay.subnet on both of those hosts" >&2
+		exit 2
+	fi
 fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -779,9 +779,14 @@ Breaking any of these is a correctness bug even if the tests pass.
     to attribute, weeks later. Both reconcilers call `sysx.EnsureQdisc` for any
     path with a rate, and neither runs `tc` at all for a path without one.
 19. **Multi-host support must be invisible until it is configured.** With
-    `overlay.subnet` empty — the state every site starts in and most stay in —
-    the generated rulesets and the `ip` commands must be byte-identical to a
-    build with no linker support at all. This is not neatness: a site with one
+    `overlay.subnet` empty — an older site, or one that opted out with
+    `--subnet ''` — the generated rulesets and the `ip` commands must be
+    byte-identical to a build with no linker support at all. This is a property
+    of the code and does not change with what the installers write: they now
+    default the field to the `/24` the overlay addresses sit in, because it
+    cannot be set from the portal and a site without it has to be visited over
+    SSH on both hosts before a linker can be added at all. The empty case stays
+    supported, and stays tested. This is not neatness: a site with one
     host at the far end has no reason to have a range routed down its tunnel,
     its `DOCKER-USER` exceptions widened, or its egress NAT matching addresses
     nothing holds — and every one of those is a live rule on a working system.

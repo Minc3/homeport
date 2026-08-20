@@ -21,8 +21,8 @@
     "backend_ip": "10.99.0.2",
     "_device": "Optional. The dummy interface the overlay address lives on; defaults to dummy0. Set it here on both hosts, not in the portal - the two must agree and the change would tear down the channel it has to travel over.",
     "device": "dummy0",
-    "_subnet": "Only for a site that runs linker agents - extra hosts published through this backend. Leave it out otherwise: a site with one host at the far end has no reason to route a range down its tunnel. Must be identical on both hosts, and covered by AllowedIPs on the frontend's peers - the shipped setup already puts 10.99.0.0/24 there.",
-    "subnet": "",
+    "_subnet": "The overlay range. install-frontend.sh and install-backend.sh now write the /24 the two addresses above sit in, and it must be identical on both hosts. It is what makes a linker - an extra host published through this backend - configurable at all, and it cannot be set from the portal, so having it in advance is what keeps adding a second machine a portal-only job. On a site with one host at the far end everything it enables matches nothing: no other address in the range exists. Set it to \"\" to opt out, and check AllowedIPs on the frontend's peers covers the range - the shipped setup already puts 10.99.0.0/24 there.",
+    "subnet": "10.99.0.0/24",
     "probe_port": 51999,
     "control_port": 51998
   }
