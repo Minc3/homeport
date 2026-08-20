@@ -154,6 +154,56 @@ Both start in **observe mode**: they probe, decide and log, and change nothing
 until you arm them from the portal. Both are safe to re-run, which is how you
 upgrade.
 
+## Building from source
+
+To build you need **Go 1.25 or newer** and `git`. Debian 13 ships `golang-go`
+1.24, which is older than the `go` line in `go.mod` and will refuse the build.
+Take the tarball from [go.dev/dl](https://go.dev/dl/), or build on another
+machine and copy the tree across. The installers use a prebuilt binary in
+`build/` when there is no toolchain on the host, so a box that only ever
+receives artefacts is a supported case rather than a workaround.
+
+One command builds all four binaries into `build/`:
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+  -ldflags="-s -w -X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" \
+  -o build/ ./cmd/...
+```
+
+`CGO_ENABLED=0` is not optional: the only dependency is `modernc.org/sqlite`,
+which is pure Go, and keeping cgo off is what makes the binaries static and
+independent of the target's libc. The trailing slash on `-o build/` is what lets
+one invocation write several binaries, each named after its directory under
+`cmd/`.
+
+`make build` does the same for the three binaries every site runs. It leaves out
+`failover-linker` deliberately, because most deployments have no extra hosts and
+building it by default invites installing it by default. The command above
+includes it, which costs nothing so long as you only copy it to a host that
+really is a linker.
+
+### Packages on the hosts
+
+The agents shell out to ordinary system commands, so what they need is what
+those commands come in. On the frontend:
+
+```sh
+apt install iproute2 nftables procps openssl wireguard-tools
+```
+
+The backend and any linker need the same minus `openssl`, which only the
+frontend uses, to generate the shared secret and the first-run password.
+`procps` is there for `sysctl` and `wireguard-tools` for `wg`; `systemd` is
+assumed. Each installer checks for these before it changes anything and names
+the missing ones.
+
+The tunnels themselves are yours to create and are not installed here; see
+[deploy/SETUP.md](deploy/SETUP.md). If you want traffic shaping, the `sch_cake`
+module must load (`modprobe sch_cake`); it is in Debian's stock kernel. Leaving
+shaping unconfigured runs no `tc` at all, so a kernel without it is only a
+problem if you ask for the feature.
+
 ## Documentation
 
 - **[REFERENCE.md](REFERENCE.md)** covers the full detail: how failover stays
