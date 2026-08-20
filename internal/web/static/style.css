@@ -111,8 +111,13 @@ main.wide { max-width: none; padding-left: 44px; padding-right: 44px; }
 }
 main.wide fieldset > p.hint,
 main.wide fieldset > .grid,
-main.wide fieldset > .alert,
-main.wide .sticky-save { max-width: 1160px; }
+main.wide fieldset > .alert { max-width: 1160px; }
+
+/* The save bar is not one of them. It is a frame around the settings rather
+   than content inside one, so it tracks the width of the panels above it -
+   capped, it sat visibly short of their right edge on a wide monitor, with
+   "Revert all system changes" floating in the middle of the page instead of
+   lining up with the fieldsets it belongs to. */
 
 .hidden { display: none !important; }
 
@@ -227,6 +232,12 @@ input[type="checkbox"] { width: auto; }
 input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent); outline-offset: -1px; }
 
 fieldset {
+  /* A fieldset's UA min-width is min-content, so it refuses to shrink below
+     the settings table's 1100px and the whole page scrolls sideways on a
+     narrow screen - .table-wrap's overflow never gets a chance to engage. The
+     save bar, which has no such floor, then sat visibly narrower than every
+     panel above it. Zero here lets the wrapper scroll the table instead. */
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 14px 16px;
@@ -302,6 +313,12 @@ label.inline .help, .sticky-save .help { margin-left: 0; }
   padding: 12px 16px;
   display: flex;
   align-items: center;
+  /* Wraps rather than overflows. Three buttons and their help markers are
+     wider than a phone held upright, and the portal is read from one - the
+     admin tunnel has a peer for it. Without this the row ran off the right
+     edge, taking "Revert all system changes" with it and giving the whole
+     page a sideways scroll. */
+  flex-wrap: wrap;
   gap: 12px;
   margin-top: 16px;
 }
