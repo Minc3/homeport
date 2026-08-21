@@ -327,7 +327,7 @@ func (l *Linker) reconcile(ctx context.Context) {
 func (l *Linker) Revert(ctx context.Context) {
 	sysx.RemoveLinkerEgressRuleset(ctx, l.runner, l.table())
 	sysx.RemoveLinkerReturnRuleset(ctx, l.runner, l.table())
-	sysx.RemoveLinkerRouting(ctx, l.runner, l.boot.Linker.OverlayIP, l.table())
+	sysx.RemoveLinkerRouting(ctx, l.runner, l.boot.Linker.OverlayIP, l.boot.Linker.BackendLAN, l.table())
 	l.log.Warn("removed the overlay policy rule and table",
 		"note", "the overlay address is left in place; anything bound to it is still listening",
 		"hint", "if failover-linker.service is still running, its reconciler puts the routing "+

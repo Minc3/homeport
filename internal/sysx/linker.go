@@ -287,7 +287,7 @@ func gatewayFrom(out string) string {
 // The overlay address is deliberately left alone: a service may still be bound
 // to it, and pulling the address out from under a running process turns a
 // routing change into a crash.
-func RemoveLinkerRouting(ctx context.Context, r Runner, overlayIP string, tbl int) {
+func RemoveLinkerRouting(ctx context.Context, r Runner, overlayIP, backendLAN string, tbl int) {
 	table := strconv.Itoa(tbl)
 
 	// By the priority each rule was found at. `ip rule del` given only a
@@ -315,6 +315,22 @@ func RemoveLinkerRouting(ctx context.Context, r Runner, overlayIP string, tbl in
 	// deployment found already in use for a second ISP: flushing it would have
 	// deleted that machine's own routing while reporting a clean revert.
 	// Invariant 8.
+	//
+	// Qualified by the gateway, which is what makes this a deletion of our own
+	// route rather than of whatever default the table happens to hold. On the
+	// host this exists for those are not the same thing: the agent overwrote
+	// that machine's `default via <isp2 gateway>` when it installed, and if the
+	// operator has since put theirs back - noticed the fault, or their own
+	// tooling reasserted it on the next boot - then an unqualified delete
+	// removes the route they repaired, on the command they ran to undo us. With
+	// the gateway named it simply fails, which is the correct outcome: there is
+	// nothing of ours left in the table.
+	if backendLAN != "" {
+		_, _ = r.Run(ctx, "ip", "route", "del", "default", "via", backendLAN, "table", table)
+		return
+	}
+	// Only where the caller has no backend address to name, which LoadBootstrap
+	// refuses to start a linker without.
 	_, _ = r.Run(ctx, "ip", "route", "del", "default", "table", table)
 }
 

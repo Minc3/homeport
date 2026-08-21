@@ -303,3 +303,27 @@ func TestRemoveLinkerRulesetsDeleteByPriority(t *testing.T) {
 		}
 	}
 }
+
+// The default route goes by its gateway, not by being the table's default.
+//
+// The two are the same thing only until the collision this whole change exists
+// for actually happens. On a host that uses this table for a second ISP the
+// agent overwrote `default via <isp2 gateway>` when it installed; if the
+// operator has since put theirs back, an unqualified delete removes the route
+// they repaired, on the command they ran to undo us.
+func TestRemoveLinkerRoutingDeletesOnlyItsOwnDefaultRoute(t *testing.T) {
+	f := &fakeRunner{}
+	RemoveLinkerRouting(context.Background(), f, "10.99.0.3", "192.168.1.2", 200)
+
+	if !f.ran("ip route del default via 192.168.1.2 table 200") {
+		t.Errorf("the default route was not removed by its gateway: %v", f.calls)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "route flush") {
+			t.Errorf("revert flushed a table it does not own: %s", c)
+		}
+		if c == "ip route del default table 200" {
+			t.Errorf("an unqualified delete takes whatever default the table holds: %s", c)
+		}
+	}
+}

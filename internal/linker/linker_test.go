@@ -179,7 +179,9 @@ func TestRevertLeavesTheOverlayAddressAlone(t *testing.T) {
 	// this system: the first real deployment landed on a machine already using
 	// 200 for a second ISP, and a flush would have deleted that machine's own
 	// routing while reporting a clean revert.
-	if !strings.Contains(joined, "ip route del default table 200") {
+	// Qualified by the gateway: on a host that had its own default in this
+	// table, an unqualified delete would take that one instead.
+	if !strings.Contains(joined, "ip route del default via 192.168.1.2 table 200") {
 		t.Errorf("revert should remove the default route it installed, calls were %v", f.calls)
 	}
 	for _, c := range f.calls {
