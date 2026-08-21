@@ -40,6 +40,13 @@ func TestApplyUsageAcksWhatIsInTheLedgerAndDedupesResends(t *testing.T) {
 	if got := ack.Seqs[2]; got != 2 {
 		t.Fatalf("ack for path 2 = %d, want 2", got)
 	}
+	// The watermark travels into the ledger transaction rather than being
+	// written afterwards. Written separately, a crash between the two writes
+	// left a watermark behind the ledger, and the resent batch - the backend
+	// resends everything unacked - was billed a second time.
+	if got := e.Store().Meta("usage_seq:2"); got != "2" {
+		t.Fatalf("watermark = %q, want 2 recorded with the ledger", got)
+	}
 
 	p, _ := e.Config().PathByID(2)
 	start, _ := quota.PeriodBounds(p.Quota, now)
@@ -70,11 +77,16 @@ func TestApplyUsageAcksWhatIsInTheLedgerAndDedupesResends(t *testing.T) {
 // A delta for an unmetered path is discardable, and the ack has to say so - a
 // held-back ack would have the backend resending it forever.
 func TestApplyUsageAcksUnmeteredDeltasSoTheyStopBeingResent(t *testing.T) {
-	s, _ := controlServerForUsage(t)
+	s, e := controlServerForUsage(t)
 	ack := s.applyUsage(proto.Usage{Deltas: []proto.UsageDelta{
 		{PathID: 1, Bytes: 1000, Packets: 10, AtUnix: time.Now().Unix(), Sequence: 7},
 	}})
 	if got := ack.Seqs[1]; got != 7 {
 		t.Errorf("unmetered delta acked as %d, want 7", got)
+	}
+	// Discarded deltas still advance the durable watermark, so a restarted
+	// frontend keeps filtering their resends too.
+	if got := e.Store().Meta("usage_seq:1"); got != "7" {
+		t.Errorf("watermark = %q, want 7", got)
 	}
 }

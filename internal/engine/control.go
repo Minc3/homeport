@@ -239,13 +239,16 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 		// Only advance the watermark - and the ack - once the bytes are in the
 		// ledger. Acking regardless would discard metered LTE usage for good:
 		// the backend drops its buffered copy on the strength of this number.
-		if err := s.eng.AddUsage(d.PathID, d.Bytes, d.Packets, time.Unix(d.AtUnix, 0)); err != nil {
+		// AddUsage writes the ledger and the watermark in one transaction; two
+		// separate writes left a crash window between them, and a crash there
+		// had the resent batch pass the stale watermark and bill twice.
+		if err := s.eng.AddUsage(d.PathID, d.Bytes, d.Packets, time.Unix(d.AtUnix, 0),
+			key, strconv.FormatUint(d.Sequence, 10)); err != nil {
 			s.log.Warn("usage delta not recorded, holding back this path's watermark",
 				"path_id", d.PathID, "seq", d.Sequence, "err", err)
 			stalled[d.PathID] = true
 			continue
 		}
-		_ = st.SetMeta(key, strconv.FormatUint(d.Sequence, 10))
 		ack.Seqs[d.PathID] = d.Sequence
 	}
 	return ack

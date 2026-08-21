@@ -193,7 +193,14 @@ func (s *Store) SaveConfig(cfg model.Config) error {
 
 // AddUsage accumulates a metered delta against a path's current period and
 // records the sample for graphing.
-func (s *Store) AddUsage(pathID int, periodStart time.Time, bytes, packets int64, at time.Time) error {
+//
+// A non-empty metaKey is written in the same transaction. The caller's key is
+// the per-path ack watermark, and it must not be able to drift from the ledger
+// across a crash in either direction: written first, a crash loses the bytes
+// for good (the ack tells the backend to drop its copy); written second, a
+// crash has the backend resend a delta the watermark no longer filters, and
+// the same LTE bytes are billed twice.
+func (s *Store) AddUsage(pathID int, periodStart time.Time, bytes, packets int64, at time.Time, metaKey, metaValue string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -211,6 +218,13 @@ func (s *Store) AddUsage(pathID int, periodStart time.Time, bytes, packets int64
 		`INSERT INTO usage_samples (ts, path_id, bytes, packets) VALUES (?, ?, ?, ?)`,
 		at.Unix(), pathID, bytes, packets); err != nil {
 		return fmt.Errorf("usage sample: %w", err)
+	}
+	if metaKey != "" {
+		if _, err := tx.Exec(
+			`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			metaKey, metaValue); err != nil {
+			return fmt.Errorf("usage watermark: %w", err)
+		}
 	}
 	return tx.Commit()
 }

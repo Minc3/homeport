@@ -182,15 +182,12 @@ func (a *Agent) reportLoop(ctx context.Context, conn net.Conn) {
 			return
 
 		case <-usage.C:
-			pending := a.meter.Pending()
-			if len(pending) == 0 {
+			// At most a few hundred at a time so a long offline backlog drains
+			// steadily instead of in one oversized frame - and only that many
+			// copied, rather than the whole backlog for the sake of its front.
+			batch := a.meter.PendingBatch(500)
+			if len(batch) == 0 {
 				continue
-			}
-			// Send at most a few hundred at a time so a long offline backlog
-			// drains steadily instead of in one oversized frame.
-			batch := pending
-			if len(batch) > 500 {
-				batch = batch[:500]
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := proto.WriteFrame(conn, proto.MsgUsage, proto.Usage{Deltas: batch}); err != nil {

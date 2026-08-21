@@ -536,6 +536,13 @@ type Status struct {
 	Uptime      float64 `json:"uptime_sec"`
 	DecisionSeq uint64  `json:"decision_seq"`
 
+	// Reverted reports the post-revert hold: probing is stopped and nothing is
+	// installed or repaired until settings are saved or the mode is changed.
+	// Said here because the trackers freeze at whatever they last measured, so
+	// without it the portal showed three healthy-looking paths on a system
+	// measuring nothing, indefinitely.
+	Reverted bool `json:"reverted"`
+
 	// PreferredPath is the most preferred enabled path - the one the system
 	// returns to on its clean streak. Reported so the portal can say whether
 	// traffic is on it or on a fallback without reimplementing the rule, which

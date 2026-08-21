@@ -31,6 +31,14 @@
     <div id="held-actions" class="row"></div>
   </div>
 
+  <div id="reverted" class="alert hidden">
+    <h3>Reverted &mdash; nothing is being measured</h3>
+    <p>A revert removed everything this agent installed, and the engine is holding:
+       probing is stopped, and the path cards below are frozen at whatever was last
+       measured before the revert. Saving settings or changing the mode is what
+       resumes measurement.</p>
+  </div>
+
   <div id="observe" class="alert info hidden">
     <h3>Observe mode</h3>
     <p>Decisions are being computed and logged, but nothing is applied to routing or nftables.

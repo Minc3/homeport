@@ -173,6 +173,13 @@ type Engine struct {
 	// put rules back that the about-to-be-deleted binary was the only thing
 	// able to remove. While set, nothing is installed and nothing is measured;
 	// a settings save or a mode change is what brings the engine back.
+	//
+	// It is persisted (revertedMetaKey) and reloaded in New, because the unit
+	// runs under Restart=always: held only in memory, any crash or restart in
+	// the window between `failoverctl revert` and `systemctl stop` brought the
+	// process back with the startup sequence reinstalling everything the
+	// revert had just removed - and during uninstall that window ends with the
+	// only binary able to remove them being deleted.
 	reverted bool
 
 	// cfgVersion increments on every configuration change. The control server
@@ -213,8 +220,18 @@ func New(log *slog.Logger, st *store.Store, notifier *notify.Notifier, cfg model
 	}
 	e.runner = runnerFor(cfg.Mode, log)
 	e.loadLinkerSeen()
+	// A latch left by a previous process. See the field: without this,
+	// Restart=always turned every crash after a revert into a full reinstall.
+	if st.Meta(revertedMetaKey) != "" {
+		e.reverted = true
+	}
 	return e
 }
+
+// revertedMetaKey is the persisted form of the reverted latch. Set by Revert
+// before it tears anything down, cleared by Reconfigure - the same lifecycle
+// as the in-memory flag, so a restart lands in the state the operator left.
+const revertedMetaKey = "reverted"
 
 func runnerFor(mode string, log *slog.Logger) sysx.Runner {
 	if mode == model.ModeArmed {
@@ -225,13 +242,29 @@ func runnerFor(mode string, log *slog.Logger) sysx.Runner {
 
 // Run drives the engine until the context is cancelled.
 func (e *Engine) Run(ctx context.Context) error {
+	// The startup install sequence holds reconfMu like the other two callers
+	// of applySystemConfig/startProbers. The failoverctl socket opens on its
+	// own goroutine, so a revert can be served while this is still installing:
+	// unserialised, Revert latched, found no probers to stop, tore everything
+	// down - and this then reinstalled the plumbing and started a generation
+	// of probers on a "reverted" engine, measuring 100% loss against removed
+	// routes. The latch check below is the other half: a latch restored from
+	// the store (or set by a revert that won the lock first) means start held,
+	// exactly as the process that served the revert was.
+	e.reconfMu.Lock()
 	e.mu.Lock()
 	e.baseCtx = ctx
+	reverted := e.reverted
 	e.mu.Unlock()
-
-	e.applySystemConfig(ctx)
-	e.seedActiveFromKernel(ctx)
-	e.startProbers(ctx)
+	if reverted {
+		e.log.Warn("starting latched after a revert",
+			"note", "nothing is installed or measured until settings are saved or the mode is changed")
+	} else {
+		e.applySystemConfig(ctx)
+		e.seedActiveFromKernel(ctx)
+		e.startProbers(ctx)
+	}
+	e.reconfMu.Unlock()
 	defer e.stopProbers()
 
 	decide := time.NewTicker(500 * time.Millisecond)
@@ -1375,21 +1408,25 @@ func (e *Engine) refreshQuota(now time.Time) {
 	}
 }
 
-// AddUsage records a metering delta reported by the backend. It reports
-// whether the delta was durably accounted for, so the caller only advances its
-// dedupe watermark once the bytes are safely in the ledger.
-func (e *Engine) AddUsage(pathID int, bytes, packets int64, at time.Time) error {
+// AddUsage records a metering delta reported by the backend and advances the
+// caller's dedupe watermark (seqKey/seqVal) in the same transaction. It
+// reports whether both are durable, so the caller only acks once the bytes are
+// safely in the ledger - and the two cannot drift across a crash: a watermark
+// ahead of the ledger loses the bytes, one behind it double-bills a resend.
+func (e *Engine) AddUsage(pathID int, bytes, packets int64, at time.Time, seqKey, seqVal string) error {
 	e.mu.RLock()
 	cfg := e.cfg
 	e.mu.RUnlock()
 
 	p, ok := cfg.PathByID(pathID)
 	if !ok || !p.Metered {
-		return nil // nothing to account for; the delta can be discarded
+		// Nothing to account for; the delta is discarded, and only the
+		// watermark advances so the backend stops resending it.
+		return e.st.SetMeta(seqKey, seqVal)
 	}
 	metered := quota.Metered(bytes, packets, p.Quota)
 	start, _ := quota.PeriodBounds(p.Quota, at)
-	if err := e.st.AddUsage(pathID, start, metered, packets, at); err != nil {
+	if err := e.st.AddUsage(pathID, start, metered, packets, at, seqKey, seqVal); err != nil {
 		e.log.Warn("cannot record usage", "path", p.Name, "err", err)
 		return err
 	}
@@ -1772,6 +1809,12 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 	e.mu.Unlock()
 	e.applyMu.Unlock()
 
+	// The persisted copy comes off with it, or the next restart would start
+	// held on a latch the operator already released.
+	if err := e.st.SetMeta(revertedMetaKey, ""); err != nil {
+		e.log.Warn("cannot clear the persisted revert latch", "err", err)
+	}
+
 	e.notifier.SetConfig(cfg.Notify)
 	e.applySystemConfig(ctx)
 	e.startProbers(ctx)
@@ -1808,6 +1851,7 @@ func (e *Engine) Status() model.Status {
 		RulesActive: e.dataPlane,
 		Uptime:      now.Sub(e.started).Seconds(),
 		DecisionSeq: e.decisionSeq,
+		Reverted:    e.reverted,
 
 		Protect:         e.protectStatus(),
 		SharedEndpoints: e.sharedEndpoints,
@@ -1879,6 +1923,15 @@ func (e *Engine) Revert(ctx context.Context) {
 	e.reverted = true
 	cfg := e.cfg
 	e.mu.Unlock()
+
+	// Persisted before the teardown too, and for the same reason in a longer
+	// window: the unit restarts itself, so a crash anywhere between here and
+	// the `systemctl stop` that follows a revert would otherwise bring the
+	// process back reinstalling what this is about to remove.
+	if err := e.st.SetMeta(revertedMetaKey, "1"); err != nil {
+		e.log.Error("cannot persist the revert latch",
+			"err", err, "note", "a restart before the unit is stopped will reinstall and resume probing")
+	}
 
 	// The probers go too. Their routes and rules are removed below, so left
 	// running they would report every path down and fire the no-usable-path

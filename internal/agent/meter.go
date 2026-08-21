@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -40,6 +41,15 @@ type Meter struct {
 	last    map[string]sysx.Counters
 	nextSeq map[int]uint64
 	pending []proto.UsageDelta
+
+	// persistMu serialises persist against itself. It is called from two
+	// goroutines - the sample ticker and, via AckApplied, the control read
+	// loop - and both write the same tmp file before renaming it over the
+	// buffer. Unserialised, one rename can land mid-write of the other and
+	// publish a torn file. It is a separate lock from mu, held across the
+	// snapshot as well as the write, so the last writer to finish is also the
+	// one holding the newest snapshot and the file never goes backwards.
+	persistMu sync.Mutex
 }
 
 type meterState struct {
@@ -152,6 +162,21 @@ func (m *Meter) Pending() []proto.UsageDelta {
 	return out
 }
 
+// PendingBatch returns a copy of at most n of the oldest buffered deltas.
+// The report loop sends the oldest few hundred per tick, and copying the
+// whole backlog to slice off the front - up to maxBuffered deltas, every ten
+// seconds for the length of a drain - was allocation for nothing.
+func (m *Meter) PendingBatch(n int) []proto.UsageDelta {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n > len(m.pending) {
+		n = len(m.pending)
+	}
+	out := make([]proto.UsageDelta, n)
+	copy(out, m.pending[:n])
+	return out
+}
+
 // AckApplied drops every buffered delta the frontend's ack covers: for each
 // path named, everything at or below the acked sequence.
 //
@@ -184,6 +209,9 @@ func (m *Meter) AckApplied(seqs map[int]uint64) {
 // readable when somebody opens it mid-incident to see what has not been
 // delivered yet.
 func (m *Meter) persist() {
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+
 	m.mu.Lock()
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -221,7 +249,15 @@ func (m *Meter) save() {
 func (m *Meter) load() {
 	if raw, err := os.ReadFile(m.bufferPath); err == nil {
 		pending, err := decodeBuffer(raw)
-		if err == nil && len(pending) > 0 {
+		if err != nil {
+			// Whatever decoded ahead of the bad line is kept. Discarding the
+			// lot because the tail was torn threw away exactly the usage this
+			// buffer exists to protect - the deltas accrued while the frontend
+			// was unreachable.
+			m.log.Warn("usage buffer damaged, keeping the deltas that decoded",
+				"kept", len(pending), "err", err)
+		}
+		if len(pending) > 0 {
 			m.pending = pending
 			m.log.Info("restored buffered usage deltas", "count", len(pending))
 		}
@@ -244,6 +280,11 @@ func (m *Meter) load() {
 // The legacy branch exists so an upgrade does not discard deltas buffered by
 // the build it replaced - which would lose usage at exactly the moment the
 // buffer was doing its job.
+//
+// On a decode error it returns the deltas that decoded cleanly ahead of it,
+// alongside the error. A torn final line - a crash mid-write is enough - must
+// not cost the whole file: everything before it is intact and is the usage the
+// buffer was keeping safe.
 func decodeBuffer(raw []byte) ([]proto.UsageDelta, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
@@ -259,7 +300,7 @@ func decodeBuffer(raw []byte) ([]proto.UsageDelta, error) {
 	for dec.More() {
 		var d proto.UsageDelta
 		if err := dec.Decode(&d); err != nil {
-			return nil, err
+			return pending, err
 		}
 		pending = append(pending, d)
 	}
@@ -268,8 +309,22 @@ func decodeBuffer(raw []byte) ([]proto.UsageDelta, error) {
 
 func writeAtomic(log *slog.Logger, path string, data []byte) {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		log.Warn("cannot write state file", "path", path, "err", err)
+		return
+	}
+	_, werr := f.Write(data)
+	// Synced before the rename. The rename is metadata and can survive a power
+	// loss that the data behind it did not, replacing the last good file with a
+	// truncated one - the one corruption "atomic" was supposed to rule out.
+	serr := f.Sync()
+	if cerr := f.Close(); werr == nil && serr == nil {
+		werr = cerr
+	}
+	if werr != nil || serr != nil {
+		log.Warn("cannot write state file", "path", path, "err", cmp.Or(werr, serr))
+		_ = os.Remove(tmp)
 		return
 	}
 	if err := os.Rename(tmp, path); err != nil {

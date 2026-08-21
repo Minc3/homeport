@@ -329,7 +329,13 @@ async function refreshStatus() {
   const mode = document.getElementById('mode-badge');
   mode.textContent = st.mode === 'armed' ? 'armed' : 'observe only';
   mode.className = 'badge ' + (st.mode === 'armed' ? 'ok' : 'warn');
-  document.getElementById('observe').classList.toggle('hidden', st.mode === 'armed');
+  document.getElementById('observe').classList.toggle('hidden', st.mode === 'armed' || st.reverted);
+
+  // After a revert the trackers are frozen, so every path card below shows its
+  // last pre-revert health - typically three green tunnels - while nothing is
+  // measured at all. This banner is the page saying so; without it the frozen
+  // cards read as a live, healthy system.
+  document.getElementById('reverted').classList.toggle('hidden', !st.reverted);
 
   // Disarming stops further changes but leaves whatever was already installed
   // in place, because deleting the DNAT rules would drop every published

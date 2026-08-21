@@ -82,7 +82,13 @@ the engine: the probers stop and the reconciler and decision loop hold off
 until the next settings save or mode change, because observe mode deliberately
 repairs measurement plumbing and would otherwise reinstall the probe tables
 within a tick of the revert removing them. A reverted frontend measures
-nothing until it is told to resume. The other two
+nothing until it is told to resume. The latch is persisted (a `meta` key) and
+honoured by the startup sequence, because the unit runs under `Restart=always`:
+held only in memory, any crash between the revert and the `systemctl stop`
+that follows brought the process back reinstalling everything the revert had
+just removed. The portal says the hold out loud (`Status.Reverted`), since the
+trackers freeze at whatever they last measured and the frozen cards otherwise
+read as three healthy paths. The other two
 need theirs **stopped**: those reverts are separate processes with no way to
 tell a running agent anything, and the reconciler puts back everything it finds
 missing within ten seconds. Reverting underneath a live agent leaves a host that
@@ -286,7 +292,10 @@ there is no second layer of encryption.
 3. Buffers the delta to disk with a per-path sequence number.
 4. Ships batches up the control channel; the frontend dedupes on the sequence
    (`meta` key `usage_seq:<pathID>`) and folds them into the SQLite ledger,
-   converting to billed bytes with `quota.Metered`.
+   converting to billed bytes with `quota.Metered`. The watermark is written in
+   the **same transaction** as the ledger insert: as two writes, a crash
+   between them left a stale watermark that let the resent batch bill the same
+   bytes twice.
 5. The frontend acks the highest sequence per path that is durably in the
    ledger (`usage_ack`), and only then does the backend drop its buffered
    copy. A successful TCP write is not delivery — the batch in flight when the
@@ -792,6 +801,13 @@ Breaking any of these is a correctness bug even if the tests pass.
     uninstalling the frontend was a race — the script stops the unit moments
     after the revert returns, and a reconcile tick landing in that gap stranded
     rules the about-to-be-deleted binary was the only thing able to remove.
+    The latch is persisted alongside being set, and `Run`'s startup both checks
+    it and holds `reconfMu`, because the same race had two more entrances: the
+    unit restarts itself (`Restart=always`), so a crash in that window brought
+    up a process that reinstalled everything unconditionally — and the
+    failoverctl socket opens concurrently with startup, so a revert served
+    mid-startup could be followed by the startup sequence putting the plumbing
+    back and starting probers on a latched engine.
     `failover-backend -revert` and `failover-linker
     -revert` are separate processes, and a running agent's reconciler reinstalls
     the probe tables and their rules, the overlay route, the routes to every
@@ -1333,6 +1349,10 @@ where a subtle regression would be invisible in production until an outage:
   commands at all and still reports the rules gone, which is why
   `web.handleRevert` detaches the request context; and the same revert with a
   live one does the work.
+- `engine/revert_latch_test.go` — the revert latch survives a restart: a fresh
+  process on the same database starts held, its startup installs nothing and
+  starts no probers, and a settings save releases both the in-memory flag and
+  the persisted copy.
 - `sysx/linker_test.go` — that a site with no subnet generates byte-identical
   rules, that the two prefix helpers agree once one is set, that a service
   target moves only the DNAT, and that the source rules stay behind the
