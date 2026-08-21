@@ -242,12 +242,21 @@ fi
 # ---------------------------------------------------------------------------
 # Revert
 #
-# First, and while the agent is still installed and running: this is the step
-# that takes the DNAT table, the policy rules and the routes back out, and the
-# binary about to be deleted is the only thing that knows what they were.
+# First, and while the agent is still installed: this is the step that takes the
+# DNAT table, the policy rules and the routes back out, and the binary about to
+# be deleted is the only thing that knows what they were.
 #
-# The frontend's revert goes over the local control socket, so it needs the
-# agent up. A stopped or crashed frontend is exactly the state somebody
+# Installed, but not running, on the backend and the linker. Their reverts are
+# separate processes and cannot tell the agent anything, while the agent's
+# reconciler re-reads the kernel every ten seconds and puts back everything it
+# finds missing: the probe tables and their rules, the overlay route, the routes
+# to every extra host. Reverting underneath a live agent leaves a half reverted
+# host that reports itself clean, and then deletes the only binary that could
+# have finished the job.
+#
+# The frontend is the exception and needs the opposite. Its revert goes over the
+# local control socket into the running engine, which is also what disarms it,
+# so it must be up: a stopped or crashed frontend is exactly the state somebody
 # uninstalling is likely to be in, so it is started for the purpose and stopped
 # again below. That reinstalls nothing that was not already installed: an armed
 # agent's rules are on the host whether the process is running or not.
@@ -279,6 +288,16 @@ revert_frontend() {
 	"$BIN_DIR/failoverctl" -socket "$sock" revert
 }
 
+# stop_agent takes the unit down before an agent reverts itself. See the note
+# above: the reconciler would put the routing back within ten seconds of the
+# revert removing it, and the binary that knows what to remove is deleted below.
+# Not for the frontend, whose revert needs its agent up.
+stop_agent() {
+	systemctl is-active --quiet "$UNIT" 2>/dev/null || return 0
+	echo "  stopping $UNIT first, so its reconciler cannot reinstall what this removes"
+	systemctl stop "$UNIT" >/dev/null 2>&1 || true
+}
+
 if [ "$REVERT" -eq 1 ]; then
 	say "Reverting system changes"
 	case "$ROLE" in
@@ -286,6 +305,7 @@ if [ "$REVERT" -eq 1 ]; then
 		if revert_frontend; then reverted=1; fi
 		;;
 	backend)
+		stop_agent
 		if [ -x "$BIN_DIR/failover-backend" ] && [ -f "$CONFIG" ]; then
 			if "$BIN_DIR/failover-backend" -config "$CONFIG" -revert; then reverted=1; fi
 		else
@@ -293,6 +313,7 @@ if [ "$REVERT" -eq 1 ]; then
 		fi
 		;;
 	linker)
+		stop_agent
 		if [ -x "$BIN_DIR/failover-linker" ] && [ -f "$CONFIG" ]; then
 			if "$BIN_DIR/failover-linker" -config "$CONFIG" -revert; then reverted=1; fi
 		else
@@ -324,6 +345,12 @@ EOF
 		backend) echo "    failover-backend -revert" >&2 ;;
 		linker) echo "    failover-linker -revert" >&2 ;;
 		esac
+		if [ "$ROLE" != frontend ]; then
+			echo >&2
+			echo "  $UNIT was stopped for the revert and has been left stopped, so that" >&2
+			echo "  nothing reinstalls the rules underneath you. 'systemctl start $UNIT'" >&2
+			echo "  puts the agent back if you would rather keep serving for now." >&2
+		fi
 		exit 1
 	fi
 fi

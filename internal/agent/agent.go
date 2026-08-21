@@ -754,6 +754,16 @@ func (a *Agent) loadCachedConfig() {
 // moment it goes: requests keep arriving down the tunnel and their replies
 // leave by the LAN to pfSense, where the client's flow has no state.
 //
+// And stop this host's unit before running it. This is a separate process with
+// no way to tell a running agent anything, and reconcileRouting re-reads the
+// kernel every ten seconds and reinstalls whatever it finds missing: the probe
+// tables and their rules, the overlay route to the frontend, the routes to
+// every extra host, and the return path too if the cached mode is still armed.
+// The nftables tables and the source rules stay gone, so what is left is a host
+// that is half reverted and reports itself clean. The frontend has no such
+// problem because its revert runs inside the engine and disarms it, which is
+// invariant 12; there is no equivalent here to disarm.
+//
 // The WireGuard tunnels are left alone because the agent never created them,
 // and the overlay address is left in place for the reason the linker's revert
 // leaves its own: a service may still be bound to it, and taking an address out
@@ -809,7 +819,9 @@ func (a *Agent) Revert(ctx context.Context) {
 
 	a.log.Warn("reverted all system changes on the backend",
 		"note", "the WireGuard tunnels and the overlay address are left in place; "+
-			"restart the agent to reinstall")
+			"restart the agent to reinstall",
+		"hint", "if failover-backend.service is still running, its reconciler puts the routing "+
+			"back within ten seconds: stop the unit and run this again")
 }
 
 // withdrawRemovedLinkers deletes routes for linkers that are no longer

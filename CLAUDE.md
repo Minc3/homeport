@@ -72,13 +72,22 @@ make deploy-backend  BACKEND_HOST=root@home
 make deploy-linker   LINKER_HOST=root@gs1     # one host at a time
 ```
 
-Rolling back takes one command per host, in this order (see invariant 8):
+Rolling back goes host by host, in this order (see invariant 8):
 
 ```sh
-failoverctl revert                            # frontend, first
-failover-backend -revert                      # backend, second
-failover-linker -revert                       # each extra host, if any
+failoverctl revert                            # frontend, first, agent running
+systemctl stop failover-backend               # backend, second
+failover-backend -revert
+systemctl stop failover-linker                # each extra host, if any
+failover-linker -revert
 ```
+
+The frontend's revert needs its agent **up**, because it goes over the control
+socket into the running engine, which is also what disarms it. The other two
+need theirs **stopped**: those reverts are separate processes with no way to
+tell a running agent anything, and the reconciler puts back everything it finds
+missing within ten seconds. Reverting underneath a live agent leaves a host that
+is half reverted and reports itself clean.
 
 Removing an agent entirely is `sudo ./deploy/uninstall.sh` on each host, in that
 same order. It runs the revert above first, while the binary that knows what it
@@ -687,10 +696,11 @@ Breaking any of these is a correctness bug even if the tests pass.
 
    **It takes two commands, because there are two hosts.** `failoverctl revert`
    reaches only the frontend; the backend's half is `failover-backend -revert`,
-   and it must be run second. Taking the reply path down while the frontend is
-   still armed and DNATing breaks every published service on the spot: requests
-   keep arriving down the tunnel and their replies leave by the LAN to pfSense,
-   where the client's flow has no state.
+   and it must be run second, with that host's unit stopped first (invariant
+   12). Taking the reply path down while the frontend is still armed and DNATing
+   breaks every published service on the spot: requests keep arriving down the
+   tunnel and their replies leave by the LAN to pfSense, where the client's flow
+   has no state.
 
    This was a gap for a long while and an invisible one: `RemoveReturnRoutes`,
    `RemoveOverlayLocalRule` and `RemoveReturnRuleset` were all written and none
@@ -765,6 +775,18 @@ Breaking any of these is a correctness bug even if the tests pass.
     are gone, which is invariant 13 failing in the one direction it must not,
     on the one command that exists to be trusted. `Revert` takes `reconfMu` and
     `applyMu`, in that order.
+
+    **Only the frontend can disarm itself, and the other two need the unit
+    stopped instead.** `failoverctl revert` runs inside the engine, so setting
+    observe mode is enough. `failover-backend -revert` and `failover-linker
+    -revert` are separate processes, and a running agent's reconciler reinstalls
+    the probe tables and their rules, the overlay route, the routes to every
+    extra host, and the return path if the cached mode is still armed, within
+    one ten-second tick. The nftables tables and the source rules stay gone, so
+    what is left is a host that is half reverted and says it is clean, and
+    `uninstall.sh` then deletes the binary that could have finished the job.
+    That script stops the unit first for those two roles; the manual commands in
+    §2 say to do the same.
 
     **And it must never be handed a request context.** `ExecRunner` builds every
     command with `exec.CommandContext`, so a cancelled context does not abort a

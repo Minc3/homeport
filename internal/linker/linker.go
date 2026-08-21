@@ -318,10 +318,18 @@ func (l *Linker) reconcile(ctx context.Context) {
 // The overlay address stays. A service may still be bound to it, and taking an
 // address out from under a listening process turns a routing change into a
 // crash - which is not what somebody running a revert is asking for.
+//
+// Stop this host's unit before running it. This is a separate process and
+// cannot tell a running agent anything, while reconcile re-reads the kernel
+// every ten seconds and puts back the overlay rule, the mark rule and the route
+// to the backend. The result is a host that is half reverted and says it is
+// clean.
 func (l *Linker) Revert(ctx context.Context) {
 	sysx.RemoveLinkerEgressRuleset(ctx, l.runner, l.table())
 	sysx.RemoveLinkerReturnRuleset(ctx, l.runner, l.table())
 	sysx.RemoveLinkerRouting(ctx, l.runner, l.boot.Linker.OverlayIP, l.table())
 	l.log.Warn("removed the overlay policy rule and table",
-		"note", "the overlay address is left in place; anything bound to it is still listening")
+		"note", "the overlay address is left in place; anything bound to it is still listening",
+		"hint", "if failover-linker.service is still running, its reconciler puts the routing "+
+			"back within ten seconds: stop the unit and run this again")
 }

@@ -554,12 +554,21 @@ every policy route the *frontend* installed, including the egress table from
 section 5. The WireGuard tunnels are untouched, because the agent never created
 them.
 
-Then, on the backend, `failover-backend -revert`. It is a separate command
-because it is a separate host, and it goes second on purpose: it takes down the
-reply path, and while the frontend is still armed and DNATing that breaks every
-published service instantly. The requests keep arriving down the tunnel and the
-replies leave by the LAN to pfSense, where the client's flow has no state. It
-leaves the overlay address in place, because a service may still be bound to it.
+Then, on the backend, `systemctl stop failover-backend` followed by
+`failover-backend -revert`. It is a separate command because it is a separate
+host, and it goes second on purpose: it takes down the reply path, and while the
+frontend is still armed and DNATing that breaks every published service
+instantly. The requests keep arriving down the tunnel and the replies leave by
+the LAN to pfSense, where the client's flow has no state. It leaves the overlay
+address in place, because a service may still be bound to it.
+
+Stopping the unit first is not optional. That revert is a separate process with
+no way to tell a running agent anything, and the agent's reconciler puts the
+probe tables, the overlay route and the routes to any extra hosts back within
+ten seconds of the revert removing them, leaving a host that is half reverted
+and reports itself clean. The frontend needs the opposite, its agent up, because
+its revert goes over the control socket into the running engine and that is also
+what disarms it.
 
 Neither command is a teardown of the tunnels, and neither needs to be undone:
 restarting the agent reinstalls everything.
@@ -785,8 +794,10 @@ a service was deliberately bound to it — so until something opts in, the rules
 are inert. What actually directs traffic to this host is the frontend's DNAT,
 which has its own observe mode.
 
-`failover-linker -revert` removes both rules and deliberately leaves the overlay
-address in place, so anything bound to it keeps listening.
+`systemctl stop failover-linker` then `failover-linker -revert` removes both
+rules and deliberately leaves the overlay address in place, so anything bound to
+it keeps listening. Stop the unit first, for the reason the backend's does:
+reconcile puts the rules back ten seconds after the revert takes them out.
 
 ### Declare the linker in the portal first
 
@@ -1102,10 +1113,17 @@ control socket, so the script starts the unit for the purpose and stops it
 again. That installs nothing new — an armed agent's rules are on the host
 whether the process is running or not.
 
+**The backend and the linker are the other way round**, and the script stops
+their unit before reverting. Those reverts are separate processes that cannot
+tell a running agent anything, and the reconciler reinstalls whatever it finds
+missing within ten seconds — so reverting underneath a live agent leaves rules
+behind and then deletes the binary that knew about them.
+
 **Doing it by hand** is four steps, and the script exists because the first one
 is easy to skip:
 
 ```sh
+# on the backend or a linker, stop the unit first: systemctl stop failover-backend
 failoverctl revert                       # or failover-{backend,linker} -revert
 systemctl disable --now failover-frontend
 rm /etc/systemd/system/failover-frontend.service && systemctl daemon-reload
