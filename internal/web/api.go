@@ -410,6 +410,24 @@ func validate(cfg *model.Config) error {
 	}
 	for i := range cfg.Services {
 		sv := &cfg.Services[i]
+		// The name is not decoration: it is rendered into the generated
+		// ruleset as an nftables comment, on the DNAT rule and again on the
+		// protection ceiling beside it. nft bounds a comment's length and
+		// cannot parse a quote or a newline inside one, and it rejects the
+		// *whole table* when it meets one - so a single awkward name takes
+		// every published service down with it, or rather leaves the previous
+		// ones installed while the save reports success and nothing new
+		// reaches the kernel. Bounded here so it cannot get as far as the file.
+		sv.Name = trimmed(sv.Name)
+		if len(sv.Name) > maxServiceName {
+			return fmt.Errorf("service name %q is %d characters; keep it under %d, "+
+				"because it becomes an nftables comment and the kernel bounds those",
+				sv.Name, len(sv.Name), maxServiceName)
+		}
+		if bad := firstBadCommentRune(sv.Name); bad != "" {
+			return fmt.Errorf("service name %q contains %q, which cannot appear in an nftables comment",
+				sv.Name, bad)
+		}
 		if sv.Proto != "tcp" && sv.Proto != "udp" {
 			return fmt.Errorf("service %s must be tcp or udp", sv.Name)
 		}
@@ -450,6 +468,28 @@ func validate(cfg *model.Config) error {
 		}
 	}
 	return nil
+}
+
+// maxServiceName is a bound, not a style rule. nftables caps a rule comment at
+// 128 bytes and rejects the table that carries an over-long one; this leaves
+// room for the "ceiling:" prefix the protection rules add.
+const maxServiceName = 64
+
+// firstBadCommentRune returns the first character that cannot be rendered into
+// an nftables comment, or "" when the string is safe.
+//
+// A quote ends the comment early and a backslash starts an escape, so either
+// one turns the rest of the name into rule syntax; a newline does the same at
+// the level of the file. None of that is a privilege the operator does not
+// already have - they are editing the ruleset by definition - but all of it
+// fails as a rejected table rather than as anything anybody meant.
+func firstBadCommentRune(s string) string {
+	for _, r := range s {
+		if r == '"' || r == '\\' || r < 0x20 || r == 0x7f {
+			return string(r)
+		}
+	}
+	return ""
 }
 
 // overlayContains reports whether an address is somewhere this site can route.

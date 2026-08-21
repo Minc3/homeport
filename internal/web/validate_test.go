@@ -284,3 +284,38 @@ func TestPathsCannotTakeAReservedFwmark(t *testing.T) {
 		t.Errorf("the shipped configuration no longer validates: %v", err)
 	}
 }
+
+// A service name is rendered into the generated ruleset as an nftables comment,
+// on the DNAT rule and on the protection ceiling beside it. nft rejects the
+// whole table over one bad comment, so an unbounded name is not a cosmetic
+// problem: the load fails, the previously installed rules stay live, and the
+// save reports success while nothing new has reached the kernel.
+func TestValidateRejectsAServiceNameNftablesCannotCarry(t *testing.T) {
+	cases := map[string]string{
+		"a quote ends the comment early":       `gmod "main"`,
+		"a backslash starts an escape":         `gmod\main`,
+		"a newline is a second rule":           "gmod\ncounter drop",
+		"a control character is not printable": "gmod\x01",
+		"too long for the kernel's bound":      strings.Repeat("g", maxServiceName+1),
+	}
+	for why, name := range cases {
+		cfg := model.Defaults()
+		cfg.Services[0].Name = name
+		if err := validate(&cfg); err == nil {
+			t.Errorf("%s: %q should have been rejected", why, name)
+		}
+	}
+}
+
+// Ordinary names keep working, and are trimmed the way every other free-text
+// field here is.
+func TestValidateAcceptsAndTrimsAnOrdinaryServiceName(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Services[0].Name = "  gmod: main server (27015)  "
+	if err := validate(&cfg); err != nil {
+		t.Fatalf("an ordinary name must validate: %v", err)
+	}
+	if cfg.Services[0].Name != "gmod: main server (27015)" {
+		t.Errorf("name = %q, want it trimmed", cfg.Services[0].Name)
+	}
+}
