@@ -7,7 +7,7 @@ Documentation=https://github.com/quinlan102/homeport
 # rp_filter but not nftables, so a late nftables.service would take the
 # return marking away with nothing to notice - published replies would then
 # leave by the LAN default route instead of the tunnel.
-After=network-online.target nftables.service wg-quick@wg-nbn.service wg-quick@wg-lte1.service wg-quick@wg-lte2.service
+After=network-online.target nftables.service wg-quick@wg-main.service wg-quick@wg-lte1.service wg-quick@wg-lte2.service
 Wants=network-online.target
 
 [Service]

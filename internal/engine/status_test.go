@@ -17,7 +17,7 @@ func TestStatusReportsPreferredPathSoThePortalNeedNotReimplementIt(t *testing.T)
 
 	st := e.Status()
 	if st.PreferredPath != 1 {
-		t.Errorf("preferred path %d, want nbn (1)", st.PreferredPath)
+		t.Errorf("preferred path %d, want main (1)", st.PreferredPath)
 	}
 }
 
@@ -33,7 +33,7 @@ func TestPreferredPathTracksTheSelectorWhenTheTopPathIsDisabled(t *testing.T) {
 
 	st := e.Status()
 	if st.PreferredPath != 2 {
-		t.Errorf("preferred path %d, want lte1 (2) once nbn is disabled", st.PreferredPath)
+		t.Errorf("preferred path %d, want lte1 (2) once main is disabled", st.PreferredPath)
 	}
 
 	// The selector and the badge must agree about where traffic belongs.

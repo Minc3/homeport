@@ -15,7 +15,7 @@ single tunnel.
               Debian FRONTEND  (datacentre)
                        │   probes all three, picks one, DNATs published ports
         ┌──────────────┼──────────────┐
-     wg-nbn         wg-lte1        wg-lte2
+     wg-main         wg-lte1        wg-lte2
         └──────────────┼──────────────┘
                     pfSense           pins each tunnel to its own WAN
                        │
@@ -63,13 +63,13 @@ routing decision.
 
 ## Selection policy
 
-Strict priority by default: NBN → LTE1 → LTE2.
+Strict priority by default: main → LTE1 → LTE2.
 
 - **Failover is immediate.** Being on a working link beats being on the
   preferred one.
 - **Failback waits.** A better path must be continuously clean for the hold-down
-  window (90s by default) before traffic returns, so a marginal NBN service
-  cannot drag traffic back and forth.
+  window (90s by default) before traffic returns, so a marginal fixed line
+  service cannot drag traffic back and forth.
 - **A path is skipped** when it is unreachable, degraded past the loss/latency
   thresholds, quarantined by the flap circuit breaker, over its data quota, or
   switched off.
@@ -82,10 +82,10 @@ eligible path rather than the next one down the list. A clean LTE2 beats an LTE1
 dropping one packet in ten.
 
 It never displaces the preferred path, however much better a fallback measures.
-Priority order here is the *cost* order — NBN is unmetered and the LTE services
-are capped — and a selector that simply chased the lowest score would park
-traffic on a metered link and call it optimising. Moving between two fallbacks
-needs a margin, a hold-down and a minimum dwell, so noise cannot cause a swap
+Priority order here is the *cost* order — the main link is unmetered and the
+LTE services are capped — and a selector that simply chased the lowest score
+would park traffic on a metered link and call it optimising. Moving between two
+fallbacks needs a margin, a hold-down and a minimum dwell, so noise cannot cause a swap
 and a genuine alternation cannot cause an endless run of them.
 
 ## LTE quotas
@@ -213,7 +213,7 @@ sudo ./deploy/install-backend.sh --psk <the value it printed>
 
 Both are safe to re-run — that is how you upgrade — and leave an existing
 bootstrap file alone unless `--force-config` is given. `--help` lists the
-overlay and portal address options. [SETUP.md](deploy/SETUP.md) section 12
+overlay and portal address options. [SETUP.md](deploy/SETUP.md) step 15
 covers updating: what a restart of each agent costs, and why replacing a binary
 by hand needs a `systemctl stop` while the script does not.
 
@@ -227,7 +227,7 @@ make deploy-backend  BACKEND_HOST=root@home.example.net
 ```
 
 For an extra host behind the backend — rarely, and only after reading
-[SETUP.md](deploy/SETUP.md) section 10, which covers the WireGuard change it
+[SETUP.md](deploy/SETUP.md) step 14, which covers the WireGuard change it
 requires:
 
 ```sh
@@ -253,7 +253,7 @@ sudo ./deploy/uninstall.sh --keep-state    # ... but keep the database
 ```
 
 Run it on the frontend first, then the backend, then any linkers — the ordering
-in [SETUP.md](deploy/SETUP.md) section 8, for the same reason. It reverts while
+in [SETUP.md](deploy/SETUP.md) step 17, for the same reason. It reverts while
 the agent is still installed and refuses to go further if that fails, since the
 binary is the only thing that knows which rules and priorities are this
 system's. The bootstrap file and the state directory go with it, unless

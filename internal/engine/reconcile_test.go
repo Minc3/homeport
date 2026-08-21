@@ -57,7 +57,7 @@ func (q *queryRunner) count(substr string) int {
 }
 
 // healthyKernel is what the frontend sees when every route is where the agent
-// put it: nbn active, all three probe tables populated, rules in place.
+// put it: main active, all three probe tables populated, rules in place.
 func healthyKernel() map[string]string {
 	return map[string]string{
 		"ip rule show": "0: from all lookup local\n" +
@@ -74,14 +74,14 @@ func healthyKernel() map[string]string {
 		"ip rule show table 101":                    "30001: from all fwmark 0x101 lookup 101\n",
 		"ip rule show table 102":                    "30002: from all fwmark 0x102 lookup 102\n",
 		"ip rule show table 103":                    "30003: from all fwmark 0x103 lookup 103\n",
-		"sysctl -n net.ipv4.conf.wg-nbn.rp_filter":  "0",
+		"sysctl -n net.ipv4.conf.wg-main.rp_filter": "0",
 		"sysctl -n net.ipv4.conf.wg-lte1.rp_filter": "0",
 		"sysctl -n net.ipv4.conf.wg-lte2.rp_filter": "0",
-		"ip route show 10.99.0.2/32 table 101":      "10.99.0.2 dev wg-nbn scope link src 10.99.0.1",
+		"ip route show 10.99.0.2/32 table 101":      "10.99.0.2 dev wg-main scope link src 10.99.0.1",
 		"ip route show 10.99.0.2/32 table 102":      "10.99.0.2 dev wg-lte1 scope link src 10.99.0.1",
 		"ip route show 10.99.0.2/32 table 103":      "10.99.0.2 dev wg-lte2 scope link src 10.99.0.1",
-		"ip route show 10.99.0.2/32 table 100":      "10.99.0.2 dev wg-nbn scope link src 10.99.0.1",
-		"ip route show 10.99.0.2/32":                "10.99.0.2 dev wg-nbn scope link src 10.99.0.1",
+		"ip route show 10.99.0.2/32 table 100":      "10.99.0.2 dev wg-main scope link src 10.99.0.1",
+		"ip route show 10.99.0.2/32":                "10.99.0.2 dev wg-main scope link src 10.99.0.1",
 	}
 }
 
@@ -104,7 +104,7 @@ func engineForReconcile(t *testing.T, kernel map[string]string) (*Engine, *query
 	e.real = q
 	e.runner = q
 	e.ifaceExists = func(string) bool { return true }
-	e.active = 1 // nbn
+	e.active = 1 // main
 	return e, q
 }
 
@@ -115,7 +115,7 @@ func engineForReconcile(t *testing.T, kernel map[string]string) (*Engine, *query
 // part doesn't work" looks like from the portal.
 func TestReconcileRestoresAProbeRouteLostWhenATunnelWasRecreated(t *testing.T) {
 	kernel := healthyKernel()
-	kernel["ip route show 10.99.0.2/32 table 101"] = "" // wg-nbn was restarted
+	kernel["ip route show 10.99.0.2/32 table 101"] = "" // wg-main was restarted
 
 	// Traffic already moved to lte1, so that is where the active routes point.
 	kernel["ip route show 10.99.0.2/32 table 100"] = "10.99.0.2 dev wg-lte1 scope link src 10.99.0.1"
@@ -126,7 +126,7 @@ func TestReconcileRestoresAProbeRouteLostWhenATunnelWasRecreated(t *testing.T) {
 
 	e.reconcileRouting(context.Background())
 
-	want := "ip route replace 10.99.0.2/32 dev wg-nbn src 10.99.0.1 table 101"
+	want := "ip route replace 10.99.0.2/32 dev wg-main src 10.99.0.1 table 101"
 	if q.count(want) != 1 {
 		t.Errorf("probe route for the restarted tunnel was not restored; writes were %v", q.writes())
 	}
@@ -158,12 +158,12 @@ func TestReconcileSkipsPathsWhoseTunnelIsStillMissing(t *testing.T) {
 	kernel["ip route show 10.99.0.2/32 table 101"] = ""
 
 	e, q := engineForReconcile(t, kernel)
-	e.ifaceExists = func(iface string) bool { return iface != "wg-nbn" }
+	e.ifaceExists = func(iface string) bool { return iface != "wg-main" }
 	e.active = 2
 
 	e.reconcileRouting(context.Background())
 
-	if q.count("dev wg-nbn") != 0 {
+	if q.count("dev wg-main") != 0 {
 		t.Errorf("tried to route through a tunnel that does not exist: %v", q.writes())
 	}
 }

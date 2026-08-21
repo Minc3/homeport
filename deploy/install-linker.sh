@@ -367,7 +367,7 @@ IN THE PORTAL, on the frontend:
 
   - overlay.subnet must be set in the frontend's and the backend's bootstrap
     files, to $SUBNET. Check the frontend's peers cover the range as well -
-    "wg show wg-nbn allowed-ips" should list it, and a peer that excludes
+    "wg show wg-main allowed-ips" should list it, and a peer that excludes
     this host drops its traffic in silence. See SETUP.md section 10.
 
 This host still does not appear in the portal. A linker reports nothing about

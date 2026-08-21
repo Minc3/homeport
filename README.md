@@ -14,6 +14,54 @@ real IP address, on UDP as much as on TCP.
 Those are deliberately left to you. It assumes the tunnels exist and are correct,
 and steers traffic across them.
 
+## The two things it does
+
+### Your services see the client's real IP address, on UDP as well as TCP
+
+The frontend rewrites the destination of an incoming packet and never the
+source. Nothing is terminated, re-originated or proxied, so the packet your
+game server or web server receives is the client's own packet, from the
+client's own address.
+
+That is what keeps the things built on IP addresses working: per player bans,
+rate limits, geolocation, abuse reports, `fail2ban`, and web logs that do not
+need `X-Forwarded-For` to be true. A reverse proxy can offer this for HTTP
+only, as a header your application has to trust; for a UDP game protocol it
+cannot offer it at all.
+
+### One stable public address that moves between your connections
+
+Both ends carry a fixed private address on a dummy interface, and a failover
+changes only which tunnel the traffic leaves by. The addresses at both ends of
+every connection stay exactly as they were, so connection tracking survives the
+switch and clients are never told anything happened.
+
+Failover away from a broken link is immediate. Failback waits for a clean
+streak, ninety seconds by default, so a connection that keeps half recovering
+cannot drag your traffic back and forth.
+
+### What a failover feels like from the outside
+
+A link goes down. Roughly two seconds later the frontend has seen enough lost
+probes to condemn it, and one `ip route replace` moves the traffic. Then:
+
+| Client | What they see |
+|---|---|
+| A player in a Source game | A freeze of a couple of seconds, then play continues. No "connection lost", no reconnect, no map reload: their session is the same 5-tuple it was before. |
+| A browser mid request | A pause, then the page finishes loading. No error page, no logging in again. |
+| An SSH session | The terminal stops for a moment and resumes. |
+| A large download | Stalls, retransmits, carries on at the new link's rate. |
+
+TCP connections survive because the segments in flight when the link died are
+simply lost, and TCP does what it always does with lost segments: it
+retransmits, and by then the route points somewhere that works. UDP flows
+survive because there is no connection state to lose in the first place, and
+because the server sees no change of peer.
+
+There is no DNS record to propagate, nothing to reconnect, and no fresh
+WireGuard handshake at the worst moment, because the standby tunnels are kept
+warm.
+
 ![The portal dashboard: three tunnels with live RTT, loss and jitter, the
 active one marked, data used against each quota, and an extra host checked
 in below](dashboard.png)
@@ -163,7 +211,7 @@ file that host needs, and the backend installs and maintains the route to it, so
 nothing is ever set up by hand on the linker itself.
 
 Adding one changes the WireGuard configuration slightly, so do it after the
-other two are working and read [SETUP.md](deploy/SETUP.md) section 10 first:
+other two are working and read [SETUP.md](deploy/SETUP.md) step 14 first:
 
 ```sh
 sudo ./deploy/install-linker.sh --psk <the frontend's psk> \
@@ -220,7 +268,7 @@ sudo ./deploy/uninstall.sh          # --keep-state keeps the database
 
 It reverts the routing and nftables changes before it removes anything, and
 leaves the tunnels and the overlay address alone. [SETUP.md](deploy/SETUP.md)
-section 13 covers the ordering and what survives; section 12 covers updating a
+step 17 covers the ordering and what survives; step 15 covers updating a
 host, which is the same install script run again.
 
 ## Building from source
@@ -284,8 +332,9 @@ problem if you ask for the feature.
 - **[REFERENCE.md](REFERENCE.md)** covers the full detail: how failover stays
   invisible, how health is measured, the selection policy, data quotas,
   outbound traffic, multi-host setups, the CLI and the safety behaviour.
-- **[deploy/SETUP.md](deploy/SETUP.md)** is installation start to finish:
-  WireGuard, pfSense, the portal, arming it.
+- **[deploy/SETUP.md](deploy/SETUP.md)** is the step by step install: what to
+  type, in what order, and what to check at each stage. WireGuard, pfSense, both
+  agents, the portal, arming it, then updating and removing it again.
 - **[deploy/LINKER-NOTES.md](deploy/LINKER-NOTES.md)** holds field notes from
   the first multi-host deployment, and how to debug that path.
 - **[CLAUDE.md](CLAUDE.md)** has the design reasoning, the invariants and the

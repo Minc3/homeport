@@ -98,7 +98,7 @@ func TestRulesetScopesToPublicIP(t *testing.T) {
 // straight back out the tunnel it came from - the service appears completely
 // dead while every component of it is healthy. This was observed in production.
 func TestReturnRulesetMarksOnlyReplies(t *testing.T) {
-	rs := BuildReturnRuleset([]string{"wg-nbn", "wg-lte1"})
+	rs := BuildReturnRuleset([]string{"wg-main", "wg-lte1"})
 
 	if !strings.Contains(rs, "ct direction reply meta mark set ct mark") {
 		t.Errorf("mark restore must be limited to the reply direction:\n%s", rs)
@@ -106,7 +106,7 @@ func TestReturnRulesetMarksOnlyReplies(t *testing.T) {
 	if strings.Contains(rs, "\n\t\tmeta mark set ct mark") {
 		t.Errorf("unconditional mark restore would send requests back out their own tunnel:\n%s", rs)
 	}
-	if !strings.Contains(rs, `iifname { "wg-nbn", "wg-lte1" } ct direction original ct mark set 0x200`) {
+	if !strings.Contains(rs, `iifname { "wg-main", "wg-lte1" } ct direction original ct mark set 0x200`) {
 		t.Errorf("connections arriving from a tunnel must be marked:\n%s", rs)
 	}
 	// The direction qualifier is not decoration. A connection the backend
@@ -276,7 +276,7 @@ func TestEgressForwardExceptionMatchesSource(t *testing.T) {
 func TestBackendEgressRulesetPullsANetworkOntoTheTunnel(t *testing.T) {
 	rs := BuildBackendEgressRuleset(
 		[]string{"172.18.0.0/16"},
-		[]string{"wg-nbn", "wg-lte1"},
+		[]string{"wg-main", "wg-lte1"},
 		"10.99.0.2")
 
 	// The mark is set in prerouting because a forwarded packet's routing
@@ -290,7 +290,7 @@ func TestBackendEgressRulesetPullsANetworkOntoTheTunnel(t *testing.T) {
 	}
 	// The source has to become the overlay address: that is what the frontend's
 	// egress rule matches, and the only address it can route a reply back to.
-	if !strings.Contains(rs, `ip saddr 172.18.0.0/16 oifname { "wg-nbn", "wg-lte1" } snat to 10.99.0.2`) {
+	if !strings.Contains(rs, `ip saddr 172.18.0.0/16 oifname { "wg-main", "wg-lte1" } snat to 10.99.0.2`) {
 		t.Errorf("source not rewritten to the overlay address:\n%s", rs)
 	}
 }
@@ -300,7 +300,7 @@ func TestBackendEgressRulesetPullsANetworkOntoTheTunnel(t *testing.T) {
 // have none, because wg-quick runs with Table = off and no Address. The
 // translation has to be settled before Docker gets a look.
 func TestBackendEgressSNATRunsBeforeDockersMasquerade(t *testing.T) {
-	rs := BuildBackendEgressRuleset([]string{"172.18.0.0/16"}, []string{"wg-nbn"}, "10.99.0.2")
+	rs := BuildBackendEgressRuleset([]string{"172.18.0.0/16"}, []string{"wg-main"}, "10.99.0.2")
 	if !strings.Contains(rs, "type nat hook postrouting priority -10") {
 		t.Errorf("egress SNAT must be ahead of srcnat priority 100:\n%s", rs)
 	}
@@ -311,7 +311,7 @@ func TestBackendEgressSNATRunsBeforeDockersMasquerade(t *testing.T) {
 // and rewriting its source to an overlay address on the way out of the LAN
 // would break it rather than merely leave it alone.
 func TestBackendEgressSNATOnlyAppliesOnTheTunnels(t *testing.T) {
-	rs := BuildBackendEgressRuleset([]string{"172.18.0.0/16"}, []string{"wg-nbn"}, "10.99.0.2")
+	rs := BuildBackendEgressRuleset([]string{"172.18.0.0/16"}, []string{"wg-main"}, "10.99.0.2")
 	for _, line := range strings.Split(rs, "\n") {
 		if strings.Contains(line, "snat to") && !strings.Contains(line, "oifname") {
 			t.Errorf("unscoped SNAT would fire on the local network too: %q", line)
@@ -322,7 +322,7 @@ func TestBackendEgressSNATOnlyAppliesOnTheTunnels(t *testing.T) {
 // Nothing configured must render nothing, so the caller removes the table
 // rather than loading an empty one that looks deliberate.
 func TestBackendEgressRulesetIsEmptyWithoutSources(t *testing.T) {
-	if rs := BuildBackendEgressRuleset(nil, []string{"wg-nbn"}, "10.99.0.2"); rs != "" {
+	if rs := BuildBackendEgressRuleset(nil, []string{"wg-main"}, "10.99.0.2"); rs != "" {
 		t.Errorf("expected nothing with no sources:\n%s", rs)
 	}
 	if rs := BuildBackendEgressRuleset([]string{"172.18.0.0/16"}, nil, "10.99.0.2"); rs != "" {

@@ -11,14 +11,14 @@ import (
 // from - the public address of the WAN that tunnel actually used.
 func TestPeerEndpointsAreReadPerInterface(t *testing.T) {
 	f := &shapeRunner{replies: map[string]string{
-		"wg show all endpoints": "wg-nbn\tkeyA=\t203.0.113.10:51820\n" +
+		"wg show all endpoints": "wg-main\tkeyA=\t203.0.113.10:51820\n" +
 			"wg-lte1\tkeyB=\t198.51.100.20:41234\n" +
 			"wg-lte2\tkeyC=\t198.51.100.99:52001",
 	}}
 
 	got := PeerEndpoints(context.Background(), f)
 	for iface, want := range map[string]string{
-		"wg-nbn":  "203.0.113.10:51820",
+		"wg-main": "203.0.113.10:51820",
 		"wg-lte1": "198.51.100.20:41234",
 		"wg-lte2": "198.51.100.99:52001",
 	} {
@@ -33,7 +33,7 @@ func TestPeerEndpointsAreReadPerInterface(t *testing.T) {
 // address would be worse than a blank.
 func TestATunnelWithNoHandshakeReportsNoEndpoint(t *testing.T) {
 	f := &shapeRunner{replies: map[string]string{
-		"wg show all endpoints": "wg-nbn\tkeyA=\t203.0.113.10:51820\n" +
+		"wg show all endpoints": "wg-main\tkeyA=\t203.0.113.10:51820\n" +
 			"wg-lte2\tkeyC=\t(none)",
 	}}
 
@@ -41,7 +41,7 @@ func TestATunnelWithNoHandshakeReportsNoEndpoint(t *testing.T) {
 	if _, ok := got["wg-lte2"]; ok {
 		t.Errorf("a tunnel with no handshake reported %q", got["wg-lte2"])
 	}
-	if got["wg-nbn"] == "" {
+	if got["wg-main"] == "" {
 		t.Error("the tunnel that does have a handshake was dropped too")
 	}
 }
@@ -51,8 +51,8 @@ func TestATunnelWithNoHandshakeReportsNoEndpoint(t *testing.T) {
 // nothing - the whole point is that two paths showing one address is a fault.
 func TestAnInterfaceWithSeveralPeersReportsNothing(t *testing.T) {
 	f := &shapeRunner{replies: map[string]string{
-		"wg show all endpoints": "wg-nbn\tkeyA=\t203.0.113.10:51820\n" +
-			"wg-nbn\tkeyB=\t203.0.113.55:51820",
+		"wg show all endpoints": "wg-main\tkeyA=\t203.0.113.10:51820\n" +
+			"wg-main\tkeyB=\t203.0.113.55:51820",
 	}}
 
 	if got := PeerEndpoints(context.Background(), f); len(got) != 0 {

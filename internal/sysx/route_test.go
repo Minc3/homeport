@@ -115,7 +115,7 @@ func TestDryRunnerSuppressesMutationsButRunsQueries(t *testing.T) {
 	// Observe mode must not change anything, but it has to be able to read the
 	// system or it could not report what it would do.
 	mutations := [][]string{
-		{"ip", "route", "replace", "10.99.0.2/32", "dev", "wg-nbn"},
+		{"ip", "route", "replace", "10.99.0.2/32", "dev", "wg-main"},
 		{"ip", "rule", "add", "fwmark", "0x101", "lookup", "101"},
 		{"ip", "link", "add", "dummy0", "type", "dummy"},
 		{"nft", "-f", "/var/lib/failover/ruleset.nft"},
@@ -143,7 +143,7 @@ func TestDryRunnerSuppressesMutationsButRunsQueries(t *testing.T) {
 		// EnsureQdisc runs through the mode-gated runner, so this one was live:
 		// in observe mode the readback always answered "no shaper installed",
 		// and every reconcile tick proposed replacing a correct one.
-		{"tc", "qdisc", "show", "dev", "wg-nbn"},
+		{"tc", "qdisc", "show", "dev", "wg-main"},
 		// Latent, and only because every caller passes the real runner today:
 		// the option comes before the verb, so testing args[0] read the flag.
 		{"nft", "-a", "list", "chain", "ip", "filter", "DOCKER-USER"},
@@ -157,8 +157,8 @@ func TestDryRunnerSuppressesMutationsButRunsQueries(t *testing.T) {
 
 	// And the tools that gained a branch must not have gained a hole with it.
 	moreMutations := [][]string{
-		{"tc", "qdisc", "replace", "dev", "wg-nbn", "root", "cake", "bandwidth", "18mbit"},
-		{"tc", "qdisc", "del", "dev", "wg-nbn", "root"},
+		{"tc", "qdisc", "replace", "dev", "wg-main", "root", "cake", "bandwidth", "18mbit"},
+		{"tc", "qdisc", "del", "dev", "wg-main", "root"},
 		{"nft", "delete", "table", "ip", "failover"},
 		{"nft", "-a", "delete", "rule", "ip", "filter", "DOCKER-USER", "handle", "12"},
 		// The word "list" appearing as data must not make a write look like a
@@ -182,7 +182,7 @@ func TestControlRouteSelectsOnMarkNotAddresses(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		"ip rule show": "0:\tfrom all lookup local\n32766:\tfrom all lookup main\n",
 	}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-main"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
 	if !f.ran("ip rule add fwmark 0x100 lookup 100") {
@@ -193,7 +193,7 @@ func TestControlRouteSelectsOnMarkNotAddresses(t *testing.T) {
 			t.Errorf("control rule matches probe traffic by address: %s", c)
 		}
 	}
-	if !f.ran("ip route replace 10.99.0.2/32 dev wg-nbn src 10.99.0.1 table 100") {
+	if !f.ran("ip route replace 10.99.0.2/32 dev wg-main src 10.99.0.1 table 100") {
 		t.Errorf("expected the control route in table 100, got calls: %v", f.calls)
 	}
 }
@@ -209,12 +209,12 @@ func TestControlRouteSelectsOnMarkNotAddresses(t *testing.T) {
 func TestControlRouteCoversTheOverlayRange(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		"ip rule show":                         "0:\tfrom all lookup local\n",
-		"ip route show 10.99.0.2/32 table 100": "10.99.0.2 dev wg-nbn scope link src 10.99.0.1\n",
+		"ip route show 10.99.0.2/32 table 100": "10.99.0.2 dev wg-main scope link src 10.99.0.1\n",
 	}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.0/24", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.0/24", "10.99.0.2", "10.99.0.1", "wg-main"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
-	if !f.ran("ip route replace 10.99.0.0/24 dev wg-nbn src 10.99.0.1 table 100") {
+	if !f.ran("ip route replace 10.99.0.0/24 dev wg-main src 10.99.0.1 table 100") {
 		t.Errorf("the overlay range is not in the control table: %v", f.calls)
 	}
 	// And the host route it supersedes, which is more specific and would keep
@@ -228,10 +228,10 @@ func TestControlRouteCoversTheOverlayRange(t *testing.T) {
 // A site with no subnet must issue exactly what it always did - invariant 19.
 func TestControlRouteWithoutSubnetIsUnchanged(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{"ip rule show": "0:\tfrom all lookup local\n"}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-main"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
-	if !f.ran("ip route replace 10.99.0.2/32 dev wg-nbn src 10.99.0.1 table 100") {
+	if !f.ran("ip route replace 10.99.0.2/32 dev wg-main src 10.99.0.1 table 100") {
 		t.Errorf("expected the host route in table 100, got: %v", f.calls)
 	}
 	for _, c := range f.calls {
@@ -285,11 +285,11 @@ func TestControlMarkIsOutsideThePathRange(t *testing.T) {
 // that looks exactly like two dead links.
 func TestSysctlsDisableReversePathFilter(t *testing.T) {
 	f := &fakeRunner{}
-	EnsureSysctls(context.Background(), f, []string{"wg-nbn", "wg-lte1"})
+	EnsureSysctls(context.Background(), f, []string{"wg-main", "wg-lte1"})
 
 	for _, want := range []string{
 		"sysctl -w net.ipv4.conf.all.rp_filter=0",
-		"sysctl -w net.ipv4.conf.wg-nbn.rp_filter=0",
+		"sysctl -w net.ipv4.conf.wg-main.rp_filter=0",
 		"sysctl -w net.ipv4.conf.wg-lte1.rp_filter=0",
 		"sysctl -w net.ipv4.ip_forward=1",
 	} {
@@ -321,8 +321,8 @@ func TestRouteViaReportsAnEmptyTableAsNoInterface(t *testing.T) {
 		return out
 	}
 
-	if got := via("10.99.0.2 dev wg-nbn scope link src 10.99.0.1", 101); got != "wg-nbn" {
-		t.Errorf("RouteVia(table 101) = %q, want wg-nbn", got)
+	if got := via("10.99.0.2 dev wg-main scope link src 10.99.0.1", 101); got != "wg-main" {
+		t.Errorf("RouteVia(table 101) = %q, want wg-main", got)
 	}
 	// The purged case is the one that matters: no route, but not an error.
 	if got := via("", 102); got != "" {
@@ -358,7 +358,7 @@ func TestProbeRulesArePinnedAheadOfTheReturnRule(t *testing.T) {
 			"32765:\tfrom all fwmark 0x101 lookup 101\n" +
 			"32766:\tfrom all lookup main\n",
 	}}
-	p := model.PathConfig{ID: 1, Name: "nbn", Iface: "lo", Table: 101, Mark: 0x101}
+	p := model.PathConfig{ID: 1, Name: "main", Iface: "lo", Table: 101, Mark: 0x101}
 
 	if err := EnsureProbeRoute(context.Background(), f, p, "10.99.0.1", "10.99.0.2"); err != nil {
 		t.Fatalf("EnsureProbeRoute: %v", err)
@@ -378,7 +378,7 @@ func TestProbeRuleIsNotReinstalledWhenAlreadyCorrect(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		"ip rule show": "30001:\tfrom all fwmark 0x101 lookup 101\n32766:\tfrom all lookup main\n",
 	}}
-	p := model.PathConfig{ID: 1, Name: "nbn", Iface: "lo", Table: 101, Mark: 0x101}
+	p := model.PathConfig{ID: 1, Name: "main", Iface: "lo", Table: 101, Mark: 0x101}
 
 	if err := EnsureProbeRoute(context.Background(), f, p, "10.99.0.1", "10.99.0.2"); err != nil {
 		t.Fatalf("EnsureProbeRoute: %v", err)
@@ -399,21 +399,21 @@ func TestProbeRuleIsNotReinstalledWhenAlreadyCorrect(t *testing.T) {
 // with a perfectly healthy WireGuard handshake.
 func TestRPFilterIsDisabledAgainAfterATunnelIsRecreated(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
-		"sysctl -n net.ipv4.conf.wg-nbn.rp_filter": "2\n",
+		"sysctl -n net.ipv4.conf.wg-main.rp_filter": "2\n",
 	}}
-	changed, err := RPFilterOff(context.Background(), f, "wg-nbn")
+	changed, err := RPFilterOff(context.Background(), f, "wg-main")
 	if err != nil || !changed {
 		t.Fatalf("RPFilterOff = %v, %v; want it to report a change", changed, err)
 	}
-	if !f.ran("sysctl -w net.ipv4.conf.wg-nbn.rp_filter=0") {
+	if !f.ran("sysctl -w net.ipv4.conf.wg-main.rp_filter=0") {
 		t.Errorf("filtering not disabled; calls were %v", f.calls)
 	}
 
 	// Already off: it must not write, or it does so on every tick forever.
 	g := &fakeRunner{replies: map[string]string{
-		"sysctl -n net.ipv4.conf.wg-nbn.rp_filter": "0\n",
+		"sysctl -n net.ipv4.conf.wg-main.rp_filter": "0\n",
 	}}
-	if changed, err := RPFilterOff(context.Background(), g, "wg-nbn"); err != nil || changed {
+	if changed, err := RPFilterOff(context.Background(), g, "wg-main"); err != nil || changed {
 		t.Errorf("RPFilterOff = %v, %v; want no change when it is already off", changed, err)
 	}
 	if g.ran("sysctl -w") {
@@ -444,7 +444,7 @@ func TestProbeRuleIsFoundWhenTheTableHasAName(t *testing.T) {
 		// What the kernel prints once the operator has named table 101.
 		"ip rule show table 101": "30001:\tfrom all fwmark 0x101 lookup isp2\n",
 	}}
-	p := model.PathConfig{ID: 1, Name: "nbn", Iface: "lo", Table: 101, Mark: 0x101}
+	p := model.PathConfig{ID: 1, Name: "main", Iface: "lo", Table: 101, Mark: 0x101}
 
 	if err := EnsureProbeRoute(context.Background(), f, p, "10.99.0.1", "10.99.0.2"); err != nil {
 		t.Fatalf("EnsureProbeRoute: %v", err)
@@ -465,7 +465,7 @@ func TestProbeRuleIsFoundWhenTheTableHasAName(t *testing.T) {
 func TestTableOneHundredRulesAreFoundWhenTheTableHasAName(t *testing.T) {
 	named := "29999:\tfrom all fwmark 0x100 lookup uplink\n"
 	f := &fakeRunner{replies: map[string]string{"ip rule show table 100": named}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-main"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
 	if f.ran("ip rule add") {
@@ -505,7 +505,7 @@ func TestControlAndReturnMarkRulesCarryAnExplicitPriority(t *testing.T) {
 	}
 
 	f := &fakeRunner{replies: map[string]string{"ip rule show table 100": ""}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-main"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
 	want := "ip rule add fwmark 0x100 lookup 100 pref " + strconv.Itoa(ControlRulePref)
@@ -535,7 +535,7 @@ func TestMovingARuleAddsBeforeItDeletes(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		"ip rule show table 100": "30000:\tfrom all fwmark 0x100 lookup 100\n",
 	}}
-	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-nbn"); err != nil {
+	if err := EnsureControlRoute(context.Background(), f, "10.99.0.2/32", "10.99.0.2", "10.99.0.1", "wg-main"); err != nil {
 		t.Fatalf("EnsureControlRoute: %v", err)
 	}
 	add := f.index("ip rule add fwmark 0x100 lookup 100 pref " + strconv.Itoa(ControlRulePref))
@@ -550,7 +550,7 @@ func TestMovingARuleAddsBeforeItDeletes(t *testing.T) {
 	g := &fakeRunner{replies: map[string]string{
 		"ip rule show table 101": "32765:\tfrom all fwmark 0x101 lookup 101\n",
 	}}
-	p := model.PathConfig{ID: 1, Name: "nbn", Iface: "lo", Table: 101, Mark: 0x101}
+	p := model.PathConfig{ID: 1, Name: "main", Iface: "lo", Table: 101, Mark: 0x101}
 	if err := EnsureProbeRoute(context.Background(), g, p, "10.99.0.1", "10.99.0.2"); err != nil {
 		t.Fatalf("EnsureProbeRoute: %v", err)
 	}
@@ -576,7 +576,7 @@ func TestRemoveProbeRoutesNeverFlushesATable(t *testing.T) {
 		"ip rule show table 102": "30002:\tfrom all fwmark 0x102 lookup 102\n",
 	}}
 	paths := []model.PathConfig{
-		{ID: 1, Name: "nbn", Iface: "wg-nbn", Table: 101, Mark: 0x101},
+		{ID: 1, Name: "main", Iface: "wg-main", Table: 101, Mark: 0x101},
 		{ID: 2, Name: "lte1", Iface: "wg-lte1", Table: 102, Mark: 0x102},
 	}
 	RemoveProbeRoutes(context.Background(), f, paths, "10.99.0.2/32", "10.99.0.0/24")
@@ -607,7 +607,7 @@ func TestRemoveProbeRoutesNeverFlushesATable(t *testing.T) {
 func TestRemoveProbeRoutesUsesTheProbePrefixInTheProbeTable(t *testing.T) {
 	f := &fakeRunner{}
 	RemoveProbeRoutes(context.Background(), f,
-		[]model.PathConfig{{ID: 1, Name: "nbn", Iface: "wg-nbn", Table: 101, Mark: 0x101}},
+		[]model.PathConfig{{ID: 1, Name: "main", Iface: "wg-main", Table: 101, Mark: 0x101}},
 		"10.99.0.2/32", "10.99.0.0/24")
 
 	if f.ran("ip route del 10.99.0.0/24 table 101") {

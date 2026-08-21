@@ -69,9 +69,9 @@ func backendKernel() map[string]string {
 			"32500: from 10.99.0.2 lookup 100",
 		"ip rule show table 101":                    "30001: from all fwmark 0x101 lookup 101\n",
 		"ip rule show table 102":                    "30002: from all fwmark 0x102 lookup 102\n",
-		"sysctl -n net.ipv4.conf.wg-nbn.rp_filter":  "0",
+		"sysctl -n net.ipv4.conf.wg-main.rp_filter": "0",
 		"sysctl -n net.ipv4.conf.wg-lte1.rp_filter": "0",
-		"ip route show 10.99.0.1/32 table 101":      "10.99.0.1 dev wg-nbn scope link src 10.99.0.2",
+		"ip route show 10.99.0.1/32 table 101":      "10.99.0.1 dev wg-main scope link src 10.99.0.2",
 		"ip route show 10.99.0.1/32 table 102":      "10.99.0.1 dev wg-lte1 scope link src 10.99.0.2",
 		"ip route show 10.99.0.1/32":                "10.99.0.1 dev wg-lte1 scope link src 10.99.0.2",
 		"ip route show default table 100":           "default dev wg-lte1 scope link",
@@ -94,7 +94,7 @@ func agentForReconcile(t *testing.T, kernel map[string]string) (*Agent, *queryRu
 		Mode:    model.ModeArmed,
 		Overlay: proto.OverlayInfo{FrontendIP: "10.99.0.1", BackendIP: "10.99.0.2"},
 		Paths: []proto.PathInfo{
-			{ID: 1, Name: "nbn", Iface: "wg-nbn", Table: 101, Mark: 0x101},
+			{ID: 1, Name: "main", Iface: "wg-main", Table: 101, Mark: 0x101},
 			{ID: 2, Name: "lte1", Iface: "wg-lte1", Table: 102, Mark: 0x102},
 		},
 	}
@@ -109,13 +109,13 @@ func agentForReconcile(t *testing.T, kernel map[string]string) (*Agent, *queryRu
 // however healthy the link is - the reason a recovered tunnel never came back.
 func TestReconcileRestoresAReplyRouteLostWhenATunnelWasRecreated(t *testing.T) {
 	kernel := backendKernel()
-	kernel["ip route show 10.99.0.1/32 table 101"] = "" // wg-nbn was restarted
+	kernel["ip route show 10.99.0.1/32 table 101"] = "" // wg-main was restarted
 
 	a, q := agentForReconcile(t, kernel)
 
 	a.reconcileRouting(context.Background())
 
-	want := "ip route replace 10.99.0.1/32 dev wg-nbn src 10.99.0.2 table 101"
+	want := "ip route replace 10.99.0.1/32 dev wg-main src 10.99.0.2 table 101"
 	if q.wrote(want) != 1 {
 		t.Errorf("reply route for the restarted tunnel was not restored; writes were %v", q.writes())
 	}
@@ -192,7 +192,7 @@ func (o *observeRunner) Applying() bool { return false }
 // unshaped, and only the latency under load gets quietly worse.
 func TestReconcileRestoresShapingLostWithTheTunnel(t *testing.T) {
 	kernel := backendKernel()
-	kernel["tc qdisc show dev wg-nbn"] = "qdisc noqueue 0: root refcnt 2"
+	kernel["tc qdisc show dev wg-main"] = "qdisc noqueue 0: root refcnt 2"
 	kernel["tc qdisc show dev wg-lte1"] = "qdisc noqueue 0: root refcnt 2"
 
 	a, q := agentForReconcile(t, kernel)
@@ -200,7 +200,7 @@ func TestReconcileRestoresShapingLostWithTheTunnel(t *testing.T) {
 
 	a.reconcileRouting(context.Background())
 
-	if q.wrote("tc qdisc replace dev wg-nbn root cake bandwidth 20mbit") != 1 {
+	if q.wrote("tc qdisc replace dev wg-main root cake bandwidth 20mbit") != 1 {
 		t.Errorf("shaping was not restored; writes were %v", q.writes())
 	}
 	// The unshaped path is not even asked about.

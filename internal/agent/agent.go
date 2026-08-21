@@ -491,7 +491,7 @@ func (a *Agent) applyLoop(ctx context.Context) {
 // the interface is exactly what `wg-quick down` does. Bringing the tunnel back
 // up does not bring the routes back, and nothing else reinstalls them:
 // applyPlumbing runs at startup and on a configuration push only. So after
-// `systemctl restart wg-quick@wg-nbn` that path's reply table is empty, its
+// `systemctl restart wg-quick@wg-main` that path's reply table is empty, its
 // probe replies can no longer leave by the tunnel their request arrived on,
 // and the frontend goes on reporting the path down however healthy the tunnel
 // is. That is the failure this exists to end.

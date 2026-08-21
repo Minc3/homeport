@@ -137,7 +137,7 @@ if [ -n "$missing" ]; then
 fi
 
 say "Checking the environment"
-for iface in wg-nbn wg-lte1 wg-lte2; do
+for iface in wg-main wg-lte1 wg-lte2; do
 	if ip link show "$iface" >/dev/null 2>&1; then
 		echo "  $iface present"
 	else
@@ -151,7 +151,7 @@ fi
 
 # The tunnels must not install their own routes, or all three fight over the
 # same destination and the per-path tables become meaningless.
-for conf in /etc/wireguard/wg-nbn.conf /etc/wireguard/wg-lte1.conf /etc/wireguard/wg-lte2.conf; do
+for conf in /etc/wireguard/wg-main.conf /etc/wireguard/wg-lte1.conf /etc/wireguard/wg-lte2.conf; do
 	if [ -f "$conf" ] && ! grep -qiE '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off' "$conf"; then
 		warn "$conf has no 'Table = off' - wg-quick will install competing routes"
 	fi

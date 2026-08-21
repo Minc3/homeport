@@ -67,7 +67,7 @@ func TestStatusAPICarriesTheFieldsTheDashboardReads(t *testing.T) {
 	if got.Status.BackendHost != "backend-host" {
 		t.Errorf("backend_host = %q", got.Status.BackendHost)
 	}
-	// The shipped defaults put nbn at priority 1, so that is where traffic
+	// The shipped defaults put main at priority 1, so that is where traffic
 	// belongs and where the badge should read green.
 	if got.Status.PreferredPath != 1 {
 		t.Errorf("preferred_path = %d, want 1", got.Status.PreferredPath)

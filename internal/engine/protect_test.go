@@ -83,7 +83,7 @@ func TestDisablingProtectionRemovesTheTable(t *testing.T) {
 // only the latency-under-load gets quietly worse.
 func TestReconcileRestoresShapingLostWithTheTunnel(t *testing.T) {
 	kernel := healthyKernel()
-	kernel["tc qdisc show dev wg-nbn"] = "qdisc noqueue 0: root refcnt 2"
+	kernel["tc qdisc show dev wg-main"] = "qdisc noqueue 0: root refcnt 2"
 	kernel["tc qdisc show dev wg-lte1"] = "qdisc noqueue 0: root refcnt 2"
 	kernel["tc qdisc show dev wg-lte2"] = "qdisc noqueue 0: root refcnt 2"
 
@@ -92,7 +92,7 @@ func TestReconcileRestoresShapingLostWithTheTunnel(t *testing.T) {
 
 	e.reconcileRouting(context.Background())
 
-	if q.count("tc qdisc replace dev wg-nbn root cake bandwidth 40mbit") != 1 {
+	if q.count("tc qdisc replace dev wg-main root cake bandwidth 40mbit") != 1 {
 		t.Errorf("shaping was not restored; writes were %v", q.writes())
 	}
 }
@@ -101,7 +101,7 @@ func TestReconcileRestoresShapingLostWithTheTunnel(t *testing.T) {
 // would discard the queue state that is doing the work, ten times a minute.
 func TestReconcileLeavesIntactShapingAlone(t *testing.T) {
 	kernel := healthyKernel()
-	kernel["tc qdisc show dev wg-nbn"] = "qdisc cake 8003: root refcnt 2 bandwidth 40Mbit besteffort overhead 80"
+	kernel["tc qdisc show dev wg-main"] = "qdisc cake 8003: root refcnt 2 bandwidth 40Mbit besteffort overhead 80"
 
 	e, q := engineForReconcile(t, kernel)
 	e.cfg = protectedConfig()
@@ -132,11 +132,11 @@ func TestReconcileIgnoresPathsWithNoShapingConfigured(t *testing.T) {
 // discipline belongs to whoever put it there.
 func TestRevertRemovesOnlyTheShapersItInstalled(t *testing.T) {
 	e, q := engineForReconcile(t, healthyKernel())
-	e.cfg = protectedConfig() // only nbn is shaped
+	e.cfg = protectedConfig() // only main is shaped
 
 	e.Revert(context.Background())
 
-	if q.count("tc qdisc del dev wg-nbn root") != 1 {
+	if q.count("tc qdisc del dev wg-main root") != 1 {
 		t.Errorf("did not remove the shaper it installed; writes were %v", q.writes())
 	}
 	for _, iface := range []string{"wg-lte1", "wg-lte2"} {
@@ -180,7 +180,7 @@ func hasArg(args []string, want string) bool {
 // two tunnels out one WAN is invisible from every other signal here.
 func TestTwoTunnelsOnOneServiceAreReported(t *testing.T) {
 	kernel := healthyKernel()
-	kernel["wg show all endpoints"] = "wg-nbn\tkeyA=\t203.0.113.10:51820\n" +
+	kernel["wg show all endpoints"] = "wg-main\tkeyA=\t203.0.113.10:51820\n" +
 		"wg-lte1\tkeyB=\t198.51.100.20:41234\n" +
 		"wg-lte2\tkeyC=\t198.51.100.20:52001" // same address, different NAT port
 
@@ -212,7 +212,7 @@ func TestTwoTunnelsOnOneServiceAreReported(t *testing.T) {
 // configured system is one nobody reads when it matters.
 func TestSeparateServicesReportNoClash(t *testing.T) {
 	kernel := healthyKernel()
-	kernel["wg show all endpoints"] = "wg-nbn\tkeyA=\t203.0.113.10:51820\n" +
+	kernel["wg show all endpoints"] = "wg-main\tkeyA=\t203.0.113.10:51820\n" +
 		"wg-lte1\tkeyB=\t198.51.100.20:41234\n" +
 		"wg-lte2\tkeyC=\t198.51.100.99:52001"
 
@@ -229,7 +229,7 @@ func TestSeparateServicesReportNoClash(t *testing.T) {
 // them must not read as two tunnels sharing one - "unknown" is not a value.
 func TestTunnelsWithNoHandshakeAreNotTreatedAsSharing(t *testing.T) {
 	kernel := healthyKernel()
-	kernel["wg show all endpoints"] = "wg-nbn\tkeyA=\t203.0.113.10:51820\n" +
+	kernel["wg show all endpoints"] = "wg-main\tkeyA=\t203.0.113.10:51820\n" +
 		"wg-lte1\tkeyB=\t(none)\n" +
 		"wg-lte2\tkeyC=\t(none)"
 

@@ -20,7 +20,7 @@ what is still unfinished.
 A Garry's Mod server and some websites are hosted on a Debian box at a house.
 They are published to the internet from a Debian box in a datacentre. Between
 the two are three WireGuard tunnels riding three different internet services —
-NBN (fixed line), and two LTE services.
+a main fixed line, and two LTE services.
 
 The job: give the datacentre box **one stable path** to the home box, and move
 it between the three tunnels automatically when one fails, without players
@@ -32,7 +32,7 @@ being disconnected and without silently burning through LTE data caps.
               Debian FRONTEND  (datacentre, public IP, always reachable)
                        │
         ┌──────────────┼──────────────┐
-     wg-nbn         wg-lte1        wg-lte2
+     wg-main         wg-lte1        wg-lte2
         └──────────────┼──────────────┘
                     pfSense       (pins each tunnel to a fixed WAN, nothing more)
                        │
@@ -367,8 +367,8 @@ eligibility test; do not change it back to `Health() == HealthUp`.
 **Failover is immediate, failback waits.** Moving to a worse path happens the
 instant the current one is ineligible. Moving back to a better one requires an
 unbroken clean streak of `HoldDownSec`. Any lost probe clears `cleanSince`, so a
-marginal NBN service that keeps half-recovering cannot drag traffic back and
-forth.
+marginal fixed line service that keeps half-recovering cannot drag traffic
+back and forth.
 
 **Quality selection only chooses between fallbacks, never against the preferred
 path.** `Failover.Selection = "quality"` (off by default) changes exactly one
@@ -378,8 +378,8 @@ an LTE1 dropping one packet in ten.
 
 It is deliberately not "pick the best path". While the preferred path is usable
 it keeps the traffic whatever the numbers say, and it wins the traffic back on
-its clean streak alone. Priority order here is the *cost* order: NBN is
-unmetered and the LTE services are capped, and LTE frequently measures better
+its clean streak alone. Priority order here is the *cost* order: the main link
+is unmetered and the LTE services are capped, and LTE frequently measures better
 than a congested fixed line. A selector that simply chased the lowest score
 would park traffic on a metered link indefinitely and report itself as
 optimising. `preferredPathID` is the guard; `qualityTarget` returns early on it.
@@ -852,7 +852,7 @@ Breaking any of these is a correctness bug even if the tests pass.
     installed once.** Deleting an interface deletes every route that used it
     *and* resets its sysctls, and `wg-quick down` deletes the interface.
     Bringing the tunnel back restores neither, so `systemctl restart
-    wg-quick@wg-nbn` leaves that path's probe table empty and its `rp_filter`
+    wg-quick@wg-main` leaves that path's probe table empty and its `rp_filter`
     back at the system default of 2 — either alone is enough to make the path
     read as down forever, while the tunnel recovers on the wire and never
     recovers in the portal. `Engine.reconcileRouting` and
@@ -954,7 +954,8 @@ documented in `deploy/SETUP.md`:
 - Gateway monitoring **action** must be disabled per gateway. By default,
   pfSense removes policy-routing rules for a gateway it thinks is down, and the
   traffic falls through to the default gateway. The "LTE1 tunnel" would then
-  ride NBN — three tunnels on one link, all probing healthy, no failover at all.
+  ride the main link — three tunnels on one link, all probing healthy, no
+  failover at all.
 
 **`AllowedIPs` is asymmetric, and the backend's must be `0.0.0.0/0`.** It is a
 filter as well as a route: WireGuard drops an inbound packet whose source falls
@@ -1064,7 +1065,7 @@ when a subnet does.
 To see it directly, on the backend:
 
 ```sh
-ip route get 10.99.0.3 from 10.99.0.1 iif wg-nbn
+ip route get 10.99.0.3 from 10.99.0.1 iif wg-main
 ```
 
 Answering with the tunnel rather than the LAN is the bug.
@@ -1206,7 +1207,7 @@ restarts the probers, reapplies system config, and bumps `cfgVersion`. The
 control server notices the version change within 2s and pushes the backend's
 subset down.
 
-Defaults (`model.Defaults()`) match the intended deployment: NBN/LTE1/LTE2 at
+Defaults (`model.Defaults()`) match the intended deployment: main/LTE1/LTE2 at
 priorities 1/2/3, tables 101/102/103, marks `0x101`/`0x102`/`0x103`, 250ms
 active and 5s standby probing, 8 losses to condemn (~2s detection), 90s
 failback hold-down, 60 GB and 20 GB quotas resetting on the 1st in

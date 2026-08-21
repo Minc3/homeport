@@ -298,8 +298,8 @@ func (o OverlayConfig) RoutePrefix() string {
 // PathConfig is one WireGuard tunnel and the policy attached to it.
 type PathConfig struct {
 	ID       int    `json:"id"`
-	Name     string `json:"name"`     // nbn, lte1, lte2
-	Iface    string `json:"iface"`    // wg-nbn, wg-lte1, wg-lte2
+	Name     string `json:"name"`     // main, lte1, lte2
+	Iface    string `json:"iface"`    // wg-main, wg-lte1, wg-lte2
 	Priority int    `json:"priority"` // lower wins; 1 = most preferred
 	Table    int    `json:"table"`    // routing table used to probe this path specifically
 	Mark     int    `json:"mark"`     // fwmark selecting that table
@@ -628,7 +628,7 @@ type LinkerState struct {
 }
 
 // Defaults returns a configuration matching the agreed design: strict
-// NBN > LTE1 > LTE2 priority, 2-3 second detection, quotas on both LTE paths,
+// main > LTE1 > LTE2 priority, 2-3 second detection, quotas on both LTE paths,
 // and observe mode so a fresh install cannot move traffic until it is armed.
 func Defaults() Config {
 	quota := func(limit int64) Quota {
@@ -654,7 +654,7 @@ func Defaults() Config {
 			ControlPort: 51998,
 		},
 		Paths: []PathConfig{
-			{ID: 1, Name: "nbn", Iface: "wg-nbn", Priority: 1, Table: 101, Mark: 0x101, Enabled: true},
+			{ID: 1, Name: "main", Iface: "wg-main", Priority: 1, Table: 101, Mark: 0x101, Enabled: true},
 			{ID: 2, Name: "lte1", Iface: "wg-lte1", Priority: 2, Table: 102, Mark: 0x102, Enabled: true, Metered: true, Quota: quota(60 << 30)},
 			{ID: 3, Name: "lte2", Iface: "wg-lte2", Priority: 3, Table: 103, Mark: 0x103, Enabled: true, Metered: true, Quota: quota(20 << 30)},
 		},
@@ -689,7 +689,7 @@ func Defaults() Config {
 			QuarantineMaxSec: 3600,
 
 			// Strict priority by default. Priority order is not merely a
-			// preference here - it is the cost ordering, NBN being unmetered
+			// preference here - it is the cost ordering, the main link being unmetered
 			// and the LTE services capped - so choosing on measurements alone
 			// is opt-in.
 			Selection: SelectionPriority,

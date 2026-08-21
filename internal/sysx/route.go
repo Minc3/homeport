@@ -14,7 +14,7 @@ import (
 // ----------------------
 // One route in the main table decides where backend-bound traffic goes:
 //
-//	ip route replace 10.99.0.2/32 dev wg-nbn src 10.99.0.1
+//	ip route replace 10.99.0.2/32 dev wg-main src 10.99.0.1
 //
 // Failover replaces the dev. The source and destination addresses never
 // change, so conntrack entries and the client's 5-tuple survive the switch.
@@ -25,7 +25,7 @@ import (
 // one specific tunnel regardless of which one is currently active:
 //
 //	ip rule  add fwmark 0x101 lookup 101
-//	ip route replace 10.99.0.2/32 dev wg-nbn src 10.99.0.1 table 101
+//	ip route replace 10.99.0.2/32 dev wg-main src 10.99.0.1 table 101
 
 // EnsureOverlayAddress makes sure the stable overlay address exists on its own
 // dummy interface, creating both if needed.
@@ -308,7 +308,7 @@ func devFrom(out string) string {
 // go back out the same tunnel instead of out pfSense to the internet:
 //
 //	ip rule  add from 10.99.0.2 lookup 100
-//	ip route replace default dev wg-nbn table 100
+//	ip route replace default dev wg-main table 100
 //
 // Only traffic sourced from the overlay address uses it. The backend's own
 // normal traffic still egresses via pfSense as usual.

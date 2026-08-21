@@ -18,12 +18,12 @@ import (
 // perfectly while published traffic left down a tunnel carrying nothing else.
 func TestSupersededHostRouteIsRemovedOnceASubnetIsSet(t *testing.T) {
 	kernel := healthyKernel()
-	kernel["ip route show 10.99.0.0/24"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.0/24"] = "10.99.0.0/24 dev wg-main scope link src 10.99.0.1"
 	// The leftover from before the subnet was configured.
-	kernel["ip route show 10.99.0.2/32"] = "10.99.0.2 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.2/32"] = "10.99.0.2 dev wg-main scope link src 10.99.0.1"
 	// The control table carries the same widening and is cleaned the same way;
 	// this test is about the main one, so it starts finished.
-	kernel["ip route show 10.99.0.0/24 table 100"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.0/24 table 100"] = "10.99.0.0/24 dev wg-main scope link src 10.99.0.1"
 	kernel["ip route show 10.99.0.2/32 table 100"] = ""
 
 	e, q := engineForReconcile(t, kernel)
@@ -52,11 +52,11 @@ func TestHostRouteIsKeptWhenNoSubnetIsConfigured(t *testing.T) {
 // a delete for a route that no longer exists on every tick forever.
 func TestSupersededRemovalIsNotRepeated(t *testing.T) {
 	kernel := healthyKernel()
-	kernel["ip route show 10.99.0.0/24"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.0/24"] = "10.99.0.0/24 dev wg-main scope link src 10.99.0.1"
 	kernel["ip route show 10.99.0.2/32"] = "" // already cleaned
 	// The control table is a separate copy of the same widening, and these
 	// tests are about the main one, so it starts in its finished state.
-	kernel["ip route show 10.99.0.0/24 table 100"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.0/24 table 100"] = "10.99.0.0/24 dev wg-main scope link src 10.99.0.1"
 	kernel["ip route show 10.99.0.2/32 table 100"] = ""
 
 	e, q := engineForReconcile(t, kernel)
@@ -74,9 +74,9 @@ func TestSupersededRemovalIsNotRepeated(t *testing.T) {
 // mode exists to never do.
 func TestSupersededHostRouteSurvivesObserveMode(t *testing.T) {
 	kernel := healthyKernel()
-	kernel["ip route show 10.99.0.0/24"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
-	kernel["ip route show 10.99.0.2/32"] = "10.99.0.2 dev wg-nbn scope link src 10.99.0.1"
-	kernel["ip route show 10.99.0.0/24 table 100"] = "10.99.0.0/24 dev wg-nbn scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.0/24"] = "10.99.0.0/24 dev wg-main scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.2/32"] = "10.99.0.2 dev wg-main scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.0/24 table 100"] = "10.99.0.0/24 dev wg-main scope link src 10.99.0.1"
 	kernel["ip route show 10.99.0.2/32 table 100"] = ""
 
 	e, q := engineForReconcile(t, kernel)

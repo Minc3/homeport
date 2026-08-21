@@ -36,7 +36,7 @@ func feedQuality(e *Engine, pathID int, lossPct, rttMs float64, base time.Time) 
 }
 
 // The preferred link is never second-guessed, however much better a fallback
-// measures. Priority order here is the cost order - NBN is unmetered and the
+// measures. Priority order here is the cost order - the main link is unmetered and the
 // LTE services are capped - so "better ping" must never be able to move traffic
 // onto a metered link and quietly keep it there.
 func TestQualityNeverDisplacesThePreferredPath(t *testing.T) {
@@ -45,14 +45,14 @@ func TestQualityNeverDisplacesThePreferredPath(t *testing.T) {
 	e.active = 1
 	base := time.Now().Add(-time.Hour)
 
-	feedQuality(e, 1, 0, 300, base) // nbn: far worse on paper
+	feedQuality(e, 1, 0, 300, base) // main: far worse on paper
 	feedQuality(e, 2, 0, 10, base)  // lte1: dramatically better
 	feedQuality(e, 3, 0, 12, base)
 
 	// Long after any hold-down would have elapsed.
 	for _, at := range []time.Time{time.Now(), time.Now().Add(time.Hour)} {
 		if got, _, _ := e.selectPath(cfg, at); got != 1 {
-			t.Errorf("chose %d, want nbn (1); quality must not get a vote while the preferred link is up", got)
+			t.Errorf("chose %d, want main (1); quality must not get a vote while the preferred link is up", got)
 		}
 	}
 }
@@ -169,7 +169,7 @@ func TestQualityPrefersACleanSlowLinkOverALossyFastOne(t *testing.T) {
 }
 
 // Failback to the preferred link stays governed by its clean streak, not by its
-// score. This is the quota protection: once NBN is healthy the traffic returns
+// score. This is the quota protection: once the main link is healthy the traffic returns
 // to the unmetered link even though LTE is measurably faster.
 func TestQualityStillFailsBackToTheUnmeteredPathWhenItIsSlower(t *testing.T) {
 	cfg := qualityConfig()
@@ -177,13 +177,13 @@ func TestQualityStillFailsBackToTheUnmeteredPathWhenItIsSlower(t *testing.T) {
 	e.active = 2 // failed over to lte1 earlier
 	base := time.Now().Add(-time.Hour)
 
-	feedQuality(e, 1, 0, 55, base) // nbn: healthy but slower
+	feedQuality(e, 1, 0, 55, base) // main: healthy but slower
 	feedQuality(e, 2, 0, 40, base) // lte1: faster, and metered
 
 	// newTestEngine leaves healthy paths clean for an hour, so the hold-down
 	// is long satisfied.
 	if got, _, _ := e.selectPath(cfg, time.Now()); got != 1 {
-		t.Errorf("chose %d, want nbn (1); a slower unmetered link must still win the traffic back", got)
+		t.Errorf("chose %d, want main (1); a slower unmetered link must still win the traffic back", got)
 	}
 }
 
@@ -308,10 +308,10 @@ func TestQualityDwellNeverDelaysFailbackToThePreferredPath(t *testing.T) {
 	e.lastSwitch = time.Now()
 	base := time.Now().Add(-time.Hour)
 
-	feedQuality(e, 1, 0, 80, base) // nbn healthy, slower
+	feedQuality(e, 1, 0, 80, base) // main healthy, slower
 	feedQuality(e, 2, 0, 30, base)
 
 	if got, _, _ := e.selectPath(cfg, time.Now()); got != 1 {
-		t.Errorf("chose %d, want nbn (1): failback must not wait on the dwell", got)
+		t.Errorf("chose %d, want main (1): failback must not wait on the dwell", got)
 	}
 }

@@ -486,7 +486,7 @@ func (e *Engine) evaluate(ctx context.Context, now time.Time) {
 //
 // Failing over to a worse path is immediate - being on a working link matters
 // more than being on the preferred one. Failing back to a better path waits
-// for an unbroken clean streak, which is what stops a marginal NBN service
+// for an unbroken clean streak, which is what stops a marginal fixed line service
 // from dragging traffic back and forth every time it briefly recovers.
 func (e *Engine) selectPath(cfg model.Config, now time.Time) (chosen int, held bool, reason string) {
 	if e.pinned != 0 {
@@ -1141,7 +1141,7 @@ func (e *Engine) applyEgress(ctx context.Context, cfg model.Config, gated, real 
 // the interface is exactly what `wg-quick down` does. Bringing the tunnel back
 // up does not bring the routes back, and nothing else ever reinstalls them:
 // applySystemConfig runs at startup and on a configuration change only. So
-// after `systemctl restart wg-quick@wg-nbn` that path's probe table is empty,
+// after `systemctl restart wg-quick@wg-main` that path's probe table is empty,
 // its probes no longer have a route out of their own tunnel, and it reads as
 // permanently down however healthy the link is. The same purge takes out the
 // control-channel route and the main-table route to the backend when the

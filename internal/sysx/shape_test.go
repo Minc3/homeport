@@ -44,7 +44,7 @@ func TestAnUnshapedPathInstallsNothing(t *testing.T) {
 	f := &shapeRunner{replies: map[string]string{
 		"tc qdisc show": "qdisc noqueue 0: root refcnt 2",
 	}}
-	changed, err := EnsureQdisc(context.Background(), f, "wg-nbn", 0)
+	changed, err := EnsureQdisc(context.Background(), f, "wg-main", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -98,14 +98,14 @@ func TestAShaperLostWithTheInterfaceIsRestored(t *testing.T) {
 	f := &shapeRunner{replies: map[string]string{
 		"tc qdisc show": "qdisc noqueue 0: root refcnt 2",
 	}}
-	changed, err := EnsureQdisc(context.Background(), f, "wg-nbn", 40)
+	changed, err := EnsureQdisc(context.Background(), f, "wg-main", 40)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !changed {
 		t.Error("did not report restoring the shaper")
 	}
-	if !f.ran("tc qdisc replace dev wg-nbn root cake bandwidth 40mbit") {
+	if !f.ran("tc qdisc replace dev wg-main root cake bandwidth 40mbit") {
 		t.Errorf("did not reinstall the shaper: %v", f.calls)
 	}
 }
@@ -133,7 +133,7 @@ func TestAForeignQdiscIsNotRemoved(t *testing.T) {
 	f := &shapeRunner{replies: map[string]string{
 		"tc qdisc show": "qdisc htb 1: root refcnt 2 r2q 10 default 0x10",
 	}}
-	changed, err := EnsureQdisc(context.Background(), f, "wg-nbn", 0)
+	changed, err := EnsureQdisc(context.Background(), f, "wg-main", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

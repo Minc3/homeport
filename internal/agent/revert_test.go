@@ -27,7 +27,7 @@ func agentForRevert(t *testing.T) (*Agent, *queryRunner) {
 	a, q := agentForReconcile(t, revertKernel())
 	a.cfg.Overlay.Subnet = "10.99.0.0/24"
 	a.cfg.Linkers = []proto.LinkerRoute{{OverlayIP: "10.99.0.3", LanIP: "192.168.1.4"}}
-	a.cfg.Paths[1].ShapeMbit = 18 // lte1 is shaped; nbn is not
+	a.cfg.Paths[1].ShapeMbit = 18 // lte1 is shaped; main is not
 	return a, q
 }
 
@@ -99,7 +99,7 @@ func TestBackendRevertRemovesOnlyTheShapersItInstalled(t *testing.T) {
 	if q.wrote("tc qdisc del dev wg-lte1") == 0 {
 		t.Errorf("the shaped tunnel kept its queue discipline; writes were %v", q.writes())
 	}
-	if q.wrote("tc qdisc del dev wg-nbn") != 0 {
+	if q.wrote("tc qdisc del dev wg-main") != 0 {
 		t.Errorf("revert removed a queue discipline this agent never installed; writes were %v", q.writes())
 	}
 }

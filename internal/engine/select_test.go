@@ -8,7 +8,7 @@ import (
 	"github.com/quinlan102/homeport/internal/quota"
 )
 
-// testConfig mirrors the real deployment: NBN preferred, then LTE1, then LTE2.
+// testConfig mirrors the real deployment: the main link preferred, then LTE1, then LTE2.
 func testConfig() model.Config {
 	cfg := model.Defaults()
 	cfg.Failover.HoldDownSec = 90
@@ -50,7 +50,7 @@ func TestSelectsHighestPriorityHealthyPath(t *testing.T) {
 		t.Fatal("should not be held when every path is healthy")
 	}
 	if got != 1 {
-		t.Errorf("chose path %d, want nbn (1)", got)
+		t.Errorf("chose path %d, want main (1)", got)
 	}
 }
 
@@ -82,9 +82,9 @@ func TestFailoverSkipsToThirdPath(t *testing.T) {
 func TestFailbackWaitsForHoldDown(t *testing.T) {
 	cfg := testConfig()
 	e := newTestEngine(cfg, map[int]model.Health{1: model.HealthUp, 2: model.HealthUp, 3: model.HealthUp})
-	e.active = 2 // currently on LTE1 after an NBN outage
+	e.active = 2 // currently on LTE1 after a main-link outage
 
-	// NBN has only just come back. Switching now would risk flapping straight
+	// The main link has only just come back. Switching now would risk flapping straight
 	// back if it is still marginal, so the hold-down must keep us on LTE1.
 	e.trackers[1].cleanSince = time.Now().Add(-10 * time.Second)
 	if got, _, _ := e.selectPath(cfg, time.Now()); got != 2 {
@@ -94,7 +94,7 @@ func TestFailbackWaitsForHoldDown(t *testing.T) {
 	// Once it has been continuously clean past the hold-down, fail back.
 	e.trackers[1].cleanSince = time.Now().Add(-91 * time.Second)
 	if got, _, _ := e.selectPath(cfg, time.Now()); got != 1 {
-		t.Errorf("chose path %d after hold-down, want nbn (1)", got)
+		t.Errorf("chose path %d after hold-down, want main (1)", got)
 	}
 }
 
@@ -198,7 +198,7 @@ func TestDisabledPathIsNeverChosen(t *testing.T) {
 
 	got, _, _ := e.selectPath(cfg, time.Now())
 	if got != 2 {
-		t.Errorf("chose path %d, want lte1 (2) with nbn disabled", got)
+		t.Errorf("chose path %d, want lte1 (2) with main disabled", got)
 	}
 }
 

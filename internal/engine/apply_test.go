@@ -109,7 +109,7 @@ func TestSwitchIsCommittedOnlyAfterTheRouteInstalls(t *testing.T) {
 	runner.fail = false
 	e.evaluate(context.Background(), time.Now())
 	if e.active != 1 {
-		t.Errorf("active = %d once the route installs, want nbn (1)", e.active)
+		t.Errorf("active = %d once the route installs, want main (1)", e.active)
 	}
 }
 
@@ -166,7 +166,7 @@ func TestProbePlumbingIsInstalledInObserveMode(t *testing.T) {
 	if err == nil {
 		t.Skip("test host unexpectedly has wg interfaces")
 	}
-	for _, name := range []string{"nbn", "lte1", "lte2"} {
+	for _, name := range []string{"main", "lte1", "lte2"} {
 		if !strings.Contains(err.Error(), name) {
 			t.Errorf("error should name the unprobeable path %q, got: %v", name, err)
 		}
@@ -184,7 +184,7 @@ func TestApplyingConfigReinstallsTheActiveRoute(t *testing.T) {
 
 	e.evaluate(context.Background(), time.Now())
 	if e.active != 1 {
-		t.Fatalf("active = %d, want nbn (1)", e.active)
+		t.Fatalf("active = %d, want main (1)", e.active)
 	}
 	before := runner.count("route replace 10.99.0.2/32")
 

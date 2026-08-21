@@ -773,11 +773,11 @@ function renderSettings() {
 
   const pathsTable = el('table', {},
     el('thead', {}, el('tr', {},
-      th('Name', 'Label only — what this path is called in the dashboard, the alerts and the activity log. Examples: nbn, lte1, lte2.'),
+      th('Name', 'Label only — what this path is called in the dashboard, the alerts and the activity log. Examples: main, lte1, lte2.'),
       th('Interface', 'The WireGuard interface on this frontend that carries this path, spelled exactly as wg show names it. '
         + 'The agent never creates tunnels, so it must already exist and be up. Example: wg-lte1.'),
       th('Priority', 'Lower number wins. 1 is the preferred path and keeps the traffic whenever it is usable. '
-        + 'This is the cost order, not the speed order: put the unmetered link first even if an LTE service measures better. Example: nbn 1, lte1 2, lte2 3.'),
+        + 'This is the cost order, not the speed order: put the unmetered link first even if an LTE service measures better. Example: main 1, lte1 2, lte2 3.'),
       th('Table', 'A routing table used only for probing this one tunnel, so it can be tested while a different path carries the traffic. '
         + 'Unique per path, 1-252, and not 100 (reserved). Example: 101, 102, 103.'),
       th('fwmark', 'Firewall mark stamped on this path\'s probe packets so the kernel sends them to the table above. '
@@ -880,7 +880,7 @@ function renderSettings() {
         help: 'The ceiling on that doubling, so a path that has come good is never benched for longer than this before being tried again. Example: 3600 (an hour).',
       }),
     ),
-    el('p', { class: 'hint', text: 'Failing over to a worse path is immediate. Failing back to a better one waits for an unbroken clean streak, so a marginal NBN service cannot drag traffic back and forth.' }),
+    el('p', { class: 'hint', text: 'Failing over to a worse path is immediate. Failing back to a better one waits for an unbroken clean streak, so a marginal fixed line service cannot drag traffic back and forth.' }),
   ));
 
   if (!c.failover.quality) c.failover.quality = { loss_weight: 25, rtt_weight: 1, jitter_weight: 3, margin_pct: 25, min_dwell_sec: 300 };
@@ -1137,7 +1137,7 @@ function renderSettings() {
     el('p', { class: 'hint', text: 'Saving here installs the backend’s route to each linker and keeps it repaired. Nothing has to be run on the backend by hand.' }),
     el('p', { class: 'hint', text: 'Table is the routing table that host uses for overlay traffic — 200 unless you change it. It belongs to that machine’s own namespace, so pick another number if the box already policy-routes (a second ISP, a VPN): two systems writing one table fight over its default route, and the loser’s traffic goes somewhere nobody intended. Check with: ip rule show, and cat /etc/iproute2/rt_tables.' }),
     el('p', { class: 'hint', text: 'It must also be set in that host’s own linker.json — the rule it names is what carries the control connection, so the agent needs it before it can be told anything. The generated config below has it; the dashboard warns if the host reports a different one.' }),
-    el('p', { class: 'hint', text: 'Requires overlay.subnet in both bootstrap files. The frontend’s WireGuard peers must also cover that range — the shipped setup uses 10.99.0.0/24, so normally there is nothing to change. A peer still limited to the backend’s single address drops everything for a linker before it reaches the tunnel, and reports nothing: check with wg show wg-nbn allowed-ips.' }),
+    el('p', { class: 'hint', text: 'Requires overlay.subnet in both bootstrap files. The frontend’s WireGuard peers must also cover that range — the shipped setup uses 10.99.0.0/24, so normally there is nothing to change. A peer still limited to the backend’s single address drops everything for a linker before it reaches the tunnel, and reports nothing: check with wg show wg-main allowed-ips.' }),
     linkerConfigs,
   ));
 

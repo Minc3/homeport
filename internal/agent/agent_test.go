@@ -63,7 +63,7 @@ func testAgent(t *testing.T, withConfig bool) (*Agent, *stubRunner) {
 		a.cfg = proto.BackendConfig{
 			Overlay: proto.OverlayInfo{FrontendIP: "10.99.0.1", BackendIP: "10.99.0.2"},
 			Paths: []proto.PathInfo{
-				{ID: 1, Name: "nbn", Iface: "wg-nbn", Table: 101, Mark: 0x101},
+				{ID: 1, Name: "main", Iface: "wg-main", Table: 101, Mark: 0x101},
 				{ID: 2, Name: "lte1", Iface: "wg-lte1", Table: 102, Mark: 0x102},
 			},
 		}
@@ -88,7 +88,7 @@ func TestBackendRetriesWhenConfigHasNotArrived(t *testing.T) {
 	// Config lands. The very next probe carries the same decision sequence, so
 	// it must still be acted on rather than dismissed as already applied.
 	a.mu.Lock()
-	a.cfg = proto.BackendConfig{Paths: []proto.PathInfo{{ID: 1, Name: "nbn", Iface: "wg-nbn"}}}
+	a.cfg = proto.BackendConfig{Paths: []proto.PathInfo{{ID: 1, Name: "main", Iface: "wg-main"}}}
 	a.haveCfg = true
 	a.mu.Unlock()
 
@@ -96,7 +96,7 @@ func TestBackendRetriesWhenConfigHasNotArrived(t *testing.T) {
 	if a.ActivePath() != 1 {
 		t.Errorf("active = %d, want 1 once the config arrived", a.ActivePath())
 	}
-	if runner.count("route replace default dev wg-nbn") != 1 {
+	if runner.count("route replace default dev wg-main") != 1 {
 		t.Errorf("return path not installed; calls were %v", runner.calls)
 	}
 }
@@ -172,7 +172,7 @@ func TestConfigChangeReinstallsTheReturnPath(t *testing.T) {
 
 	a.reassertReturnPath(context.Background())
 
-	if runner.count("route replace default dev wg-nbn table 100") != 1 {
+	if runner.count("route replace default dev wg-main table 100") != 1 {
 		t.Errorf("a configuration change must reinstall the return path, got: %v", runner.calls)
 	}
 }

@@ -63,7 +63,7 @@ func (t *Tracker) Observe(r Result, now time.Time) Transition {
 		t.consecLoss++
 		t.consecOK = 0
 		// Any loss ends the clean streak. Failback to a higher-priority path
-		// requires an unbroken streak, so this is what stops a marginal NBN
+		// requires an unbroken streak, so this is what stops a marginal fixed line
 		// link from repeatedly stealing traffic back from a working LTE one.
 		t.cleanSince = time.Time{}
 		if t.health == model.HealthUp {

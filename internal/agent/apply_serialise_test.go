@@ -71,7 +71,7 @@ func TestBackendRouteWritersNeverOverlap(t *testing.T) {
 	cfg := proto.BackendConfig{
 		Overlay: proto.OverlayInfo{FrontendIP: "10.99.0.1", BackendIP: "10.99.0.2"},
 		Paths: []proto.PathInfo{
-			{ID: 1, Name: "nbn", Iface: "wg-nbn", Table: 101, Mark: 0x101},
+			{ID: 1, Name: "main", Iface: "wg-main", Table: 101, Mark: 0x101},
 			{ID: 2, Name: "lte1", Iface: "wg-lte1", Table: 102, Mark: 0x102},
 		},
 	}

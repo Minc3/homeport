@@ -154,7 +154,7 @@ func TestEvaluateCeilingOverridesGrant(t *testing.T) {
 }
 
 func TestEvaluateUnmeteredPathNeverBlocks(t *testing.T) {
-	p := model.PathConfig{ID: 1, Name: "nbn"}
+	p := model.PathConfig{ID: 1, Name: "main"}
 	d := Evaluate(p, 1<<40, store.Grant{}, false, time.Now())
 	if d.Blocked {
 		t.Error("an unmetered path has no quota to exceed")

@@ -1,170 +1,184 @@
-# Setting up the underlying network
+# Installing homeport
 
-The agents do not create WireGuard tunnels and do not touch pfSense. They
-assume both are already correct. This document is what "correct" means.
+A step by step install, start to finish. Every item here is something to do,
+type or check.
 
-Get this part wrong and the software will still appear to work while silently
-testing the same link three times.
+Nothing here explains how the system works or why it is built this way. That is
+[REFERENCE.md](../REFERENCE.md) for the behaviour and [CLAUDE.md](../CLAUDE.md)
+for the internals. If a step looks arbitrary, the reason is in one of those two.
 
-Everything below has been done on Debian 13 and Ubuntu 24.04 and nowhere else.
-The agents shell out to `ip`, `nft`, `wg` and `sysctl` rather than using
-anything distribution-specific, so another systemd distribution will most likely
-work, but nobody has tried one.
+Done on Debian 13 and Ubuntu 24.04. Any other systemd distribution will
+probably work and has not been tried.
+
+## Order of work
+
+| Step | On | What |
+|---|---|---|
+| 1 | both hosts | Prerequisites |
+| 2 | both hosts | WireGuard tunnels |
+| 3 | pfSense | Pin each tunnel to its own WAN |
+| 4 | frontend | Install the agent |
+| 5 | backend | Install the agent |
+| 6 | laptop | First login, change the password |
+| 7 | portal | Publish your services |
+| 8 | both hosts | Verify |
+| 9 | portal | Arm it |
+
+Steps 10 to 14 are optional features. Steps 15 to 18 are day to day operations:
+updating, reverting, uninstalling, rebuilding.
+
+Do not skip ahead to step 4. The agents assume the tunnels already exist and
+will happily report three healthy paths that are all riding one link.
 
 ---
 
-## 1. Overlay addresses — handled for you
+## 1. Prerequisites
 
-Both hosts carry a stable address on a dummy interface: `10.99.0.1/32` on the
-frontend, `10.99.0.2/32` on the backend.
+### 1.1 Two hosts
 
-**The agents create these themselves** on every start, so there is nothing to
-configure and nothing to make persistent. For reference, it is equivalent to:
+| Role | Where | Needs |
+|---|---|---|
+| frontend | datacentre or VPS | a static public IP, root |
+| backend | the house | terminates the tunnels, root |
+
+### 1.2 Packages
+
+On the frontend:
 
 ```sh
-ip link add dummy0 type dummy
-ip addr add 10.99.0.1/32 dev dummy0
-ip link set dummy0 up
+apt install iproute2 nftables procps openssl wireguard-tools
 ```
 
-The device name is the `overlay.device` field of the bootstrap file on each
-host, in case `dummy0` is already taken. It is deliberately *not* editable in
-the portal: both hosts have to agree on the overlay, and the change would have
-to travel over the channel it tears down. `handlePutConfig` overwrites whatever
-the client sends with the bootstrap value.
+On the backend, the same list without `openssl`:
 
-The address lives on a dummy interface rather than on a tunnel because it must
-survive any tunnel going down — if it lived on `wg-nbn`, it would vanish with
-the link. Failover then changes only the outgoing interface: the source and
-destination addresses never move, conntrack keeps its entries, and a player's
-UDP flow or a browser's TCP connection carries on after a brief stall instead
-of dropping.
+```sh
+apt install iproute2 nftables procps wireguard-tools
+```
 
-This is set up even in observe mode, because without it nothing can be probed
-at all.
+The installers check for these and name anything missing before they change
+anything.
+
+### 1.3 Ports open to the frontend's public IP
+
+| Port | Purpose |
+|---|---|
+| 51820, 51821, 51822 /udp | the three tunnels |
+| 51830/udp | admin tunnel, for the portal |
+| each service port you intend to publish | e.g. 27015/udp, 80/tcp, 443/tcp |
+
+The probe port (51999/udp) and control port (51998/tcp) run inside the tunnels
+and need nothing opened.
+
+### 1.4 Addresses used throughout
+
+These are the shipped defaults. Change them only if they clash with something
+you already run.
+
+| Thing | Value |
+|---|---|
+| Frontend overlay address | `10.99.0.1` |
+| Backend overlay address | `10.99.0.2` |
+| Overlay subnet | `10.99.0.0/24` |
+| Admin tunnel, frontend side | `10.98.0.2/24` |
+| Portal | `10.98.0.2:8080` |
+| Routing tables used | 100, 101, 102, 103 |
+| Firewall marks used | `0x101`, `0x102`, `0x103`, `0x200`, `0x300` |
+
+If either host already policy routes, check those table numbers are free before
+you start:
+
+```sh
+ip rule show
+cat /etc/iproute2/rt_tables
+```
+
+### 1.5 Note the frontend's public interface
+
+```sh
+ip route get 1.1.1.1        # the "dev" it names is the public interface
+```
+
+Write it down. The installer detects it and asks you to confirm, and a wrong
+name silently matches nothing later.
 
 ---
 
 ## 2. WireGuard tunnels
 
-Use a **separate keypair per tunnel**. Three tunnels sharing one keypair works
-but leaves you unable to revoke a single path, and makes `wg show` ambiguous.
+The agents never create, modify or remove tunnels. Build them by hand, here.
 
-### Backend (home) — dials out, one listen port per path
+### 2.1 Generate one keypair per tunnel
 
-The distinct source ports are what pfSense uses to pin each tunnel to its own
-WAN. They are not cosmetic.
+Use a separate keypair per tunnel, on each host. Sharing one works but leaves
+you unable to revoke a single path.
 
-`/etc/wireguard/wg-nbn.conf`:
+```sh
+umask 077
+cd /etc/wireguard
+for t in main lte1 lte2; do wg genkey | tee $t.key | wg pubkey > $t.pub; done
+```
+
+On the frontend also generate an admin keypair, plus one keypair per phone or
+laptop that will reach the portal.
+
+### 2.2 Backend tunnel configs
+
+`/etc/wireguard/wg-main.conf`:
 
 ```ini
 [Interface]
-PrivateKey = <backend nbn private key>
+PrivateKey = <backend main private key>
 ListenPort = 51820
 Table = off
 
 [Peer]
-PublicKey = <frontend nbn public key>
-AllowedIPs = 10.99.0.1/32
+PublicKey = <frontend main public key>
+AllowedIPs = 0.0.0.0/0
 Endpoint = <frontend public IP>:51820
 PersistentKeepalive = 15
 ```
 
-`wg-lte1.conf` is the same with `ListenPort = 51821` and `:51821`,
+Copy it to `wg-lte1.conf` with `ListenPort = 51821` and `:51821`, and to
 `wg-lte2.conf` with `ListenPort = 51822` and `:51822`.
 
-Two settings matter:
+Four things must be exactly as written:
 
-- **`Table = off`** — without it `wg-quick` installs its own route for
-  `10.99.0.1/32` and all three tunnels fight over the same destination. The
-  agent owns those routes.
-- **`PersistentKeepalive = 15`** — the LTE services are behind CGNAT, so the
-  frontend can never initiate. Keepalive holds the NAT binding open on the two
-  standby tunnels, so failing over to LTE2 costs one route change rather than a
-  route change plus a fresh handshake at the worst possible moment. Two idle
-  tunnels cost roughly 3 MB/month each in keepalive.
+- `Table = off`, or wg-quick installs its own routes and the three tunnels
+  fight over one destination.
+- `AllowedIPs = 0.0.0.0/0`, **not** the frontend's overlay address. It is a
+  filter as well as a route, and published traffic arrives carrying the
+  client's real IP.
+- `PersistentKeepalive = 15`, because the LTE services are behind CGNAT and the
+  frontend can never dial in.
+- A different `ListenPort` per tunnel. pfSense pins each tunnel to a WAN by
+  source port.
 
-### Frontend (datacentre) — responds only
+### 2.3 Frontend tunnel configs
 
-`/etc/wireguard/wg-nbn.conf`:
+`/etc/wireguard/wg-main.conf`:
 
 ```ini
 [Interface]
-PrivateKey = <frontend nbn private key>
+PrivateKey = <frontend main private key>
 ListenPort = 51820
 Table = off
 
 [Peer]
-PublicKey = <backend nbn public key>
+PublicKey = <backend main public key>
 AllowedIPs = 10.99.0.0/24
 ```
 
-No `Endpoint`: the backend's public address is dynamic and behind CGNAT, so the
-frontend learns it from the first valid handshake and updates it as it roams.
+Again copy to `wg-lte1.conf` (51821) and `wg-lte2.conf` (51822).
 
-The whole overlay range rather than the backend's single address, so that adding
-a second host behind the backend later needs no edit here. See below.
+No `Endpoint` here: the frontend learns the backend's address from the first
+handshake.
 
-### AllowedIPs is not symmetric
+`AllowedIPs` is the whole `/24`, so that adding a host behind the backend later
+needs no edit. `10.99.0.2/32` is the tighter value and is safe if this site
+will only ever have one backend; note the decision down somewhere, because
+widening it again is the step that gets forgotten.
 
-On the **backend**, every tunnel's peer must be:
-
-```ini
-AllowedIPs = 0.0.0.0/0
-```
-
-Not `10.99.0.1/32`. `AllowedIPs` is a filter as much as a route: WireGuard
-discards an inbound packet whose source is outside it, and refuses to send to a
-destination outside it. Published traffic arrives carrying the *client's real
-address* - that is the whole point of DNAT without SNAT - so a backend that
-only allows the frontend's overlay address drops every request before it
-reaches the interface, and cannot send the replies either.
-
-The symptom is brutal to diagnose: probes and the control channel work
-perfectly, because those really do come from the overlay address, so the portal
-shows three healthy paths while nothing published works at all. `tcpdump` on the
-backend's tunnel shows nothing, because the packet is dropped before it is ever
-injected into the interface.
-
-This is safe because `Table = off` means wg-quick installs no routes from it,
-so `AllowedIPs` acts purely as the crypto filter and routing stays under the
-agent's control.
-
-On the **frontend**, use the whole overlay range:
-
-```ini
-AllowedIPs = 10.99.0.0/24
-```
-
-The narrowest value that works for a backend-only site is `10.99.0.2/32`, and
-that is the more secure one — a compromised backend key then cannot present any
-source address but the one. It is not the default here because of how it fails.
-The day this site publishes from a second host, that `/32` silently drops every
-packet for `10.99.0.3`: `AllowedIPs` is a filter in both directions, so the
-frontend will not even transmit to an address outside it, nothing logs the
-refusal, `wg show` looks perfect, and the tunnel carries the backend's traffic
-exactly as before. The failure appears months after the file was written, in a
-place nobody would think to look.
-
-The range is private, is used by nothing but this system, and every channel
-riding it is separately authenticated — a peer that could claim `10.99.0.3` is
-still refused by the control server unless that address is configured and it
-holds the shared key. So the wider value costs very little.
-
-**Narrowing it is worth doing if this site will only ever have the one backend**,
-and it is a two-line edit whenever you decide: set each peer to `10.99.0.2/32`
-and restart the tunnels. Just note it down beside the decision, because widening
-it again is the step that gets forgotten.
-
-Enable all three on both hosts:
-
-```sh
-systemctl enable --now wg-quick@wg-nbn wg-quick@wg-lte1 wg-quick@wg-lte2
-```
-
-### Admin tunnel (frontend only)
-
-The portal binds here, which is why there are no certificates to manage.
+### 2.4 Admin tunnel, frontend only
 
 `/etc/wireguard/wg-admin.conf`:
 
@@ -185,235 +199,307 @@ PublicKey = <phone public key>
 AllowedIPs = 10.98.0.11/32
 ```
 
-On the laptop or phone, `AllowedIPs = 10.98.0.2/32` routes only the portal
-through the tunnel, so bringing it up does not disturb anything else.
+On the laptop and phone, set `AllowedIPs = 10.98.0.2/32` so bringing the tunnel
+up routes only the portal and disturbs nothing else.
 
-**Bring this up before installing the frontend.** `install-frontend.sh` reads
-the portal's listen address off `wg-admin`, and with the interface down there is
-nothing to read: it falls back to `127.0.0.1:8080`, which is the frontend and
-nowhere else. That is deliberate — a portal on a guessed or public address is
-worse than one that is plainly local — but it is a bootstrap value the portal
-cannot edit, so correcting it afterwards is a file and a restart:
+### 2.5 Bring them up
+
+Frontend:
 
 ```sh
-systemctl enable --now wg-quick@wg-admin
-ip -4 addr show wg-admin                     # e.g. 10.98.0.2
-editor /etc/failover/frontend.json           # "portal_listen": "10.98.0.2:8080"
-systemctl restart failover-frontend
+systemctl enable --now wg-quick@wg-main wg-quick@wg-lte1 wg-quick@wg-lte2 wg-quick@wg-admin
 ```
 
-The script says this at the time and again at the end, and re-running it with
-`--portal 10.98.0.2:8080` will not do it for you: an existing bootstrap file is
-never rewritten without `--force-config`. Nothing else waits on any of this. The
-portal retries its listen every 5s rather than exiting, because it must never be
-able to take the agent down, so probing, decisions and the control channel run
-regardless and `failoverctl status` works over the local socket meanwhile.
+Backend:
+
+```sh
+systemctl enable --now wg-quick@wg-main wg-quick@wg-lte1 wg-quick@wg-lte2
+```
+
+### 2.6 Check
+
+On the backend:
+
+```sh
+wg show
+```
+
+All three tunnels must show a recent handshake. If only one does, step 3 is not
+done or its source ports are wrong.
 
 ---
 
 ## 3. pfSense
 
-pfSense holds the three WAN links. Its only job here is to send each tunnel out
-a fixed WAN and then stay out of the way.
+Skip this step if the backend's tunnels do not pass through pfSense. On any
+other router the requirement is the same: pin each source port to a fixed WAN,
+and stop the router from failing traffic over on its own.
 
-### Policy routing rules
+### 3.1 Policy routing rules
 
-On the interface facing the backend, three rules — order matters, put them
-above any general allow rule:
+On the interface facing the backend, add three rules, above any general allow
+rule:
 
 | Source | Protocol | Source port | Destination | Gateway |
 |---|---|---|---|---|
-| backend LAN IP | UDP | 51820 | any | `NBN_GW` |
+| backend LAN IP | UDP | 51820 | any | `MAIN_GW` |
 | backend LAN IP | UDP | 51821 | any | `LTE1_GW` |
 | backend LAN IP | UDP | 51822 | any | `LTE2_GW` |
 
-Source port is under **Advanced Options → Source port range** on the rule.
-Gateway is under **Advanced Options → Gateway**.
+Source port is under **Advanced Options, Source port range**. Gateway is under
+**Advanced Options, Gateway**.
 
-### The two settings that will bite you
+Use a **single gateway** on each rule. Never a gateway group.
 
-**Use single gateways, never a gateway group.** If pfSense also fails traffic
-over, two systems are making the same decision from different information and
-they will fight. You get flapping neither one can explain.
+### 3.2 Stop pfSense acting on gateway status
 
-**Stop pfSense from withdrawing the rules.** By default, when pfSense decides a
-gateway is down it removes the policy-routing rules that use it, and the
-traffic falls through to the default gateway. That would send the "LTE1 tunnel"
-out over NBN — you would have three tunnels all riding one link, all probing
-healthy, and no failover at all when NBN died.
+**System, Routing, Gateways**, and for each of the three gateways tick
+**Disable Gateway Monitoring Action**.
 
-So, for each of the three gateways in **System → Routing → Gateways**, tick
-**Disable Gateway Monitoring Action**. pfSense will still show you the gateway
-status, but it will not act on it.
+Without this, pfSense withdraws the policy rule for a gateway it thinks is
+down, the traffic falls through to the default gateway, and the "LTE1 tunnel"
+quietly rides the main link.
 
-Leave **System → Advanced → Miscellaneous → Skip rules when gateway is down**
-unchecked. With it unchecked, a tunnel whose WAN is dead simply fails — which
-is exactly what the probes need to see.
+### 3.3 Leave one box unticked
 
----
+**System, Advanced, Miscellaneous, Skip rules when gateway is down** must stay
+unchecked.
 
-## 4. If either host runs Docker
+### 3.4 Confirm each tunnel is on its own WAN
 
-Docker rewrites the host's packet filter, and two of its defaults interact with
-this system. The agents handle both automatically - this section is here so the
-behaviour is not a mystery, and so a hand-rolled equivalent can be recognised.
-
-**On the frontend, Docker sets the FORWARD policy to drop.** Published traffic
-is DNAT'd and therefore forwarded, so it is discarded no matter how correct the
-routing is. nftables offers no way to override that from another table: an
-accept is final only within its own chain, a drop is final everywhere. The
-frontend agent therefore inserts two rules into `DOCKER-USER`, the chain Docker
-publishes for exactly this purpose and never flushes:
-
-```
-ip daddr 10.99.0.2 accept
-ct state established,related accept
-```
-
-They match on destination and connection state, never on source: a reply has
-its source rewritten back to the public address before the forward hook sees
-it, so a source match never fires. `failoverctl revert` removes them again,
-identified by their comment.
-
-**On the backend, a container on a bridge network breaks reply routing.** The
-backend normally routes replies with `ip rule from 10.99.0.2 lookup 100`. That
-stops working as soon as anything DNATs further, because the reply is routed
-*before* its source is rewritten back to the overlay address - at that moment it
-still carries the container's address, matches no rule, and leaves by the LAN
-default route. The backend agent therefore also marks connections arriving from
-a tunnel and restores that mark on their replies:
-
-```
-table ip failover_return {
-    chain prerouting {
-        type filter hook prerouting priority mangle; policy accept;
-        iifname { "wg-nbn", "wg-lte1", "wg-lte2" } ct direction original ct mark set 0x200
-        ct direction reply meta mark set ct mark
-    }
-}
-```
-
-with `ip rule add fwmark 0x200 lookup 100` beside it. Routing by connection
-survives any number of translations.
-
-Both `ct direction` qualifiers are load-bearing, in opposite directions.
-
-On the reply line, restoring the mark on *every* packet sends the incoming
-request straight back out the tunnel it arrived on instead of to the container.
-
-On the marking line, `ct direction original` limits the stamp to connections
-whose *first* packet came from a tunnel. Without it this also stamps
-connections the backend *started* down a tunnel — the egress traffic in section
-5 — because their replies arrive on a tunnel too. Those replies would then be
-routed by table 100 and sent back out the tunnel rather than to the container
-waiting for them.
-
-`--network host` avoids the second problem entirely, and is the better fit
-anyway - the design exists to preserve real client IPs, and a bridge network
-puts another NAT in front of them.
+**Diagnostics, States**, filtered by source port. `51820` should show against
+the main WAN, `51821` LTE1, `51822` LTE2. If two share an interface, fix
+the rules before going further.
 
 ---
 
-## 5. Backend-originated traffic — the egress feature
+## 4. Install the frontend
 
-Off by default. Turn it on only if something on the backend has to *appear* at
-the published address rather than at the house's own internet service.
+Run this on the datacentre box.
 
-The case it exists for is Source engine server registration. A server is listed
-in the browser at the address Steam observes its heartbeat coming from, and
-there is no way to declare a different one — deliberately, as anti-spoofing.
-Without this the heartbeat leaves by pfSense and the server is advertised at the
-home WAN address: no port forward behind it, changes when the service does, and
-unreachable entirely while a CGNAT'd LTE path is carrying traffic. Players who
-found the server through the browser would bypass the failover completely.
-
-This is the one source NAT in the system, and it does not contradict the
-DNAT-only rule. That rule is about *published* traffic, where rewriting the
-source would destroy the real client address. Here the direction is reversed and
-there is no client address to preserve, because there is no client.
-
-**It is opt-in for a reason.** Everything else the backend sends from the
-overlay address goes the same way, and therefore through the LTE quota during a
-failover.
-
-### On the frontend
-
-Portal → Frontend. Check **Public interface**. `install-frontend.sh` detects it
-from the default route and asks you to confirm, then seeds it on the agent's
-first start, so on a normal install it is already right. It is worth a look
-anyway, because the value that stands when detection finds nothing is the
-shipped default of `eth0`, and a datacentre box running a modern Debian is
-called something else.
+### 4.1 Confirm the admin tunnel is up first
 
 ```sh
-ip route get 1.1.1.1        # the dev it names is the public interface
+ip -4 addr show wg-admin        # expect 10.98.0.2
 ```
 
-Getting it wrong does not fail loudly — the rule simply never matches, and the
-heartbeat keeps leaving by pfSense. **Public IP** is optional; left empty the
-rule masquerades to whatever address the interface holds.
+The installer reads the portal's listen address off this interface. With the
+interface down it falls back to `127.0.0.1:8080`, which is a file edit and a
+restart to correct afterwards.
 
-The rule is scoped to `oifname <public>` on purpose. Unscoped it would also
-match traffic leaving down a tunnel — which is a reply on its way to a player —
-and rewriting that source is exactly what the whole design forbids. It lives in
-its own `failover_egress` table so the published ruleset never contains a
-masquerade and the feature can be removed on its own.
+### 4.2 Run the installer
 
-### On the backend, choosing what goes
+```sh
+git clone <repo> homeport && cd homeport
+sudo ./deploy/install-frontend.sh
+```
 
-Two mechanisms, because a container cannot use the first one.
+It detects the public interface and asks you to confirm it, then prints:
 
-**A service running on the backend host:** bind it to the overlay address.
+- the **shared secret**, needed verbatim in step 5,
+- the **portal address**,
+- the **first-run password**, read back out of the journal.
+
+Copy all three somewhere before you close the terminal.
+
+Useful flags:
+
+| Flag | Use |
+|---|---|
+| `--public-iface ens3` | give the interface outright instead of confirming |
+| `--no-ask` | never prompt, take the detected value (for scripted runs) |
+| `--portal 10.98.0.2:8080` | set the portal address explicitly |
+| `--psk <hex>` | reuse an existing secret instead of generating one |
+| `--subnet ''` | opt out of the overlay subnet |
+| `--force-config` | rewrite an existing bootstrap file |
+
+### 4.3 Check it started
+
+```sh
+systemctl status failover-frontend
+failoverctl status
+```
+
+It starts in **observe mode**: it probes, decides and logs, and changes
+nothing.
+
+### 4.4 If the portal fell back to loopback
+
+```sh
+ip -4 addr show wg-admin                     # e.g. 10.98.0.2
+sudo editor /etc/failover/frontend.json      # "portal_listen": "10.98.0.2:8080"
+sudo systemctl restart failover-frontend
+```
+
+Re-running the installer with `--portal` will not do this for you: an existing
+bootstrap file is never rewritten without `--force-config`.
+
+---
+
+## 5. Install the backend
+
+Run this on the box at the house, with the secret step 4 printed.
+
+```sh
+git clone <repo> homeport && cd homeport
+sudo ./deploy/install-backend.sh --psk <the value the frontend printed>
+```
+
+Then check both ends:
+
+```sh
+systemctl status failover-backend            # on the backend
+failoverctl status                           # on the frontend
+```
+
+The frontend's status should show the backend connected and three paths being
+probed within a few seconds.
+
+If it does not, the secret is the first thing to check: it must be
+byte identical on both hosts.
+
+---
+
+## 6. First login
+
+Bring the admin tunnel up on your laptop or phone, then open:
+
+```
+http://10.98.0.2:8080
+```
+
+Log in with the password step 4 printed, then change it immediately in
+**Settings, Portal account**. It was written to the frontend's journal in the
+clear and stays there as long as the journal is kept.
+
+If you did not keep it:
+
+```sh
+journalctl -u failover-frontend | grep 'portal account created'
+```
+
+Or set a new one from the frontend's shell, which asks for no old password:
+
+```sh
+sudo failoverctl passwd
+```
+
+---
+
+## 7. Publish your services
+
+**Settings, Published services** ships four example rows, 27015/udp, 27020/udp,
+80/tcp and 443/tcp, and every one of them is **disabled**.
+
+1. Tick the rows this site actually serves, or add your own.
+2. Delete the examples you do not want.
+3. Save.
+
+Each row is a DNAT rule. Nothing is published until you tick it, and nothing
+takes effect at all until step 9.
+
+While you are here, check **Settings, Frontend, Public interface** matches what
+you noted in step 1.5.
+
+---
+
+## 8. Verify before arming
+
+Work through all of these. Each one has caught a real fault.
+
+**Handshakes on all three, from the backend:**
+
+```sh
+wg show
+```
+
+**Reverse path filtering off, on both hosts:**
+
+```sh
+sysctl net.ipv4.conf.all.rp_filter          # must be 0
+```
+
+The agents set this themselves. A drop-in under `/etc/sysctl.d/` that puts it
+back to 1 or 2 breaks two of the three paths and nothing says why.
+
+**Per path probe routing, on the frontend:**
+
+```sh
+ip rule show
+ip route show table 101
+ip route get 10.99.0.2 mark 0x102
+```
+
+The last command must report `dev wg-lte1`. If it reports the active tunnel
+instead, the mark rule is missing.
+
+**End to end over the overlay:**
+
+```sh
+ping -I 10.99.0.1 10.99.0.2
+```
+
+**The portal agrees:** three paths probing, RTT and loss figures that look
+plausible for each service, and a backend that is connected.
+
+---
+
+## 9. Arm it
+
+1. Leave it in observe mode for a few days. Watch the portal for paths that
+   flap, quota counters moving at a plausible rate, and a decision history that
+   matches what actually happened on those links.
+2. Compare the metered figures against your carrier's own portal and adjust the
+   per path **Calibration %** in **Settings, Paths** until they agree.
+3. Arm it, from the portal or from the frontend's shell:
+
+   ```sh
+   failoverctl mode armed
+   ```
+
+That is the install finished. Everything below is optional or operational.
+
+---
+
+## 10. Optional: outbound traffic through the frontend
+
+Turn this on only if something at the far end has to appear at the frontend's
+public address rather than the house's WAN IP. The case it exists for is a
+Source engine server's heartbeat, which decides the address the server browser
+lists.
+
+It is off by default because everything the backend sends from the overlay
+address then goes the same way, and therefore through the LTE quota during a
+failover.
+
+### 10.1 On the frontend
+
+**Settings, Frontend**: confirm **Public interface**, then tick **Backend
+egress via this address**. **Public IP** is optional and only needed if that
+interface holds several addresses.
+
+### 10.2 Pick what goes, on the backend
+
+**A service on the backend host:** bind it to the overlay address. Nothing else
+is needed.
 
 ```sh
 srcds_run -ip 10.99.0.2 ...
 ```
 
-Nothing else is needed. The existing `ip rule from 10.99.0.2 lookup 100` already
-puts that traffic on the active tunnel.
-
-**A container:** it cannot bind `10.99.0.2` — the address does not exist in its
-network namespace — and it cannot be matched by uid or cgroup either, because a
-container's packets are *forwarded* through the host rather than locally
-originated, so there is no local socket to inspect. What is left is the bridge
-network's address range. Add it in the portal under **Egress → Sources**:
+**A container:** it cannot bind an address that does not exist in its
+namespace, so it is selected by its network instead. Find the subnet:
 
 ```sh
 docker network inspect <name> -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
 ```
 
-Be aware this catches *everything* on that network, wanted or not.
+Add it under **Settings, Backend networks routed out through the frontend**,
+leaving **On host** blank for the backend. This catches everything on that
+network, so give the service its own Docker network if the bridge carries
+anything else.
 
-The backend then installs, for each configured network:
-
-```
-table ip failover_egress {
-    chain prerouting {
-        type filter hook prerouting priority mangle; policy accept;
-        ip saddr 172.18.0.0/16 meta mark set 0x300
-    }
-    chain postrouting {
-        type nat hook postrouting priority -10; policy accept;
-        ip saddr 172.18.0.0/16 oifname { "wg-nbn", "wg-lte1", "wg-lte2" } snat to 10.99.0.2
-    }
-}
-```
-
-with `ip rule add fwmark 0x300 lookup 100` beside it.
-
-The two rules do two different jobs. The prerouting mark is what *diverts* the
-traffic: a forwarded packet is routed after that hook, so the mark is what sends
-it to table 100 instead of out to pfSense — and table 100 already tracks the
-active tunnel, so this follows failover for free. The postrouting SNAT is what
-makes the frontend's rule match and gives the reply somewhere to come back to;
-without it the packet reaches the frontend carrying a private container address
-that nothing downstream can answer.
-
-That SNAT sits at priority `-10`, ahead of `srcnat` (100) where Docker installs
-its masquerade. Allowed to run first, Docker would rewrite the source to an
-address on the output interface — and the tunnels have none.
-
-### Checking it
+### 10.3 Check
 
 ```sh
 # backend
@@ -424,330 +510,149 @@ ip rule show | grep 0x300
 nft list table ip failover_egress
 ```
 
-The portal warns if egress networks are configured while the frontend toggle is
-still off, since that combination silently does nothing.
+The portal warns if networks are configured while the frontend toggle is still
+off, because that combination does nothing.
 
 ---
 
-## 6. Verify before arming
-
-**Handshakes on all three, from the backend:**
-
-```sh
-wg show
-```
-
-Every tunnel should show a recent handshake. If only one does, the pfSense
-policy rules are not matching — check the source ports.
-
-**Each tunnel is genuinely on its own WAN.** On pfSense, look at
-**Diagnostics → States** and filter for each source port. `51820` should show
-against the NBN interface, `51821` LTE1, `51822` LTE2. If two share an
-interface, the rules are wrong and the whole exercise is pointless.
-
-**Reverse-path filtering is off, on both hosts:**
-
-```sh
-sysctl net.ipv4.conf.all.rp_filter          # must be 0
-```
-
-The agents set this themselves, but a `/etc/sysctl.d/` drop-in that puts it
-back to 1 or 2 will break two of the three paths and nothing will say why - the
-tunnels carry no address of their own, and on such an interface even "loose"
-filtering drops any packet whose reverse route names a different device. Only
-one path can ever satisfy that.
-
-**The per-path probe routing works, from the frontend once the agent has run
-once:**
-
-```sh
-ip rule show
-ip route show table 101
-ip route get 10.99.0.2 mark 0x102
-```
-
-The last command should report `dev wg-lte1`. If it reports the active tunnel
-instead, the mark rule is missing.
-
-**End-to-end through one specific path:**
-
-```sh
-ping -I 10.99.0.1 10.99.0.2
-```
-
----
-
-## 7. Bootstrap files must be owned by root
-
-Every unit runs as root but drops all but the capabilities it needs -
-`CAP_NET_ADMIN` and `CAP_NET_RAW` for the two agents, `CAP_NET_ADMIN` alone
-for a linker. None of them keep `CAP_DAC_OVERRIDE`, so root gets no DAC bypass
-and can only read a 0600 file it genuinely owns. Copying the bootstrap file up
-as an ordinary user leaves it owned by that user, and the agent restart-loops
-on `permission denied` while `sudo cat` on the same file works fine.
-
-```sh
-sudo chown root:root /etc/failover/frontend.json
-sudo chmod 0600 /etc/failover/frontend.json
-```
-
-The same applies to `backend.json` and, on an extra host, `linker.json`.
-Annotated examples of all three are in this directory as `*.json.example`;
-the install scripts write these files for you, so you only need them if you
-are configuring a host by hand.
-
----
-
-## 8. Rolling it out
-
-1. Bring up all three tunnels and verify the checks above. Nothing else works
-   until this does.
-2. Install both agents, on their own hosts, from a clone of the repo:
-
-   ```sh
-   sudo ./deploy/install-frontend.sh                  # datacentre box
-   sudo ./deploy/install-backend.sh --psk <as shown>  # box at the house
-   ```
-
-   The frontend script generates the shared secret and prints it; the backend
-   needs that same value. It also works out which interface faces the internet
-   and asks you to confirm it, because the egress rule in section 5 and the
-   edge protection rules are both scoped to that interface, and a wrong name
-   never matches anything. `--public-iface ens3` gives it outright, and
-   `--no-ask` takes the detected value without prompting, which is what you
-   want when the script is driven by something other than a person.
-
-   Both are idempotent, so re-running them is also how you upgrade. They ship in **observe mode**: they probe, decide and log, but
-   change nothing.
-
-   Re-running to upgrade never rewrites an existing bootstrap file. If you do
-   pass `--force-config` on the backend, pass `--psk` with it — the secret is
-   the one thing on that host that cannot be recovered from anywhere else.
-3. Log in and change the password. The first-run one is generated on first
-   start and written to this host's journal in the clear, where it stays for as
-   long as the journal is kept:
-
-   ```sh
-   journalctl -u failover-frontend | grep 'portal account created'
-   ```
-
-   **Settings → Portal account** changes it, and logs out every other session
-   for that account. If you never wrote it down, `sudo failoverctl passwd` on
-   the frontend sets a new one and prints it — it asks for no old password,
-   because anyone who can run it is already root on the box.
-4. **Tick the services this site actually serves.** Settings → Published
-   services ships four examples — 27015/udp, 27020/udp, 80/tcp, 443/tcp — and
-   every one of them is disabled. Each row is a DNAT rule, so enabling one
-   publishes that port on the frontend's public address to whatever is
-   listening at the far end; that is not something a fresh install should do
-   because nobody deleted a row. Nothing is published until you tick it and
-   save, and nothing takes effect until the agent is armed.
-5. Leave it for a few days. Watch the portal. You are looking for paths that
-   flap, quotas that count at a plausible rate, and a decision history that
-   matches what actually happened.
-6. Compare the metered figures against your carrier's own portal and adjust the
-   per-path **calibration %** until they agree.
-7. Arm it from the portal, or `failoverctl mode armed`.
-
-If anything goes wrong, `failoverctl revert` removes the nftables tables and
-every policy route the *frontend* installed, including the egress table from
-section 5. The WireGuard tunnels are untouched, because the agent never created
-them.
-
-Then, on the backend, `systemctl stop failover-backend` followed by
-`failover-backend -revert`. It is a separate command because it is a separate
-host, and it goes second on purpose: it takes down the reply path, and while the
-frontend is still armed and DNATing that breaks every published service
-instantly. The requests keep arriving down the tunnel and the replies leave by
-the LAN to pfSense, where the client's flow has no state. It leaves the overlay
-address in place, because a service may still be bound to it.
-
-Stopping the unit first is not optional. That revert is a separate process with
-no way to tell a running agent anything, and the agent's reconciler puts the
-probe tables, the overlay route and the routes to any extra hosts back within
-ten seconds of the revert removing them, leaving a host that is half reverted
-and reports itself clean. The frontend needs the opposite, its agent up, because
-its revert goes over the control socket into the running engine and that is also
-what disarms it.
-
-Neither command is a teardown of the tunnels, and neither needs to be undone:
-restarting the agent reinstalls everything.
-
-Extra hosts behind the backend, if you have any, come last — after the two
-agents above are armed and working. See section 10.
-
----
-
-## 9. Optional: choosing the fallback by measurement
+## 11. Optional: choose the fallback by measurement
 
 Selection is **priority** by default: when the preferred path is out, traffic
-goes to the next one down the list. Switching Portal → Failover → Selection to
-**quality** changes exactly one thing — the replacement is then the
-best-*measuring* eligible path rather than simply the next one down. A clean
-LTE2 beats an LTE1 dropping one packet in ten.
+goes to the next one down the list.
 
-It is deliberately not "always pick the best path". While the preferred path is
-usable it keeps the traffic whatever the numbers say, and it wins the traffic
-back on its clean streak alone. Priority order here is the **cost** order — NBN
-is unmetered, the LTE services are capped — and LTE frequently measures better
-than a congested fixed line. A selector that simply chased the lowest score
-would park traffic on a metered link indefinitely and report itself as
-optimising.
+**Settings, Failover, Selection**, set to **quality**. That changes one thing:
+the replacement is then the best measuring eligible path rather than the next
+one down. It never displaces the preferred path, and never delays leaving a
+path that has failed.
 
-The score is milliseconds-equivalent:
+Three dampers govern a move between two working fallbacks, under **Choosing
+between fallbacks**:
 
-```
-loss% × LossWeight + rtt × RTTWeight + jitter × JitterWeight
-```
-
-Shipped weights are `25 / 1 / 3`. Loss is weighted heavily because for a game
-server a clean 60ms link genuinely beats a lossy 30ms one. A flawless path
-scores zero and cannot be displaced.
-
-Three dampers govern a move between two working fallbacks, and none of them is
-optional:
-
-| Setting | Default | What it prevents |
+| Setting | Default | Raise it if |
 |---|---|---|
-| **Margin %** | 25 | Two similar links trading places on measurement noise. Because it applies in both directions there is a dead zone, not a threshold: A→B needs `score(B) < 0.75 × score(A)` and the move back needs the mirror image, and both cannot hold at once. |
-| **Hold-down** | 90s | A momentary lead counting as a verdict. Timed against the *active path being beaten*, not against a particular challenger, so two candidates alternating for the lead cannot restart the clock forever. |
-| **Min dwell** | 300s | A *genuine* alternation — a carrier working on a tower — moving traffic every hold-down for as long as it lasts. Every move is a visible freeze for connected players. |
+| Margin % | 25 | similar links trade places |
+| Hold-down | 90s | brief leads are counting as verdicts |
+| Min dwell | 300s | a genuinely alternating pair is switching too often |
 
-None of the three ever delays leaving a path that has become unusable, nor a
-failback to the preferred path. They apply only to a choice between two
-fallbacks that both work.
-
-Worth watching in observe mode for a while before arming: the decision history
-shows what quality selection *would* have done, at no cost.
+Watch it in observe mode first. The decision history shows what quality
+selection would have done at no cost.
 
 ---
 
-## 10. Optional: publishing from more than one host
+## 12. Optional: traffic shaping
 
-**Skip this section unless a site needs it.** Most do not. The default is one
-backend at the far end of the tunnels, and everything below is off until you
-deliberately turn it on — a site that never sets `overlay.subnet` generates
-byte-identical rules and routes to one that has never heard of the feature.
+Only worth doing if latency under load is a problem. Both fields default to 0,
+which runs no `tc` at all.
 
-Use it when the boxes doing the work are not the box terminating the tunnels: a
-small dedicated backend that only routes, with the game servers and the websites
-on separate machines behind it, chosen for their own CPUs.
+1. Confirm the kernel has CAKE on both hosts:
 
-### The addressing
+   ```sh
+   modprobe sch_cake
+   ```
 
-Each extra host gets its own overlay address on its own `dummy0` — `10.99.0.3`,
-`10.99.0.4`, and so on — and the range gets a name:
+2. Measure each link's real throughput in each direction.
+3. **Settings, Paths**, per path:
+   - **Down Mbit/s** is what the frontend sends into that tunnel, the house's
+     download.
+   - **Up Mbit/s** is what the backend sends into it, the house's upload.
+4. Set each slightly **under** the measured rate. At or above it the queue
+   forms in the carrier's buffer instead of ours and the setting does nothing.
 
-```json
-"overlay": {
-  "frontend_ip": "10.99.0.1",
-  "backend_ip": "10.99.0.2",
-  "subnet": "10.99.0.0/24"
-}
-```
+---
 
-**A current install already has it.** `install-frontend.sh` and
-`install-backend.sh` write the `/24` the two overlay addresses sit in, so a site
-installed with them needs nothing here. That is deliberate: it cannot be edited
-from the portal, so a site without it has to be visited over SSH on both hosts
-before a linker can even be added — and everything it enables is inert while
-there is one host at the far end, because no other address in the range exists.
-`--subnet ''` opts out.
+## 13. Optional: edge protection
 
-**An older site has it empty**, and the portal refuses to configure a linker
-until both hosts have it. One command each, which patches that single field in
-place and leaves the shared secret alone:
+Rate limiting and filtering on the frontend's public interface, off by default.
+It needs **Settings, Frontend, Public interface** set first; the portal refuses
+to enable it otherwise.
+
+**Settings, Protection (rate limiting and edge filtering)**, tick **Enabled**,
+then set only the thresholds you want. Each is off at 0.
+
+| Setting | Notes |
+|---|---|
+| New connections per second | per source |
+| Concurrent connections per source | per source |
+| UDP packets per second per source | per source |
+| Block a tripping source for (s) | 0 means drop the packet but do not park the source |
+| Drop invalid, bogus TCP flags, spoofed sources | cheap, safe to leave on |
+
+For a Source game port, tick **Source engine** on that service row. It limits
+only connectionless packets, so a limit of two or three per second cannot touch
+a connected player. **Ceiling pps** caps one service across every client.
+
+Every drop is counted, and the counters show in the portal beside the parked
+sources. Start loose and tighten while watching them.
+
+---
+
+## 14. Optional: publishing from more than one host
+
+Skip this unless the machines doing the work are not the machine terminating
+the tunnels. Each extra host runs `failover-linker`, holds its own overlay
+address, and routes traffic sent from that address to the backend.
+
+### 14.1 Confirm the overlay subnet is set on both hosts
+
+A current install already has it. An older one has it empty, and the portal
+refuses to configure a linker until both hosts agree:
 
 ```sh
 sudo ./deploy/install-frontend.sh --subnet 10.99.0.0/24     # on the frontend
 sudo ./deploy/install-backend.sh  --subnet 10.99.0.0/24     # on the backend
 ```
 
-Each restarts its own agent at the end, which is what makes the value take
-effect. Both must end up with the identical string.
+Each patches that one field and restarts its own agent. Both must end up with
+the identical string.
 
-It is bootstrap-owned rather than portal-editable for the same reason as the
-addresses themselves: both ends have to agree, and the change would have to
-travel over the channel it tears down.
+### 14.2 Confirm AllowedIPs covers the range
 
-Setting it changes two things on the frontend. It routes the whole range down
-the active tunnel instead of the backend's `/32`, and its egress source NAT and
-`DOCKER-USER` exceptions cover the range rather than the single address.
-
-### Check AllowedIPs on the frontend before going further
-
-Every one of the frontend's peers needs to cover the range:
+On the frontend:
 
 ```sh
-wg show wg-nbn  allowed-ips
+wg show wg-main  allowed-ips
 wg show wg-lte1 allowed-ips
 wg show wg-lte2 allowed-ips
 ```
 
-Each must list `10.99.0.0/24`, which is what section 2 sets up. If one still
-says `10.99.0.2/32` — an older install, or a host that was deliberately
-hardened — widen it and restart that tunnel, because `AllowedIPs` is a filter as
-well as a route and the frontend will not even transmit to `10.99.0.3` through a
-peer that excludes it. Nothing reports the refusal: the tunnel keeps carrying
-the backend's traffic perfectly, and only the linker is unreachable.
+Each must list `10.99.0.0/24`. If one still says `10.99.0.2/32`, widen it and
+restart that tunnel, or the frontend will not transmit to `10.99.0.3` at all
+and nothing will report the refusal.
 
-The backend side is already `0.0.0.0/0` and needs no change.
+The backend side is `0.0.0.0/0` already and needs no change.
 
-What the subnet costs a single-host site, in full: a `/24` routed down the
-active tunnel instead of the backend's `/32`, a `DOCKER-USER` accept and an
-egress NAT match covering the range rather than one address, and one extra `ip
-rule` on the backend. Every one of them matches only addresses nothing holds
-until a second host exists, which is why the installers write it in advance and
-why the WireGuard side has always shipped wide. Clearing it later is the
-direction with no cleanup: the agent removes a `/32` that a subnet superseded,
-but keeps no record of a subnet to withdraw going the other way, so a widened
-route stays until somebody removes it by hand.
+### 14.3 Pick a routing table for the extra host
 
-### Publishing a service to one of them
+The default is 200, and that number belongs to the host's own namespace. On
+that host:
 
-In the portal, **Published services** now has a **Published to** column. Leave it
-blank and the service goes to the backend, which is what every service did
-before and what most still do. Put an overlay address in it and the frontend
-DNATs that port there instead.
+```sh
+ip rule show
+cat /etc/iproute2/rt_tables
+```
 
-Nothing else changes: still destination NAT only, still no source rewriting, so
-the far host sees real client IPs. And because each host has its own address,
-two of them can both listen on 27015 with nothing to translate.
+Anything listed is taken. Pick a free number.
 
-The portal rejects a target outside the overlay subnet, and rejects one at all
-if no subnet is configured — a DNAT to an address the frontend cannot route
-would swallow every request, and a published port that accepts nothing looks
-exactly like the service being down at the far end.
+### 14.4 Declare the host in the portal
 
-### Egress networks belong to one host
+**Settings, Linkers (extra hosts behind the backend)**:
 
-**Backend networks routed out through the frontend** now has an **On host**
-column. Leave it blank for the backend.
+1. Fill in the backend's address on that LAN, once.
+2. Add a row: a name, the host's overlay address (`10.99.0.3`), its LAN address
+   (`10.1.1.4`), and the table number from 14.3.
+3. Save.
 
-Fill it in for anything else, because Docker uses the same bridge subnets on
-every machine — `172.17.0.0/16` is the default everywhere, and the allocator
-walks `172.18`, `172.19` and so on in the same order on each one. A row with no
-owner is sent to every agent, so one entry would pull containers onto the tunnel
-on hosts it was never meant to touch, silently, and through the LTE quota.
+Saving pushes the list to the backend, which installs and reconciles the route
+to that host. Nothing has to be run on the backend by hand.
 
-The same network on two different hosts is normal and allowed. The same network
-twice on one host is rejected.
+### 14.5 Install the agent on the extra host
 
-### Installing the agent on the extra host
+Expand **Set up &lt;name&gt;** under the Linkers table. It prints the exact
+install command for that host with every value filled in, and the
+`/etc/failover/linker.json` it would write for a host with no clone of the
+repo. Both contain the real secret, so read before pasting.
 
-Each extra host runs `failover-linker`. It holds the overlay address, routes
-anything sent from it to the backend, and does nothing else — no tunnels, no
-probes, no decisions.
-
-**Take the command from the portal.** Save the row first (next section), then
-expand **Set up &lt;name&gt;** underneath the Linkers table: it prints this
-host's install command with every value already in it — the shared secret, the
-overlay address, the backend's LAN address, the subnet and the routing table —
-and the `/etc/failover/linker.json` it would write, for a host with no clone of
-the repo on it. Both carry the real secret, so they are worth reading before
-they are pasted anywhere.
-
-By hand it is:
+By hand:
 
 ```sh
 sudo ./deploy/install-linker.sh --psk <the frontend's psk> \
@@ -755,252 +660,88 @@ sudo ./deploy/install-linker.sh --psk <the frontend's psk> \
      --subnet 10.99.0.0/24 --table 200
 ```
 
-`--subnet` defaults to the /24 the overlay addresses sit in and `--table` to
-200, so both can be left out on a stock site. Set `--table` when this box
-already policy-routes — a second ISP, a VPN — and give it the same number as the
-row in the portal.
-
 `--backend-lan` is the backend's address on **this** network, not its overlay
-address: overlay traffic reaches the backend as a neighbour on the LAN, and the
-backend is what puts it on a tunnel. The installer rejects the overlay address
-there, because the two names invite the mistake.
+address. The installer rejects the overlay address there.
 
-It installs exactly two things, which are the mirror of what the backend
-installs for itself:
+Check:
 
 ```sh
-ip rule  add from 10.99.0.3 lookup 200
-ip route replace default via 192.168.1.2 table 200
+ip rule show | grep 10.99.0.3
+ip route show table 200
 ```
 
-Check them with `ip rule show | grep 10.99.0.3` and `ip route show table 200`,
-substituting the table number if this host uses another one.
+There is no observe mode and none is needed; the rules match only the overlay
+address, which nothing uses until you bind to it.
 
-**If the backend runs Docker, check its forward policy.** `iptables -S FORWARD`
-showing `-P FORWARD DROP` is Docker's doing, and the backend now forwards every
-packet to and from this host. The agent inserts the two exceptions it needs
-into `DOCKER-USER` as soon as a linker is configured, so an up-to-date backend
-handles it; on an older one the symptom is this host being unreachable while
-`ip route get` answers correctly on all three machines, and the manual form is:
+### 14.6 Point services at it
+
+**Settings, Published services**, set **Published to** to `10.99.0.3` on the
+rows that belong to this host. Blank still means the backend. Two hosts can
+both listen on 27015 with nothing to translate.
+
+Bind the service on the extra host the same way as on the backend:
+
+```sh
+srcds_run -ip 10.99.0.3 -port 27015 ...
+```
+
+Containers cannot do that, and do not need to: publish them normally with
+`docker run -p 80:80`, and the linker marks the connection so the reply routes
+back. For container **outbound** traffic, add its network under **Backend
+networks routed out through the frontend** with **On host** set to
+`10.99.0.3`, and tick **Backend egress via this address** in the Frontend
+section.
+
+### 14.7 If the backend runs Docker
+
+An up to date backend handles this itself. On an older one, the symptom is the
+extra host being unreachable while `ip route get` answers correctly on all
+three machines:
 
 ```sh
 sudo nft insert rule ip filter DOCKER-USER ip daddr 10.99.0.0/24 accept
 sudo nft insert rule ip filter DOCKER-USER ip saddr 10.99.0.0/24 accept
 ```
 
-There is no observe mode and none is needed. Only packets sourced from the
-overlay address match that rule, and nothing on the box uses that address unless
-a service was deliberately bound to it — so until something opts in, the rules
-are inert. What actually directs traffic to this host is the frontend's DNAT,
-which has its own observe mode.
-
-`systemctl stop failover-linker` then `failover-linker -revert` removes both
-rules and deliberately leaves the overlay address in place, so anything bound to
-it keeps listening. Stop the unit first, for the reason the backend's does:
-reconcile puts the rules back ten seconds after the revert takes them out.
-
-### Declare the linker in the portal first
-
-**Settings → Linkers.** Fill in the backend's address on that network once, then
-add a row per extra host: a name, its overlay address (`10.99.0.3`), its LAN
-address (`10.1.1.4`), and the routing table it should use.
-
-**Check the table before accepting the default.** It is 200 unless you change
-it, and that number belongs to the host's own namespace, not to this system. A
-machine that already policy-routes — a second ISP, a VPN — may well be using it,
-and two systems writing one table fight over its default route: the loser's
-traffic goes somewhere nobody intended, silently. On the host:
-
-```sh
-ip rule show
-cat /etc/iproute2/rt_tables
-```
-
-Anything listed there is taken. Pick a free number and set it in the row. It must
-also appear in that host's `linker.json` — the rule it names is what carries the
-control connection, so the agent needs it before it can be told anything. The
-generated config below has it, and the dashboard warns if the host reports using
-a different one.
-
-That row is what tells the backend how to reach it. Saving pushes the list down
-the existing control channel, and the backend agent installs
-`ip route replace 10.99.0.3/32 via 10.1.1.4` and reconciles it every 10s like
-every other route it owns. **Nothing has to be run on the backend by hand**, and
-nothing is lost at a reboot.
-
-Without that row the frontend would DNAT a published port to `10.99.0.3`, the
-packet would arrive at the backend, and the backend would have nowhere to send
-it — the service timing out with nothing in any log to say why. So the portal
-refuses to publish a service to an address no linker holds, rather than letting
-you build that silence.
-
-Unticking a linker withdraws its route as well as its publishing, so taking a
-host out of service is one checkbox.
-
-The section also generates that host's `/etc/failover/linker.json`, ready to
-copy. The shared secret is deliberately left as a placeholder — the frontend
-holds only the key derived from it, never the passphrase, and plumbing the raw
-secret into the portal so it could be displayed would be a real downgrade for
-one saved paste. Fill it in from `/etc/failover/frontend.json`.
-
-### Binding services on the extra host
-
-Bind to the overlay address, the same as on the backend:
-
-```sh
-srcds_run -ip 10.99.0.3 -port 27015 ...
-```
-
-That single flag does two jobs. It makes the service reachable at the address
-the frontend publishes to, and it is what sends the outbound half — the
-server-browser heartbeat — through the frontend's public address, provided
-**Backend egress via this address** is ticked in the portal. Everything else the
-box does keeps its normal route out through pfSense and never touches a tunnel.
-
-Containers are the exception, and the reason is the same one as in section 4:
-the overlay address does not exist inside a container's network namespace, so
-`-ip 10.99.0.3` is not available to one.
-
-**Publishing to a container works anyway.** Run it the way containers are
-normally published — `docker run -p 80:80 …` on a bridge network — and the
-linker marks the connection on the way in so the reply is routed back to the
-backend even though it comes out of the container carrying a `172.x` address.
-Without that marking the request arrives, the container answers, and the answer
-leaves by the host's own default route: a timeout, which reads as the container
-being down.
-
-**Outbound from a container works too, with one switch.** Add the container's
-bridge network under **Backend networks routed out through the frontend**, with
-**On host** set to that linker's overlay address, and tick **Backend egress via
-this address** in the Frontend section. Its traffic then leaves by the
-frontend's public address, which is what gets a containerised game server listed
-in the browser at the published address rather than the house's.
-
-The portal refuses a network assigned to a host that is not a configured linker,
-because that row would be delivered nowhere and the operator would see rules
-they configured having no effect on any machine.
-
-All of that network's internet traffic takes this route, so it counts against
-the LTE quota during a failover. Give the service its own Docker network if the
-bridge carries anything you would rather leave on the local service.
-
-### What you do get in the portal
-
-A linker dials the frontend the way the backend does, so the dashboard shows it
-under **Extra hosts**: whether it is connected, its hostname and build, and how
-long it has been up. A linker that is configured but has never checked in reads
-as *not connected* rather than being absent, which is the difference between a
-host that is down and one nobody configured.
-
-Note what that liveness does **not** do: it never reaches the path trackers. A
-game server box rebooting is not a tunnel problem, and treating it as one would
-move traffic to a metered link for no reason.
-
-Published traffic does not depend on the control channel. The backend's route to
-the linker and the linker's own rules are installed and reconciled
-independently, so a frontend restart does not interrupt anything already
-serving.
-
-It can still be checked from its own shell:
-
-```sh
-systemctl status failover-linker
-ip rule show | grep 10.99.0.3
-ip route show table 200
-```
-
 ---
 
-## 11. Rebuilding a host from scratch
+## 15. Updating a host
 
-Wiping a host and re-running its install script is a good way to prove the
-scripts work, and the frontend carries three things a fresh install will not
-give you back.
-
-**The shared secret.** `install-frontend.sh` generates a new one when there is
-no config to read. Every other host then fails authentication. Either keep the
-old value and pass it back in, or reinstall every host together:
-
-```sh
-sudo grep psk /etc/failover/frontend.json      # before you wipe anything
-```
-
-**The overlay subnet**, if this site runs linkers. It is not stored anywhere but
-the bootstrap files, so pass it to both agents or the frontend goes back to
-routing a `/32` and every linker becomes unreachable:
-
-```sh
-sudo ./deploy/install-frontend.sh --psk <old> --subnet 10.99.0.0/24
-sudo ./deploy/install-backend.sh  --psk <old> --subnet 10.99.0.0/24
-```
-
-**The database**, and this is the one that actually costs something.
-`/var/lib/failover/failover.db` holds the whole configuration — services,
-quotas, thresholds, selection mode, egress networks, portal users — and the
-**usage ledger**. Losing the ledger resets metered-byte accounting to zero
-mid-period, so both LTE paths believe they have a full month of headroom, and
-the calibration percentages you spent a month tuning go with it.
-
-```sh
-sudo systemctl stop failover-frontend
-sudo cp /var/lib/failover/failover.db /root/failover.db.bak
-```
-
-Restore it by copying it back before starting the new agent. If you deliberately
-want a clean slate, note the calibration percentages and current usage first.
-
-**What survives regardless:** the WireGuard configuration. The agents never
-created those interfaces and no install or revert touches `/etc/wireguard`.
-
-**One thing that will look wrong and is not.** A fresh install starts in observe
-mode, and observe mode deliberately leaves existing rules in place rather than
-tearing them down — so published services keep working off the nftables table
-the old agent installed, while the portal says nothing is armed. That is
-invariant 13 behaving correctly. Run `failoverctl revert` before wiping if you
-want a genuinely bare frontend to test against, and `failover-backend -revert`
-on the backend for the same reason: its reply rules and marking table survive a
-disarm too.
-
----
-
-## 12. Updating a host
-
-Re-run its install script. That is the upgrade path, and the scripts are
-written for it: an existing bootstrap file is left alone, so no arguments are
-needed on a re-run.
+Re-run its install script. Order does not matter, and no arguments are needed:
+an existing bootstrap file is left alone.
 
 ```sh
 cd /path/to/homeport && git pull
-sudo ./deploy/install-frontend.sh          # on the datacentre box
-sudo ./deploy/install-backend.sh           # on the box at the house
-sudo ./deploy/install-linker.sh            # on each extra host, if any
+sudo ./deploy/install-frontend.sh          # datacentre box
+sudo ./deploy/install-backend.sh           # box at the house
+sudo ./deploy/install-linker.sh            # each extra host, if any
 ```
 
-No `--psk` the second time. Passing `--force-config` is the only way to rewrite
-the bootstrap file, and on the backend and a linker it then needs `--psk` with
-it, or the secret is blanked and the agent refuses to start.
+Do not copy the binary over the running one by hand. The scripts install
+alongside and rename into place, and they refresh the systemd unit, which a
+hand copy skips.
 
-**Order does not matter here**, unlike a revert or an uninstall. Nothing is
-being taken down, and neither agent depends on the other's version: the probe
-packet is a fixed 66-byte format and the control frames are newline-delimited
-JSON, so a mixed pair works for as long as those hold. A host that is briefly
-missing is one the other end already knows how to survive.
+### If your tunnels are still called `wg-nbn`
 
-**Do not copy the binary over the running one.** Linux refuses to open a
-running executable for writing, which is why doing it by hand needs a
-`systemctl stop` first. The scripts install to `failover-backend.new` and `mv`
-it into place instead: a rename swaps the directory entry and leaves the
-running process on the old inode, so the service is only away for the restart
-itself. They also refresh the systemd unit and `daemon-reload`, which a
-hand-copy skips — a unit change in the commit would otherwise never land.
+The shipped defaults name the first path `main` on `wg-main`. An update never
+rewrites your saved configuration, so a site installed under the old names
+keeps working exactly as it did. Two things reference the shipped name: the
+installers warn that `wg-main` is missing during their environment check, and
+the backend's unit orders itself after `wg-quick@wg-main.service`. Neither
+affects routing, so ignoring both is a valid answer.
 
-**Where the binary comes from.** With a Go toolchain on the host the script
-builds from the working tree. Without one it uses the committed
-`build/failover-*`, which is why a box that only ever receives artefacts is a
-supported case. Those are refreshed with `make build linker` on a machine that
-does have Go, and committed alongside the change — including for portal work,
-because the CSS and JavaScript are embedded in the frontend binary and a
-source-only change never reaches a host installing from `build/`.
+To rename instead, on the frontend and the backend:
+
+```sh
+systemctl disable --now wg-quick@wg-nbn
+mv /etc/wireguard/wg-nbn.conf /etc/wireguard/wg-main.conf
+systemctl enable --now wg-quick@wg-main
+```
+
+Then in **Settings, Paths** change that path's interface to `wg-main` and save.
+Do the portal edit last: the agent probes whatever the configuration names, so
+a path pointing at an interface that no longer exists reads as down until you
+do.
 
 From a workstation instead, without a clone on the host:
 
@@ -1011,121 +752,164 @@ make deploy-backend  BACKEND_HOST=root@home.example.net
 make deploy-linker   LINKER_HOST=root@gs1        # one host at a time
 ```
 
-### What a restart costs
-
-**The frontend.** Probing stops for the second or two the process is away. The
-installed route and the nftables tables stay exactly as they are — the unit
-does not tear anything down on stop, deliberately, so traffic keeps flowing on
-whichever path was chosen. `decisionSeq` is seeded from the wall clock rather
-than reset, so the backend does not ignore the decisions of a restarted
-frontend as stale. The portal is unavailable for the same second or two.
-
-**The backend.** All three paths stop answering at once, which is not the same
-as one path failing: with no eligible path the selector keeps the last route
-rather than moving traffic, so an update cannot bump you onto LTE. What you
-will see is a "no usable path" alert and event, then the active path back
-within a few seconds and the standby paths reading `down` for up to a minute
-while they re-earn `RecoverThreshold` at the 5s standby cadence. Usage deltas
-buffered on disk survive the restart and are delivered afterwards.
-
-**A linker.** Nothing at all. Its overlay address, rule and route are left in
-place on stop, for the same reason the frontend's route is: removing them
-because the agent restarted would drop every session on that host.
-
-### Checking it took
-
-The portal header shows the running build of the frontend and the last one the
-backend reported, and each extra host's is on its card under **Extra hosts**.
-On a host itself:
+Confirm it took:
 
 ```sh
 failover-frontend -version
 failover-backend -version
 failover-linker -version
-failoverctl version
 ```
 
-A version that has not moved means the binary was not replaced — most often
-`build/` was stale on a host with no Go toolchain, so the script installed the
-same file again.
+A version that has not moved usually means `build/` was stale on a host with no
+Go toolchain. Refresh it with `make build linker` on a machine that has one and
+commit the result.
 
-**There is nothing to migrate.** The configuration is one JSON blob in SQLite
-and the bootstrap files are not rewritten, so an update carries both across
-untouched. A build that adds settings finds them at their zero value in an old
-config and fills them in on load, which is `model.Normalise`'s job — you do not
-need to open Settings and save to pick up new defaults.
+What a restart costs: the frontend stops probing for a second or two and keeps
+its installed route and rules. The backend stops answering on all three paths
+at once, which produces a "no usable path" alert and leaves the route where it
+was; standby paths read `down` for up to a minute afterwards while they re-earn
+their recovery count. A linker costs nothing at all.
 
 ---
 
-## 13. Taking it off a host
+## 16. Reverting
 
-`deploy/uninstall.sh` is the counterpart to the three install scripts, and it
-does what they did backwards: revert the system changes, stop and disable the
-unit, and remove the unit file, the binaries, the bootstrap file and the state
-directory. It works out which agent this host runs
-from what is installed, and refuses to guess if there are two.
+Removes the routing and nftables changes, leaves the tunnels and the overlay
+address alone. Restarting the agent puts everything back.
+
+**Frontend first, with its agent running:**
 
 ```sh
-sudo ./deploy/uninstall.sh              # on the frontend
+failoverctl revert
+```
+
+**Then the backend, with its unit stopped:**
+
+```sh
+systemctl stop failover-backend
+failover-backend -revert
+```
+
+**Then each extra host, same way:**
+
+```sh
+systemctl stop failover-linker
+failover-linker -revert
+```
+
+Two rules, both load bearing:
+
+- **That order.** Taking the backend's reply path down while the frontend is
+  still armed and translating breaks every published service instantly.
+- **The unit state differs by role.** The frontend's revert goes through the
+  running engine and needs it up. The other two are separate processes, and a
+  running agent puts back what they remove within ten seconds.
+
+---
+
+## 17. Uninstalling
+
+```sh
+sudo ./deploy/uninstall.sh              # frontend
 sudo ./deploy/uninstall.sh              # then the backend
 sudo ./deploy/uninstall.sh              # then each linker
 ```
 
-**That order, for the reason in section 8.** Taking the backend's reply path
-down while the frontend is still armed and DNATing breaks every published
-service on the spot: the requests keep arriving down the tunnel and the replies
-leave by the LAN to pfSense, where the client's flow has no state. The script
-prints the reminder on the frontend and asks before it does anything, and
-`--yes` skips the question for a scripted run.
+Same order and for the same reason as step 16. The script works out which agent
+this host runs, reverts first while the binary that knows what it installed is
+still present, then removes the unit, the binaries, the bootstrap file and the
+state directory. It refuses to remove anything if the revert fails.
 
-It needs nothing from the repository, so a copy of the file is enough on a host
-where the clone is already gone.
+| Flag | Effect |
+|---|---|
+| `--keep-config` | leave the bootstrap file, and with it the shared secret |
+| `--keep-state` | leave the state directory, which on the frontend is the database |
+| `--no-backup` | do not copy `failover.db` aside first |
+| `--overlay` | also remove this host's overlay address |
+| `--force` | continue even if the revert failed |
+| `--yes` | do not ask for confirmation |
 
-**What it removes.** Everything the install script put on the host: the
-binaries, the unit, the bootstrap file and the state directory. Uninstalled
-means gone, so keeping something is what takes a flag — `--keep-config` leaves
-the bootstrap file, and with it the shared secret, for a reinstall;
-`--keep-state` leaves the state directory, which on the frontend is the
-database. That database is copied to `/root/failover.db.<timestamp>.bak` before
-it goes, because the usage ledger is the part that cannot be recreated: losing
-it mid-period tells both LTE paths they have a full month of headroom.
-`--no-backup` if you mean it.
+WireGuard is never touched, on any host, with any flag. Routing entries this
+system did not install are never removed, so a box that already policy routes
+keeps its own rules in 100, 200 and 101 to 103.
 
-**What it never touches.** WireGuard, on any host and with any flag: the agents
-did not create the tunnels and nothing in the script reads `/etc/wireguard`.
-Nor routing tables that belong to the host — a revert deletes the entries this
-system installed, by the priority it found them at, and never flushes a table,
-so a box that already policy-routes keeps its own rules in 100, 200 and 101-103.
-
-**The overlay address stays too**, for the same reason `revert` leaves it: a
-service may still be bound to it. `--overlay` removes it, and removes `dummy0`
-with it only if nothing else is on the device.
-
-**It stops rather than strand rules.** The revert runs first, while the agent is
-still installed, because the binary is the only thing that knows which rules,
-routes and priorities belong to this system. If it fails — a crashed frontend
-with no control socket, a missing bootstrap file — nothing is removed and the
-script says how to finish the revert by hand. `--force` accepts the leftovers
-and continues, and prints what is still on the host.
-
-A stopped frontend is not itself a problem: the revert goes over the local
-control socket, so the script starts the unit for the purpose and stops it
-again. That installs nothing new — an armed agent's rules are on the host
-whether the process is running or not.
-
-**The backend and the linker are the other way round**, and the script stops
-their unit before reverting. Those reverts are separate processes that cannot
-tell a running agent anything, and the reconciler reinstalls whatever it finds
-missing within ten seconds — so reverting underneath a live agent leaves rules
-behind and then deletes the binary that knew about them.
-
-**Doing it by hand** is four steps, and the script exists because the first one
-is easy to skip:
+By hand, if the script is not available:
 
 ```sh
-# on the backend or a linker, stop the unit first: systemctl stop failover-backend
+# on the backend or a linker, stop the unit first
 failoverctl revert                       # or failover-{backend,linker} -revert
 systemctl disable --now failover-frontend
 rm /etc/systemd/system/failover-frontend.service && systemctl daemon-reload
 rm /usr/local/bin/failover-frontend /usr/local/bin/failoverctl
 ```
+
+---
+
+## 18. Rebuilding a host from scratch
+
+Before you wipe the frontend, save three things a fresh install will not give
+back.
+
+**The shared secret**, or every other host fails authentication:
+
+```sh
+sudo grep psk /etc/failover/frontend.json
+```
+
+**The database**, which holds the whole configuration and the usage ledger.
+Losing the ledger resets metered accounting mid period, so both LTE paths
+believe they have a full month of headroom:
+
+```sh
+sudo systemctl stop failover-frontend
+sudo cp /var/lib/failover/failover.db /root/failover.db.bak
+```
+
+**The overlay subnet**, if this site runs linkers. It lives only in the
+bootstrap files.
+
+Reinstall passing the old values back:
+
+```sh
+sudo ./deploy/install-frontend.sh --psk <old> --subnet 10.99.0.0/24
+sudo ./deploy/install-backend.sh  --psk <old> --subnet 10.99.0.0/24
+```
+
+Copy the database back before starting the new agent. If you want a genuinely
+bare host to test against, run the reverts in step 16 **before** wiping:
+observe mode deliberately leaves existing rules in place, so published services
+keep working off the old agent's rules while the portal says nothing is armed.
+
+---
+
+## Troubleshooting
+
+| Symptom | Check | Usual cause |
+|---|---|---|
+| Only one tunnel handshakes | `wg show` on the backend | pfSense source port rules (step 3.1) |
+| All three paths healthy but nothing published works | `AllowedIPs` on the backend's peers | not `0.0.0.0/0` (step 2.2) |
+| Two paths read 100% loss | `sysctl net.ipv4.conf.all.rp_filter` | a sysctl drop-in resetting it (step 8) |
+| A path stays down after a tunnel restart | `ip route show table 101` empty | wait 10s for the reconciler; if it persists, check the agent is running |
+| Probes measure the wrong tunnel | `ip route get 10.99.0.2 mark 0x102` | a duplicate fwmark or table between paths |
+| All three tunnels probe healthy but never fail over | pfSense gateway monitoring | monitoring action not disabled (step 3.2) |
+| Agent restart loops on permission denied | `ls -l /etc/failover/*.json` | not owned by root; `chown root:root`, `chmod 0600` |
+| Portal unreachable, agent otherwise fine | `grep portal_listen /etc/failover/frontend.json` | fell back to loopback (step 4.4) |
+| Rules configured in the portal do nothing | `nft list table ip failover_egress` | still in observe mode (step 9) |
+| Extra host unreachable, routing correct everywhere | `iptables -S FORWARD` on the backend | Docker's drop policy (step 14.7) |
+| Agent logs `File exists` for rules that are present | the table has a name in `rt_tables` | a table number this system uses is already taken (step 1.4) |
+
+Deeper diagnosis, including the first multi-host deployment's fault log, is in
+[LINKER-NOTES.md](LINKER-NOTES.md).
+
+## Reference
+
+Bootstrap files live in `/etc/failover/{frontend,backend,linker}.json` and must
+be owned by `root:root` mode `0600`. The units drop `CAP_DAC_OVERRIDE`, so root
+cannot read a 0600 file it does not own, and the agent restart loops while
+`sudo cat` on the same file works. Annotated examples of all three are in this
+directory as `*.json.example`; the install scripts write them for you.
+
+- [REFERENCE.md](../REFERENCE.md), how the system behaves and why
+- [CLAUDE.md](../CLAUDE.md), design reasoning, invariants and traps
+- [LINKER-NOTES.md](LINKER-NOTES.md), field notes from the first multi-host
+  deployment
