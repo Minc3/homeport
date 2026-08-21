@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
@@ -50,9 +51,28 @@ type Engine struct {
 	// an HTTP request's context: it is cancelled the moment the handler
 	// returns, which would silently stop all probing on the first settings
 	// save.
+	//
+	// proberDone is the generation currently running. stopProbers waits on it,
+	// so the old sockets are closed before the new ones bind - two generations
+	// probing at once perturb the very measurement every decision is made
+	// from, and on a metered path they bill twice for it.
 	baseCtx      context.Context
 	proberCancel context.CancelFunc
+	proberDone   *sync.WaitGroup
 	results      chan Result
+
+	// liveProbers counts prober goroutines across every generation, which is
+	// precisely the number the orphaned-generation fault got wrong. It exists
+	// so that fault is assertable at all: from outside, an extra generation is
+	// invisible except as a path being probed faster than its configured
+	// interval.
+	liveProbers atomic.Int64
+
+	// reconfMu serialises Reconfigure against itself. It is deliberately a
+	// separate lock from mu: it has to be held across applySystemConfig, which
+	// shells out to ip, nft and tc and is far too slow to hold the state lock
+	// for. See Reconfigure for the fault it prevents.
+	reconfMu sync.Mutex
 
 	active      int
 	pinned      int // operator override; 0 means automatic selection
@@ -232,11 +252,30 @@ func (e *Engine) Run(ctx context.Context) error {
 // Probing
 // ---------------------------------------------------------------------------
 
+// startProbers replaces the running generation of probers with one built from
+// the current configuration.
+//
+// It cancels whatever it finds still recorded before installing its own. That
+// is not belt and braces for the balanced stop/start pair below: overwriting
+// e.proberCancel without cancelling it *loses* the only handle to that
+// generation, and since its context is derived from baseCtx it then probes
+// until the process exits. Two generations on a 5s standby ticker read as one
+// path being probed every 2-3s, bill the metered quota twice, and halve the
+// wall-clock time in which FailThreshold consecutive losses condemn a path -
+// with nothing anywhere reporting any of it.
 func (e *Engine) startProbers(parent context.Context) {
 	e.mu.Lock()
 	cfg := e.cfg
+	if e.proberCancel != nil {
+		// A caller reached here without stopping first. Take the old
+		// generation down rather than orphaning it.
+		e.log.Warn("probers started while a generation was still running; cancelling the old one")
+		e.proberCancel()
+	}
 	ctx, cancel := context.WithCancel(parent)
 	e.proberCancel = cancel
+	done := &sync.WaitGroup{}
+	e.proberDone = done
 
 	// Carry health across a restart of the probers. Editing a quota or adding
 	// a published port says nothing about whether a link is up, and rebuilding
@@ -265,20 +304,41 @@ func (e *Engine) startProbers(parent context.Context) {
 	for _, pr := range e.probers {
 		probers = append(probers, pr)
 	}
+	done.Add(len(probers))
 	e.mu.Unlock()
 
 	for _, pr := range probers {
-		go pr.Run(ctx)
+		go func() {
+			e.liveProbers.Add(1)
+			defer func() {
+				e.liveProbers.Add(-1)
+				done.Done()
+			}()
+			pr.Run(ctx)
+		}()
 	}
 }
 
+// stopProbers cancels the running generation and waits for it to be gone.
+//
+// The wait is the point. A cancelled prober is not a stopped prober: it holds a
+// marked UDP socket until its send loop next reaches the select and its read
+// loop's deadline expires, and until then a replacement generation started
+// underneath it is probing the same path in parallel. That window is short, but
+// it is on every settings save, and the measurement it disturbs is the one
+// every failover decision is made from. Same reasoning as invariant 17.
 func (e *Engine) stopProbers() {
 	e.mu.Lock()
 	cancel := e.proberCancel
+	done := e.proberDone
 	e.proberCancel = nil
+	e.proberDone = nil
 	e.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	if done != nil {
+		done.Wait()
 	}
 }
 
@@ -1574,7 +1634,20 @@ func (e *Engine) Mode() string {
 // It deliberately takes no context. Callers are HTTP handlers, and starting the
 // probers from a request context would tie their lifetime to that request:
 // probing would stop the instant the settings page returned a response.
+//
+// It is serialised against itself for the sibling reason. Callers are HTTP
+// handlers, which net/http serves concurrently - a settings save and a mode
+// toggle, or a double-clicked Save - and the stop/start pair below is not
+// atomic on its own. Interleaved, the second caller's stopProbers finds the
+// handle already nil, cancels nothing, and both callers then start a
+// generation; the first handle is overwritten and that generation probes until
+// the process exits. The symptom is a standby path on a 5000ms interval
+// reporting every 2-3s, and it compounds with each racing pair.
 func (e *Engine) Reconfigure(cfg model.Config) error {
+	// Held across applySystemConfig, which is why this is not e.mu.
+	e.reconfMu.Lock()
+	defer e.reconfMu.Unlock()
+
 	if err := e.st.SaveConfig(cfg); err != nil {
 		return err
 	}

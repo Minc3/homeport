@@ -710,6 +710,37 @@ Breaking any of these is a correctness bug even if the tests pass.
    cancelled the moment the handler returns. `Engine.Reconfigure` takes no
    context for exactly this reason; it uses `e.baseCtx`. Starting the probers
    from `r.Context()` silently stopped all probing on the first settings save.
+
+   **And never start them twice from concurrent requests, which is the same
+   fault from the other side.** `net/http` serves handlers concurrently, and
+   both `PUT /api/config` and `POST /api/mode` call `Reconfigure`. Its
+   `stopProbers` / `startProbers` pair is not atomic on its own, and the gap
+   between them contains `applySystemConfig`, which shells out to `ip`, `nft`
+   and `tc` — hundreds of milliseconds, wide open. Interleaved, the second
+   caller's `stopProbers` found `proberCancel` already nil, cancelled nothing,
+   and both callers then started a generation; the first `cancel` was
+   overwritten and lost, and since the context descends from `baseCtx` that
+   generation probed until the process was restarted.
+
+   Nothing reported it, because every path went on measuring perfectly. The
+   only symptom was a standby path on a 5000ms interval reporting every 2–3s —
+   two tickers out of phase — with the metered quota billed twice for the
+   privilege and `FailThreshold` consecutive losses reached in half the
+   wall-clock time it was configured for. It compounded: each racing pair added
+   another generation.
+
+   Three things hold it now, and they are not redundant. `Reconfigure` takes
+   `e.reconfMu` for its whole body — a separate lock from `e.mu` precisely
+   because it must be held across `applySystemConfig`, which is far too slow to
+   hold the state lock for. `startProbers` cancels any generation it finds
+   still recorded rather than overwriting the handle, so no future caller can
+   orphan one. And `stopProbers` **waits** on that generation's `WaitGroup`
+   instead of merely cancelling: a cancelled prober still holds its marked
+   socket and is still probing until its send loop reaches the select and its
+   read deadline expires, so without the wait every settings save doubled the
+   traffic on every path for a moment — briefly, but against the one
+   measurement every failover decision is made from. Same reasoning as
+   invariant 17.
 10. **Commit state only after the system accepts the change.** Both
     `Engine.evaluate` and `Agent.SetActivePath` install routes first and record
     the new active path second. Recording first means a failed `ip route
@@ -1168,6 +1199,17 @@ where a subtle regression would be invisible in production until an outage:
   leaves behind gets repaired, an intact system is left completely alone, a
   tunnel that has not come back is skipped, and observe mode repairs
   measurement without installing anything that moves traffic.
+- `engine/prober_lifecycle_test.go` — one generation of probers, always: a
+  replaced generation is cancelled rather than orphaned, `stopProbers` returns
+  only once the old goroutines are gone, and eight concurrent `Reconfigure`
+  calls leave exactly one prober per path. These run the probers as real
+  goroutines rather than stubs — their sockets cannot bind on a development
+  machine, which is the intended shape, because `Prober.Run` then sits in its
+  dial/`reportUnreachable` cycle holding a context exactly like a working one.
+  `Engine.liveProbers` exists so this is assertable at all: from outside, a
+  duplicate generation is invisible except as a path probing faster than its
+  configured interval. On the original code the last of these reported 24
+  goroutines where three were wanted.
 - `sysx/linker_test.go` — that a site with no subnet generates byte-identical
   rules, that the two prefix helpers agree once one is set, that a service
   target moves only the DNAT, and that the source rules stay behind the
