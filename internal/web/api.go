@@ -419,9 +419,13 @@ func validate(cfg *model.Config) error {
 		// ones installed while the save reports success and nothing new
 		// reaches the kernel. Bounded here so it cannot get as far as the file.
 		sv.Name = trimmed(sv.Name)
+		// Bytes rather than runes, because bytes are what the kernel counts:
+		// a name well inside the limit read as characters can be over it once
+		// anything non-ASCII is in there, and the error has to name the same
+		// unit the bound is in or it reads as arithmetic nobody can follow.
 		if len(sv.Name) > maxServiceName {
-			return fmt.Errorf("service name %q is %d characters; keep it under %d, "+
-				"because it becomes an nftables comment and the kernel bounds those",
+			return fmt.Errorf("service name %q is %d bytes; keep it under %d, "+
+				"because it becomes an nftables comment and the kernel bounds those in bytes",
 				sv.Name, len(sv.Name), maxServiceName)
 		}
 		if bad := firstBadCommentRune(sv.Name); bad != "" {
@@ -472,7 +476,9 @@ func validate(cfg *model.Config) error {
 
 // maxServiceName is a bound, not a style rule. nftables caps a rule comment at
 // 128 bytes and rejects the table that carries an over-long one; this leaves
-// room for the "ceiling:" prefix the protection rules add.
+// room for the "ceiling:" prefix the protection rules add. In bytes, which is
+// the unit the kernel bounds, so a name of multi-byte characters is measured
+// the way nft will measure it rather than the way it reads.
 const maxServiceName = 64
 
 // firstBadCommentRune returns the first character that cannot be rendered into
