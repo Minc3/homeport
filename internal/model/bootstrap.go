@@ -125,6 +125,27 @@ func LoadBootstrap(path string) (Bootstrap, error) {
 		if b.Linker.OverlayIP == b.Overlay.BackendIP || b.Linker.OverlayIP == b.Overlay.FrontendIP {
 			return Bootstrap{}, fmt.Errorf("bootstrap config: linker.overlay_ip %s is already the frontend's or the backend's address", b.Linker.OverlayIP)
 		}
+		// The kernel owns 253 to 255: default, main and local. A default route
+		// written into main points this entire host at the backend, and the
+		// reconciler puts it back ten seconds after anybody deletes it, so an
+		// operator cannot undo it without stopping the agent first.
+		//
+		// Refused rather than warned about. The example file's _table note
+		// already says 1-252 and explains why the number matters, which is
+		// exactly as much as a comment in a JSON file can do: the parser throws
+		// it away. The two checks above exist for the same reason.
+		//
+		// The portal applies this bound too, along with the collisions only it
+		// can see. It cannot help here: this file is where the value has to be
+		// typed, because the rule it names is what carries the channel the
+		// portal would otherwise arrive over.
+		if b.Linker.Table < 0 || b.Linker.Table > 252 {
+			return Bootstrap{}, fmt.Errorf(
+				"bootstrap config: linker.table is %d; it must be between 1 and 252, "+
+					"or left out for the default. 253 to 255 are the kernel's own tables, "+
+					"and writing a default route into main would send this host's traffic to the backend",
+				b.Linker.Table)
+		}
 	}
 	return b, nil
 }

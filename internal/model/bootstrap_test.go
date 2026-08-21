@@ -79,3 +79,51 @@ func TestPublicIfaceIsOptionalAndCarriedThrough(t *testing.T) {
 		t.Fatalf("public_iface = %q, want empty so the portal default stands", b.PublicIface)
 	}
 }
+
+// 253, 254 and 255 are default, main and local. The agent writes a default
+// route into whichever table it is given and the reconciler puts it back ten
+// seconds after anybody removes it, so a typo here redirects the whole host to
+// the backend and cannot be undone without stopping the unit. The portal
+// applies the same bound, and cannot help: this file is where the value has to
+// be typed, because the rule it names is what carries the control channel.
+func TestLinkerBootstrapRejectsAKernelRoutingTable(t *testing.T) {
+	body := func(table string) string {
+		return `{"role":"linker","psk":"x","linker":{"overlay_ip":"10.99.0.3",` +
+			`"backend_lan":"192.168.1.2","table":` + table + `}}`
+	}
+	for name, table := range map[string]string{
+		"default":  "253",
+		"main":     "254",
+		"local":    "255",
+		"beyond":   "1000",
+		"negative": "-1",
+	} {
+		p := filepath.Join(t.TempDir(), "linker.json")
+		if err := os.WriteFile(p, []byte(body(table)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := model.LoadBootstrap(p); err == nil {
+			t.Errorf("table %s (%s) should have been rejected", table, name)
+		}
+	}
+}
+
+// Zero has to stay legal: it is what the portal writes when the column is left
+// blank, and TableOr resolves it to the shipped default. Refusing it would
+// reject the generated file.
+func TestLinkerBootstrapAcceptsAnOmittedTable(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"omitted": `{"role":"linker","psk":"x","linker":{"overlay_ip":"10.99.0.3","backend_lan":"192.168.1.2"}}`,
+		"zero":    `{"role":"linker","psk":"x","linker":{"overlay_ip":"10.99.0.3","backend_lan":"192.168.1.2","table":0}}`,
+		"chosen":  `{"role":"linker","psk":"x","linker":{"overlay_ip":"10.99.0.3","backend_lan":"192.168.1.2","table":220}}`,
+	} {
+		p := filepath.Join(dir, name+".json")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := model.LoadBootstrap(p); err != nil {
+			t.Errorf("%s: should load, got %v", name, err)
+		}
+	}
+}
