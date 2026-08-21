@@ -23,7 +23,13 @@ var Version = "dev"
 // can never initiate anything toward home - which is also why the tunnels
 // themselves must be brought up from this side with a persistent keepalive.
 func (a *Agent) runControlClient(ctx context.Context) {
-	backoff := dialBackoffMin
+	// Zero, not the floor, and the wait is chosen before it is served rather
+	// than after. Deciding afterwards spends the *previous* session's wait
+	// before the reset can apply, so a backend that had climbed to the ceiling
+	// on a run of failovers still sat out thirty seconds after the next session
+	// that worked - which is the one case this backoff exists to get right.
+	// nextDialBackoff clamps up, so starting from zero still gives 1s, 2s, 4s.
+	var backoff time.Duration
 	for ctx.Err() == nil {
 		started := time.Now()
 		err := a.controlSession(ctx)
@@ -31,6 +37,7 @@ func (a *Agent) runControlClient(ctx context.Context) {
 			return
 		}
 		lasted := time.Since(started)
+		backoff = nextDialBackoff(backoff, lasted)
 		if err != nil {
 			a.log.Warn("control channel down", "err", err,
 				"session", lasted.Round(time.Second), "retry_in", backoff)
@@ -40,7 +47,6 @@ func (a *Agent) runControlClient(ctx context.Context) {
 			return
 		case <-time.After(backoff):
 		}
-		backoff = nextDialBackoff(backoff, lasted)
 	}
 }
 
