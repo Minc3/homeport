@@ -573,7 +573,7 @@ function pathRow(p) {
     el('td', {}, num('', p.shape.to_backend_mbit, (v) => (p.shape.to_backend_mbit = v || 0), { min: 0, step: 1, placeholder: '0 = off' })),
     el('td', {}, num('', p.shape.to_frontend_mbit, (v) => (p.shape.to_frontend_mbit = v || 0), { min: 0, step: 1, placeholder: '0 = off' })),
     el('td', {}, num('', p.quota.reset_day, (v) => (p.quota.reset_day = v), { min: 1, placeholder: '1' })),
-    el('td', {}, field('', p.quota.timezone, (v) => (p.quota.timezone = v), { placeholder: 'Australia/Sydney' })),
+    el('td', {}, field('', p.quota.timezone, (v) => (p.quota.timezone = v), { placeholder: 'Australia/Melbourne' })),
     el('td', {}, num('', p.quota.calibration, (v) => (p.quota.calibration = v), { step: 0.5, placeholder: '100' })),
   );
 }
@@ -797,7 +797,7 @@ function renderSettings() {
         + 'because srcds sends far more than it receives. 0 is off. Needs the sch_cake module, which Debian 12 has: modprobe sch_cake.'),
       th('Reset day', 'Day of the month your carrier\'s billing period starts, 1-31. Months too short for it clamp to the last day. Example: 1.'),
       th('Timezone', 'The zone that reset day is counted in, so the period turns over where the carrier draws it rather than at UTC midnight. '
-        + 'IANA name. Example: Australia/Sydney.'),
+        + 'IANA name, and blank means Australia/Melbourne. Example: Australia/Melbourne.'),
       th('Calibration %', 'Scales the measured figure to match what the carrier actually bills. 100 means trust the tunnel counters plus per-packet overhead. '
         + 'After a month of comparison: if this portal says 50 GB and the carrier says 55, set 110.'),
     )),

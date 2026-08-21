@@ -10,6 +10,12 @@ const (
 	ModeArmed   = "armed"   // apply routing and nftables changes
 )
 
+// DefaultTimezone is the zone a quota's reset day is counted in when the
+// portal is left to choose. A billing period turns over where the carrier
+// draws it, not at UTC midnight, so the shipped value is the deployment's
+// own zone rather than UTC.
+const DefaultTimezone = "Australia/Melbourne"
+
 // Health is what the probes say about a path. It is deliberately separate
 // from policy blocks: a path can be perfectly healthy and still unusable
 // because it blew its quota.
@@ -636,7 +642,7 @@ func Defaults() Config {
 			LimitBytes:        limit,
 			CeilingBytes:      0,
 			ResetDay:          1,
-			Timezone:          "Australia/Sydney",
+			Timezone:          DefaultTimezone,
 			Calibration:       100,
 			OverheadPerPacket: 60,
 		}

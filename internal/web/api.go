@@ -332,7 +332,7 @@ func validate(cfg *model.Config) error {
 			p.Quota.ResetDay = 1
 		}
 		if p.Quota.Timezone == "" {
-			p.Quota.Timezone = "UTC"
+			p.Quota.Timezone = model.DefaultTimezone
 		}
 		if _, err := time.LoadLocation(p.Quota.Timezone); err != nil {
 			return fmt.Errorf("path %s has an unknown timezone %q", p.Name, p.Quota.Timezone)

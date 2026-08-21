@@ -1211,7 +1211,7 @@ Defaults (`model.Defaults()`) match the intended deployment: main/LTE1/LTE2 at
 priorities 1/2/3, tables 101/102/103, marks `0x101`/`0x102`/`0x103`, 250ms
 active and 5s standby probing, 8 losses to condemn (~2s detection), 90s
 failback hold-down, 60 GB and 20 GB quotas resetting on the 1st in
-`Australia/Sydney`, and **observe mode**. The four example services —
+`model.DefaultTimezone` (`Australia/Melbourne`), and **observe mode**. The four example services —
 `27015/udp`, `27020/udp`, `80/tcp`, `443/tcp` — ship **disabled**: a row is a
 DNAT rule, and a fresh install must not publish a port on the strength of
 nobody having deleted it. Arming is when the shipped list would have gone live,
@@ -1362,7 +1362,9 @@ where a subtle regression would be invisible in production until an outage:
   site with none sends nothing.
 - `web/validate_test.go` — a path mark colliding with any of the five the system
   reserves, duplicate marks/tables, contradictory ceilings,
-  unknown timezones.
+  unknown timezones, and a blank timezone taking the deployment's own zone
+  rather than UTC, which would draw the billing boundary ten hours from where
+  the carrier draws it.
 
 When you add behaviour to the selector or the trackers, add a test that states
 the *reason* in its name and comment. The existing ones do; that is how the

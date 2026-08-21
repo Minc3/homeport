@@ -449,9 +449,12 @@ plausible for each service, and a backend that is connected.
 1. Leave it in observe mode for a few days. Watch the portal for paths that
    flap, quota counters moving at a plausible rate, and a decision history that
    matches what actually happened on those links.
-2. Compare the metered figures against your carrier's own portal and adjust the
-   per path **Calibration %** in **Settings, Paths** until they agree.
-3. Arm it, from the portal or from the frontend's shell:
+2. Check **Reset day** and **Timezone** on each metered path in **Settings,
+   Paths** against where your carrier actually draws the billing boundary. The
+   defaults are the 1st, counted in `Australia/Melbourne`.
+3. Compare the metered figures against your carrier's own portal and adjust the
+   per path **Calibration %** in the same table until they agree.
+4. Arm it, from the portal or from the frontend's shell:
 
    ```sh
    failoverctl mode armed

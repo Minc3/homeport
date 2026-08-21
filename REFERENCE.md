@@ -91,7 +91,8 @@ and a genuine alternation cannot cause an endless run of them.
 ## LTE quotas
 
 Per-path monthly allowances (60 GB and 20 GB by default), resetting on a
-configurable day in a configurable timezone.
+configurable day in a configurable timezone, `Australia/Melbourne` unless the
+path says otherwise.
 
 Usage is reconstructed as `payload bytes + packets × 60 × calibration%`,
 because the carrier meters the encapsulated datagram on the WAN rather than the

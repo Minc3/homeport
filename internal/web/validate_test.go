@@ -50,6 +50,20 @@ func TestValidateRejectsUnknownTimezone(t *testing.T) {
 	}
 }
 
+func TestValidateFillsAnEmptyTimezoneWithTheDeploymentsOwn(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Paths[1].Quota.Timezone = ""
+	if err := validate(&cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// A blank field used to become UTC, which draws the billing boundary ten
+	// hours off where the carrier draws it: usage on the first of the month
+	// lands in the previous period and the quota trips days late.
+	if cfg.Paths[1].Quota.Timezone != model.DefaultTimezone {
+		t.Errorf("timezone = %q, want %q", cfg.Paths[1].Quota.Timezone, model.DefaultTimezone)
+	}
+}
+
 func TestValidateNormalisesCalibration(t *testing.T) {
 	cfg := model.Defaults()
 	cfg.Paths[1].Quota.Calibration = 0
