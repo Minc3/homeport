@@ -15,7 +15,7 @@
 # normal arrangement. Install a linker only where the box doing the work is not
 # the box terminating the tunnels.
 #
-# Read deploy/SETUP.md section 10 first - there are two steps this script cannot
+# Read deploy/SETUP.md step 14 first - there are two steps this script cannot
 # do for you, and it prints them at the end.
 #
 # Re-running is safe: the binary and unit are replaced, an existing
@@ -243,7 +243,7 @@ fi
 if command -v docker >/dev/null 2>&1; then
 	echo "  docker present"
 	warn "containers on a bridge network are not yet handled by this agent"
-	warn "  run them with --network host and bind $OVERLAY_IP, or see SETUP.md section 10"
+	warn "  run them with --network host and bind $OVERLAY_IP, or see SETUP.md step 14"
 fi
 
 # ---------------------------------------------------------------------------
@@ -368,7 +368,7 @@ IN THE PORTAL, on the frontend:
   - overlay.subnet must be set in the frontend's and the backend's bootstrap
     files, to $SUBNET. Check the frontend's peers cover the range as well -
     "wg show wg-main allowed-ips" should list it, and a peer that excludes
-    this host drops its traffic in silence. See SETUP.md section 10.
+    this host drops its traffic in silence. See SETUP.md step 14.
 
 This host still does not appear in the portal. A linker reports nothing about
 itself - it has no control channel, so the frontend knows only what you typed.

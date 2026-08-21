@@ -30,7 +30,7 @@ BACKEND_IP=10.99.0.2
 # Derived from the overlay addresses below unless --subnet says otherwise: the
 # /24 they sit in, so the shipped 10.99.0.1 and .2 give 10.99.0.0/24. It must
 # match on every host and be covered by AllowedIPs on the frontend's peers,
-# which the shipped WireGuard setup already is. See SETUP.md section 10.
+# which the shipped WireGuard setup already is. See SETUP.md step 14.
 #
 # Wide by default for the same reason AllowedIPs is: on a site with one host at
 # the far end everything it enables is inert, because nothing holds the other

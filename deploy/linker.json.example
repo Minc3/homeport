@@ -1,5 +1,5 @@
 {
-  "_comment": "Install as /etc/failover/linker.json with mode 0600. Only needed on an extra host behind the backend - most sites never run one. See SETUP.md section 10.",
+  "_comment": "Install as /etc/failover/linker.json with mode 0600. Only needed on an extra host behind the backend - most sites never run one. See SETUP.md step 14.",
 
   "role": "linker",
 

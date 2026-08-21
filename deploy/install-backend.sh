@@ -27,7 +27,7 @@ BACKEND_IP=10.99.0.2
 # Derived from the overlay addresses below unless --subnet says otherwise: the
 # /24 they sit in, so the shipped 10.99.0.1 and .2 give 10.99.0.0/24. It has to
 # be identical to the frontend's - the two ends disagreeing about the range is
-# a fault nothing reports. See SETUP.md section 10.
+# a fault nothing reports. See SETUP.md step 14.
 SUBNET=""
 SUBNET_GIVEN=0
 FORCE_CONFIG=0
