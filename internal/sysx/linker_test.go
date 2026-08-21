@@ -327,3 +327,66 @@ func TestRemoveLinkerRoutingDeletesOnlyItsOwnDefaultRoute(t *testing.T) {
 		}
 	}
 }
+
+// A stray at the *same* priority in another table is still a stray.
+//
+// Two rules may share a priority, and the one this is most likely to meet was
+// pinned there by an earlier run of this same code: change linker.table and the
+// old table's rule sits at exactly the priority the new one wants. Deciding
+// which rule is ours by priority alone calls that stray correct and leaves it
+// claiming the marked packets forever.
+func TestLinkerMarkRuleClearsAStrayAtTheSamePriority(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase + 1)
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 220": pinned + ":\tfrom all fwmark 0x201 lookup 220\n",
+		"ip rule show": pinned + ":\tfrom all fwmark 0x201 lookup 220\n" +
+			pinned + ":\tfrom all fwmark 0x201 lookup 200\n",
+	}}
+	if err := EnsureLinkerMarkRule(context.Background(), f, 220); err != nil {
+		t.Fatalf("EnsureLinkerMarkRule: %v", err)
+	}
+	if !f.ran("ip rule del fwmark 0x201 lookup 200 pref " + pinned) {
+		t.Errorf("the stray in the old table was left behind: %v", f.calls)
+	}
+	if f.ran("ip rule add") {
+		t.Errorf("the rule in this table was already correct and should not have been re-added: %v", f.calls)
+	}
+}
+
+// The same, for the source rule beside it, and with the same reasoning: it was
+// written before tableTokens existed and matched on priority alone.
+func TestLinkerRuleClearsAStrayAtTheSamePriority(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase)
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 220": pinned + ":\tfrom 10.99.0.3 lookup 220\n",
+		"ip rule show": pinned + ":\tfrom 10.99.0.3 lookup 220\n" +
+			pinned + ":\tfrom 10.99.0.3 lookup 200\n",
+	}}
+	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", 220); err != nil {
+		t.Fatalf("EnsureLinkerRule: %v", err)
+	}
+	if !f.ran("ip rule del from 10.99.0.3 lookup 200 pref " + pinned) {
+		t.Errorf("the stray in the old table was left behind: %v", f.calls)
+	}
+}
+
+// A named table is still recognised as this host's own. `ip rule show` prints
+// `lookup isp2` wherever rt_tables names 200, and a readback that only knew the
+// number would treat this agent's own rule as a stray, delete it, and add it
+// again on every tick.
+func TestLinkerRuleRecognisesItsOwnRuleInANamedTable(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase)
+	listing := pinned + ":\tfrom 10.99.0.3 lookup isp2\n"
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 200": listing,
+		"ip rule show":           listing,
+	}}
+	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", 200); err != nil {
+		t.Fatalf("EnsureLinkerRule: %v", err)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, " add ") || strings.Contains(c, " del ") {
+			t.Errorf("a correct rule in a named table was rewritten: %s", c)
+		}
+	}
+}

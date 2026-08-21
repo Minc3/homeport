@@ -68,17 +68,29 @@ func EnsureLinkerRule(ctx context.Context, r Runner, overlayIP string, tbl int) 
 	table := strconv.Itoa(tbl)
 	want := LinkerRulePrefBase
 
-	inMyTable := map[int]bool{}
-	for _, pref := range sourceRulePrefs(mine, overlayIP, "") {
-		inMyTable[pref] = true
-	}
-
+	// Ours is the rule at the pinned priority in this table, matched on both:
+	// see tableTokens for why the priority alone is not enough.
+	mineTokens := tableTokens(mine)
+	strays := make([]sourceRule, 0, 2)
 	correct := false
 	for _, rule := range sourceRuleTables(all, overlayIP) {
-		if rule.pref == want && inMyTable[rule.pref] {
+		if rule.pref == want && mineTokens[rule.table] {
 			correct = true
 			continue
 		}
+		strays = append(strays, rule)
+	}
+	// In place before anything is withdrawn, like every other rule this system
+	// installs. In the gap this host's overlay traffic matches no rule, falls
+	// through to main and leaves by the LAN instead of going to the backend,
+	// which is the failure the rule exists to prevent.
+	if !correct {
+		if _, err := r.Run(ctx, "ip", "rule", "add", "from", overlayIP, "lookup", table,
+			"pref", strconv.Itoa(want)); err != nil {
+			return err
+		}
+	}
+	for _, rule := range strays {
 		// Deleted with the table token exactly as the kernel printed it, and
 		// with the full selector. `ip rule del pref N` alone is not safe: the
 		// local table's rule also lives at priority 0, and deleting that would
@@ -86,12 +98,7 @@ func EnsureLinkerRule(ctx context.Context, r Runner, overlayIP string, tbl int) 
 		_, _ = r.Run(ctx, "ip", "rule", "del", "from", overlayIP,
 			"lookup", rule.table, "pref", strconv.Itoa(rule.pref))
 	}
-	if correct {
-		return nil
-	}
-	_, err = r.Run(ctx, "ip", "rule", "add", "from", overlayIP, "lookup", table,
-		"pref", strconv.Itoa(want))
-	return err
+	return nil
 }
 
 // sourceRule is one `from <addr> lookup <table>` rule, with the table recorded
@@ -170,6 +177,28 @@ func markRuleTables(rules, mark string) []sourceRule {
 	return out
 }
 
+// tableTokens returns every token a per-table listing prints after "lookup".
+//
+// listRulesInTable asks the kernel to filter by number, so whatever those rules
+// print is this table's own name: `isp2` where /etc/iproute2/rt_tables gives it
+// one, the number where it does not. That is what lets a rule found in the
+// *full* listing be told apart from one of ours, which a priority cannot do on
+// its own - two rules may share a priority, and a stray left behind by a change
+// of linker.table sits at exactly the priority ours is pinned to, because the
+// build that installed it pinned it there too.
+func tableTokens(listing string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(listing, "\n") {
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "lookup" && i+1 < len(fields) {
+				out[fields[i+1]] = true
+			}
+		}
+	}
+	return out
+}
+
 // ensureLinkerMarkRule installs one of the linker's mark rules at its pinned
 // priority, and clears the same mark from anywhere else.
 //
@@ -196,14 +225,14 @@ func ensureLinkerMarkRule(ctx context.Context, r Runner, tbl int, mark string, w
 	}
 	table := strconv.Itoa(tbl)
 
-	inMyTable := map[int]bool{}
-	for _, pref := range markRulePrefs(mine, mark, "") {
-		inMyTable[pref] = true
-	}
+	// Ours is the rule at the pinned priority *in this table*. Both halves are
+	// needed: the priority alone would call a stray in another table correct,
+	// and leave it there for as long as the two agreed on a number.
+	mineTokens := tableTokens(mine)
 	strays := make([]sourceRule, 0, 2)
 	correct := false
 	for _, rule := range markRuleTables(all, mark) {
-		if rule.pref == want && inMyTable[rule.pref] {
+		if rule.pref == want && mineTokens[rule.table] {
 			correct = true
 			continue
 		}

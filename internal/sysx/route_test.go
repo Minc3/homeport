@@ -17,20 +17,36 @@ type fakeRunner struct {
 	fail    map[string]string
 }
 
+// Run answers from the canned table, longest matching prefix first.
+//
+// Longest rather than first, because Go's map iteration order is random and the
+// keys a test needs are routinely prefixes of one another: "ip rule show" is a
+// prefix of "ip rule show table 220", and a readback that reads both listings
+// would otherwise get whichever the runtime picked that second. The specific
+// key is always the one the test meant.
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
 	line := name + " " + strings.Join(args, " ")
 	f.calls = append(f.calls, line)
-	for prefix, msg := range f.fail {
-		if strings.HasPrefix(line, prefix) {
-			return msg, fmt.Errorf("%s: %s", line, msg)
-		}
+	if prefix, ok := longestPrefix(f.fail, line); ok {
+		return f.fail[prefix], fmt.Errorf("%s: %s", line, f.fail[prefix])
 	}
-	for prefix, out := range f.replies {
-		if strings.HasPrefix(line, prefix) {
-			return out, nil
-		}
+	if prefix, ok := longestPrefix(f.replies, line); ok {
+		return f.replies[prefix], nil
 	}
 	return "", nil
+}
+
+func longestPrefix(m map[string]string, line string) (string, bool) {
+	best, found := "", false
+	for prefix := range m {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		if !found || len(prefix) > len(best) {
+			best, found = prefix, true
+		}
+	}
+	return best, found
 }
 
 func (f *fakeRunner) Applying() bool { return true }
