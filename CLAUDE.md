@@ -1325,7 +1325,11 @@ where a subtle regression would be invisible in production until an outage:
   that a table abandoned by a change of `linker.table` is relieved of this
   system's `default via <backend>` when its stray rule is swept, on ensure and
   on revert, gateway-qualified so a default the operator has put back is never
-  the one removed.
+  the one removed — with the route deleted *before* the rule, and the rule
+  kept whenever the table could not be confirmed clean. The stray rule is the
+  only evidence the table was ever this system's, so it is the marker the next
+  reconcile tick retries from; deleting it first would turn any failure in the
+  gap into a permanent, invisible misroute.
 - `agent/revert_test.go` — the backend takes down what it installed: both return
   sources, the mark rule, the marking and egress tables, the routes to extra
   hosts, the probe tables and the overlay route; that it deletes table 100's

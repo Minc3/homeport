@@ -59,12 +59,7 @@ func EnsureLinkerRule(ctx context.Context, r Runner, overlayIP, backendLAN strin
 	if overlayIP == "" {
 		return fmt.Errorf("no overlay address configured")
 	}
-	strayTables, err := ensurePinnedRule(ctx, r, tbl, "from", overlayIP, LinkerRulePrefBase, true)
-	if err != nil {
-		return err
-	}
-	removeStaleLinkerDefaults(ctx, r, backendLAN, strayTables)
-	return nil
+	return ensurePinnedRule(ctx, r, tbl, "from", overlayIP, LinkerRulePrefBase, true, backendLAN)
 }
 
 // sourceRule is one policy rule, with the table recorded exactly as printed so
@@ -163,17 +158,20 @@ func tableTokens(listing string) map[string]bool {
 // backend: a dropped answer to a real client rather than a slow one. Same
 // ordering, and the same reason, as ensureProbeRoute.
 //
-// Returns the printed table tokens of the swept strays, minus the configured
-// table's own: each is a table this system stopped using, and may still hold
-// its default route.
-func ensurePinnedRule(ctx context.Context, r Runner, tbl int, key, value string, want int, ownAnyTable bool) ([]string, error) {
+// A stray pointing at another table marks that table as one this system
+// stopped using, and it may still hold our default route. backendLAN is what
+// lets cleanAbandonedTable take that route out - and the rule is withdrawn
+// only once the table is confirmed clean, because the rule is the only
+// evidence the table was ever ours. See cleanAbandonedTable for why the order
+// is load-bearing.
+func ensurePinnedRule(ctx context.Context, r Runner, tbl int, key, value string, want int, ownAnyTable bool, backendLAN string) error {
 	mine, err := listRulesInTable(ctx, r, tbl)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	all, err := listRules(ctx, r)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	table := strconv.Itoa(tbl)
 
@@ -198,12 +196,16 @@ func ensurePinnedRule(ctx context.Context, r Runner, tbl int, key, value string,
 	if !correct {
 		if _, err := r.Run(ctx, "ip", "rule", "add", key, value, "lookup", table,
 			"pref", strconv.Itoa(want)); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	var strayTables []string
-	seen := map[string]bool{}
 	for _, rule := range strays {
+		// A stray in another table is kept until that table is confirmed
+		// relieved of our default route: it is the marker the next tick needs
+		// to try again.
+		if !mineTokens[rule.table] && !cleanAbandonedTable(ctx, r, backendLAN, rule.table) {
+			continue
+		}
 		// Deleted with the table token exactly as the kernel printed it, and
 		// with the full selector. A host that has named the table in rt_tables
 		// prints the name, and the number is still accepted, but the name is
@@ -212,12 +214,8 @@ func ensurePinnedRule(ctx context.Context, r Runner, tbl int, key, value string,
 		// that would take the host's own address resolution with it.
 		_, _ = r.Run(ctx, "ip", "rule", "del", key, value, "lookup", rule.table,
 			"pref", strconv.Itoa(rule.pref))
-		if !mineTokens[rule.table] && !seen[rule.table] {
-			seen[rule.table] = true
-			strayTables = append(strayTables, rule.table)
-		}
 	}
-	return strayTables, nil
+	return nil
 }
 
 // removePinnedRule withdraws one of the linker's rules wherever it is found,
@@ -229,10 +227,11 @@ func ensurePinnedRule(ctx context.Context, r Runner, tbl int, key, value string,
 //
 // The whole listing rather than this table's, because the rule left behind by a
 // change of linker.table points at the old one, and a revert that looked only
-// at the configured table would leave it behind. Returns the stray tables, as
-// ensurePinnedRule does, so the caller can take this system's default route out
-// of them too.
-func removePinnedRule(ctx context.Context, r Runner, tbl int, key, value string, want int, ownAnyTable bool) []string {
+// at the configured table would leave it behind. Strays in other tables get the
+// same route cleanup, and the same ordering, as on the ensure path: a rule this
+// could not finish cleaning up after is deliberately left, because it is the
+// only marker of where our route still sits.
+func removePinnedRule(ctx context.Context, r Runner, tbl int, key, value string, want int, ownAnyTable bool, backendLAN string) {
 	table := strconv.Itoa(tbl)
 	mineTokens := map[string]bool{table: true}
 	if mine, err := listRulesInTable(ctx, r, tbl); err == nil {
@@ -241,21 +240,21 @@ func removePinnedRule(ctx context.Context, r Runner, tbl int, key, value string,
 		}
 	}
 	found := 0
-	var strayTables []string
-	seen := map[string]bool{}
 	if all, err := listRules(ctx, r); err == nil {
 		for _, rule := range selectorRules(all, key, value) {
 			if !ownAnyTable && !mineTokens[rule.table] && rule.pref != want {
 				// Not provably this system's: see ensurePinnedRule.
 				continue
 			}
+			// Counted whether or not it is deleted below: a rule kept as the
+			// marker of an uncleaned table must also keep the backstop from
+			// firing, or the backstop deletes it by selector.
 			found++
+			if !mineTokens[rule.table] && !cleanAbandonedTable(ctx, r, backendLAN, rule.table) {
+				continue
+			}
 			_, _ = r.Run(ctx, "ip", "rule", "del", key, value, "lookup", rule.table,
 				"pref", strconv.Itoa(rule.pref))
-			if !mineTokens[rule.table] && !seen[rule.table] {
-				seen[rule.table] = true
-				strayTables = append(strayTables, rule.table)
-			}
 		}
 	}
 	// A backstop for a listing that could not be read. The selector alone is
@@ -264,28 +263,45 @@ func removePinnedRule(ctx context.Context, r Runner, tbl int, key, value string,
 	if found == 0 {
 		_, _ = r.Run(ctx, "ip", "rule", "del", key, value, "lookup", table)
 	}
-	return strayTables
 }
 
-// removeStaleLinkerDefaults deletes this system's default route from tables it
-// has stopped using - the tables that provably-ours stray rules were found
-// pointing at.
+// cleanAbandonedTable relieves a table this system stopped using of its
+// `default via <backend>`, and reports whether the stray rule pointing at it
+// may now be withdrawn.
 //
-// Without this, a change of linker.table moved the rules and left `default via
-// <backend>` sitting in the old table forever - and on the host the
-// configurable table exists for, that table is the host's own, with the host's
-// own rules still pointing at it, so its traffic kept going to the backend
-// with nothing anywhere reporting it. Qualified by the gateway for the same
-// reason as in RemoveLinkerRouting: if the operator has already put their own
-// default back, the delete simply fails, and a default this system did not
-// install is never touched.
-func removeStaleLinkerDefaults(ctx context.Context, r Runner, backendLAN string, tables []string) {
+// Without this, a change of linker.table moved the rules and left the route
+// sitting in the old table forever - and on the host the configurable table
+// exists for, that table is the host's own, with the host's own rules still
+// pointing at it, so its traffic kept going to the backend with nothing
+// anywhere reporting it. Qualified by the gateway for the same reason as in
+// RemoveLinkerRouting: a default the operator has since put back, or one this
+// system never installed, is not ours to delete.
+//
+// The order against the rule delete is load-bearing. The stray rule is the
+// only evidence the table was ever this system's - once it is gone, nothing
+// can tell our leftover default from the host's own routing, so nothing may
+// ever try again. Deleting the rule first therefore turns any failure here -
+// the agent killed between the two deletes, a transient `ip route del` error -
+// into the permanent misroute this cleanup exists to fix. So the route goes
+// first, the answer is read back rather than assumed, and on any failure the
+// caller keeps the rule as the marker the next reconcile tick retries from. A
+// revert has no next tick, but the same answer holds: a rule left standing
+// beside our route is a visible leftover, an orphaned route alone is an
+// invisible one.
+func cleanAbandonedTable(ctx context.Context, r Runner, backendLAN, table string) bool {
 	if backendLAN == "" {
-		return
+		return true
 	}
-	for _, tbl := range tables {
-		_, _ = r.Run(ctx, "ip", "route", "del", "default", "via", backendLAN, "table", tbl)
+	out, err := r.Run(ctx, "ip", "route", "show", "default", "table", table)
+	if err != nil {
+		return false
 	}
+	if gatewayFrom(out) != backendLAN {
+		// No default left, or one the host owns: nothing of ours to clean.
+		return true
+	}
+	_, err = r.Run(ctx, "ip", "route", "del", "default", "via", backendLAN, "table", table)
+	return err == nil
 }
 
 // EnsureLinkerRoute points the linker's table at the backend.
@@ -336,11 +352,10 @@ func RemoveLinkerRouting(ctx context.Context, r Runner, overlayIP, backendLAN st
 	// Wherever the rule is found, not only in the configured table: the source
 	// selector proves ownership on its own, and a change of linker.table
 	// leaves the old table's rule behind where a filtered listing would never
-	// show it. Each stray's table is then also relieved of this system's
-	// default route, gateway-qualified for the reason below - the same pairing
-	// the ensure path does on every tick.
-	strayTables := removePinnedRule(ctx, r, tbl, "from", overlayIP, LinkerRulePrefBase, true)
-	removeStaleLinkerDefaults(ctx, r, backendLAN, strayTables)
+	// show it. Each stray's table is also relieved of this system's default
+	// route on the way, gateway-qualified for the reason below - the same
+	// pairing, in the same order, as the ensure path on every tick.
+	removePinnedRule(ctx, r, tbl, "from", overlayIP, LinkerRulePrefBase, true, backendLAN)
 
 	// The default route by name, never a flush. This table belongs to the host
 	// rather than to this system, and 200 is the number the first real
@@ -531,16 +546,15 @@ func ApplyLinkerReturnRuleset(ctx context.Context, r Runner, stateDir, ruleset s
 // The companion to the source rule, not a replacement for it: a service bound
 // to the overlay address on the host itself is still matched by source, and
 // costs no connection tracking to route.
-func EnsureLinkerMarkRule(ctx context.Context, r Runner, tbl int) error {
-	_, err := ensurePinnedRule(ctx, r, tbl, "fwmark",
-		fmt.Sprintf("0x%x", LinkerReturnMark), LinkerRulePrefBase+1, false)
-	return err
+func EnsureLinkerMarkRule(ctx context.Context, r Runner, backendLAN string, tbl int) error {
+	return ensurePinnedRule(ctx, r, tbl, "fwmark",
+		fmt.Sprintf("0x%x", LinkerReturnMark), LinkerRulePrefBase+1, false, backendLAN)
 }
 
 // RemoveLinkerReturnRuleset takes down the marking table and its rule.
-func RemoveLinkerReturnRuleset(ctx context.Context, r Runner, tbl int) {
+func RemoveLinkerReturnRuleset(ctx context.Context, r Runner, backendLAN string, tbl int) {
 	removePinnedRule(ctx, r, tbl, "fwmark",
-		fmt.Sprintf("0x%x", LinkerReturnMark), LinkerRulePrefBase+1, false)
+		fmt.Sprintf("0x%x", LinkerReturnMark), LinkerRulePrefBase+1, false, backendLAN)
 	_, _ = r.Run(ctx, "nft", "delete", "table", "ip", NFTLinkerReturnTable)
 }
 
@@ -610,17 +624,16 @@ func ApplyLinkerEgressRuleset(ctx context.Context, r Runner, stateDir, ruleset s
 
 // RemoveLinkerEgressRuleset takes it down again, for when the last network is
 // removed from the portal or the feature is switched off.
-func RemoveLinkerEgressRuleset(ctx context.Context, r Runner, tbl int) {
+func RemoveLinkerEgressRuleset(ctx context.Context, r Runner, backendLAN string, tbl int) {
 	removePinnedRule(ctx, r, tbl, "fwmark",
-		fmt.Sprintf("0x%x", LinkerEgressMark), LinkerRulePrefBase+2, false)
+		fmt.Sprintf("0x%x", LinkerEgressMark), LinkerRulePrefBase+2, false, backendLAN)
 	_, _ = r.Run(ctx, "nft", "delete", "table", "ip", NFTLinkerEgressTable)
 }
 
 // EnsureLinkerEgressRule routes marked egress traffic to the linker's table.
-func EnsureLinkerEgressRule(ctx context.Context, r Runner, tbl int) error {
-	_, err := ensurePinnedRule(ctx, r, tbl, "fwmark",
-		fmt.Sprintf("0x%x", LinkerEgressMark), LinkerRulePrefBase+2, false)
-	return err
+func EnsureLinkerEgressRule(ctx context.Context, r Runner, backendLAN string, tbl int) error {
+	return ensurePinnedRule(ctx, r, tbl, "fwmark",
+		fmt.Sprintf("0x%x", LinkerEgressMark), LinkerRulePrefBase+2, false, backendLAN)
 }
 
 // LanIfaceTo reports which interface this host reaches an address through.

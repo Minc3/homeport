@@ -169,7 +169,7 @@ func (l *Linker) applyEgress(ctx context.Context, cidrs []string) {
 // out so applyEgress has exactly one success path to commit on.
 func (l *Linker) installEgress(ctx context.Context, cidrs []string) error {
 	if len(cidrs) == 0 {
-		sysx.RemoveLinkerEgressRuleset(ctx, l.runner, l.table())
+		sysx.RemoveLinkerEgressRuleset(ctx, l.runner, l.boot.Linker.BackendLAN, l.table())
 		return nil
 	}
 
@@ -190,7 +190,7 @@ func (l *Linker) installEgress(ctx context.Context, cidrs []string) error {
 	if _, err := sysx.ApplyLinkerEgressRuleset(ctx, l.runner, l.boot.StateDir, ruleset); err != nil {
 		return fmt.Errorf("load the egress source NAT: %w", err)
 	}
-	if err := sysx.EnsureLinkerEgressRule(ctx, l.runner, l.table()); err != nil {
+	if err := sysx.EnsureLinkerEgressRule(ctx, l.runner, l.boot.Linker.BackendLAN, l.table()); err != nil {
 		return fmt.Errorf("install the egress mark rule: %w", err)
 	}
 	return nil
@@ -253,7 +253,7 @@ func (l *Linker) apply(ctx context.Context) {
 		l.log.Error("cannot install return marking; containerised services published here will time out",
 			"err", err)
 	}
-	if err := sysx.EnsureLinkerMarkRule(ctx, l.runner, l.table()); err != nil {
+	if err := sysx.EnsureLinkerMarkRule(ctx, l.runner, li.BackendLAN, l.table()); err != nil {
 		l.log.Error("cannot install the return mark rule", "err", err)
 	}
 
@@ -286,7 +286,7 @@ func (l *Linker) reconcile(ctx context.Context) {
 	if err := sysx.EnsureLinkerRule(ctx, l.runner, li.OverlayIP, li.BackendLAN, l.table()); err != nil {
 		l.log.Error("overlay policy rule missing and could not be restored", "err", err)
 	}
-	if err := sysx.EnsureLinkerMarkRule(ctx, l.runner, l.table()); err != nil {
+	if err := sysx.EnsureLinkerMarkRule(ctx, l.runner, li.BackendLAN, l.table()); err != nil {
 		l.log.Error("return mark rule missing and could not be restored", "err", err)
 	}
 
@@ -325,8 +325,8 @@ func (l *Linker) reconcile(ctx context.Context) {
 // to the backend. The result is a host that is half reverted and says it is
 // clean.
 func (l *Linker) Revert(ctx context.Context) {
-	sysx.RemoveLinkerEgressRuleset(ctx, l.runner, l.table())
-	sysx.RemoveLinkerReturnRuleset(ctx, l.runner, l.table())
+	sysx.RemoveLinkerEgressRuleset(ctx, l.runner, l.boot.Linker.BackendLAN, l.table())
+	sysx.RemoveLinkerReturnRuleset(ctx, l.runner, l.boot.Linker.BackendLAN, l.table())
 	sysx.RemoveLinkerRouting(ctx, l.runner, l.boot.Linker.OverlayIP, l.boot.Linker.BackendLAN, l.table())
 	l.log.Warn("removed the overlay policy rule and table",
 		"note", "the overlay address is left in place; anything bound to it is still listening",

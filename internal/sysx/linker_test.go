@@ -230,7 +230,7 @@ func TestLinkerMarkRuleIsMovedToItsPinnedPriority(t *testing.T) {
 		"ip rule show table 200": "31000:\tfrom all fwmark 0x201 lookup 200\n",
 		"ip rule show":           "31000:\tfrom all fwmark 0x201 lookup 200\n",
 	}}
-	if err := EnsureLinkerMarkRule(context.Background(), f, 200); err != nil {
+	if err := EnsureLinkerMarkRule(context.Background(), f, "192.168.1.2", 200); err != nil {
 		t.Fatalf("EnsureLinkerMarkRule: %v", err)
 	}
 	want := "ip rule add fwmark 0x201 lookup 200 pref " + strconv.Itoa(LinkerRulePrefBase+1)
@@ -255,7 +255,7 @@ func TestLinkerMarkRuleClearsARuleLeftInAnotherTable(t *testing.T) {
 		"ip rule show table 220": "",
 		"ip rule show":           "32401:\tfrom all fwmark 0x201 lookup 200\n",
 	}}
-	if err := EnsureLinkerMarkRule(context.Background(), f, 220); err != nil {
+	if err := EnsureLinkerMarkRule(context.Background(), f, "192.168.1.2", 220); err != nil {
 		t.Fatalf("EnsureLinkerMarkRule: %v", err)
 	}
 	if !f.ran("ip rule add fwmark 0x201 lookup 220 pref " + strconv.Itoa(LinkerRulePrefBase+1)) {
@@ -275,7 +275,7 @@ func TestLinkerMarkRuleLeavesAnIntactRuleAlone(t *testing.T) {
 		"ip rule show table 200": listing,
 		"ip rule show":           listing,
 	}}
-	if err := EnsureLinkerEgressRule(context.Background(), f, 200); err != nil {
+	if err := EnsureLinkerEgressRule(context.Background(), f, "192.168.1.2", 200); err != nil {
 		t.Fatalf("EnsureLinkerEgressRule: %v", err)
 	}
 	for _, c := range f.calls {
@@ -300,7 +300,7 @@ func TestRemoveLinkerRulesetsDeleteByPriority(t *testing.T) {
 			"31000:\tfrom all fwmark 0x201 lookup 200\n" +
 			"32401:\tfrom all fwmark 0x201 lookup isp2\n",
 	}}
-	RemoveLinkerReturnRuleset(context.Background(), f, 200)
+	RemoveLinkerReturnRuleset(context.Background(), f, "192.168.1.2", 200)
 	for _, want := range []string{
 		"ip rule del fwmark 0x201 lookup 200 pref 32401",
 		"ip rule del fwmark 0x201 lookup 200 pref 31000",
@@ -318,7 +318,7 @@ func TestRemoveLinkerRulesetsDeleteByPriority(t *testing.T) {
 // arbitrary match, which is worth more than leaving the rule in place.
 func TestRemoveLinkerRulesetsFallBackToTheSelector(t *testing.T) {
 	f := &fakeRunner{}
-	RemoveLinkerEgressRuleset(context.Background(), f, 200)
+	RemoveLinkerEgressRuleset(context.Background(), f, "192.168.1.2", 200)
 	if !f.ran("ip rule del fwmark 0x301 lookup 200") {
 		t.Errorf("nothing was withdrawn when the listing came back empty: %v", f.calls)
 	}
@@ -362,7 +362,7 @@ func TestLinkerMarkRuleClearsAStrayAtTheSamePriority(t *testing.T) {
 		"ip rule show": pinned + ":\tfrom all fwmark 0x201 lookup 220\n" +
 			pinned + ":\tfrom all fwmark 0x201 lookup 200\n",
 	}}
-	if err := EnsureLinkerMarkRule(context.Background(), f, 220); err != nil {
+	if err := EnsureLinkerMarkRule(context.Background(), f, "192.168.1.2", 220); err != nil {
 		t.Fatalf("EnsureLinkerMarkRule: %v", err)
 	}
 	if !f.ran("ip rule del fwmark 0x201 lookup 200 pref " + pinned) {
@@ -381,6 +381,7 @@ func TestLinkerRuleClearsAStrayAtTheSamePriority(t *testing.T) {
 		"ip rule show table 220": pinned + ":\tfrom 10.99.0.3 lookup 220\n",
 		"ip rule show": pinned + ":\tfrom 10.99.0.3 lookup 220\n" +
 			pinned + ":\tfrom 10.99.0.3 lookup 200\n",
+		"ip route show default table 200": "default via 192.168.1.2 dev eth0",
 	}}
 	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", "192.168.1.2", 220); err != nil {
 		t.Fatalf("EnsureLinkerRule: %v", err)
@@ -396,6 +397,83 @@ func TestLinkerRuleClearsAStrayAtTheSamePriority(t *testing.T) {
 	// a default the operator has since put back is never the one removed.
 	if !f.ran("ip route del default via 192.168.1.2 table 200") {
 		t.Errorf("the abandoned table kept this system's default route: %v", f.calls)
+	}
+	// And the route goes before the rule: the rule is the only evidence the
+	// table was ever ours, so it must be the last thing standing.
+	if f.index("ip route del default via 192.168.1.2 table 200") >
+		f.index("ip rule del from 10.99.0.3 lookup 200 pref "+pinned) {
+		t.Errorf("the marker rule was deleted before its table was cleaned: %v", f.calls)
+	}
+}
+
+// A stray whose table could not be cleaned is deliberately kept. It is the only
+// evidence the table was ever this system's: with the rule gone, nothing can
+// tell our leftover default from the host's own routing, so a failure here -
+// the agent killed between the two deletes, a transient `ip route del` error -
+// would otherwise turn into the permanent misroute the cleanup exists to fix.
+// The kept rule is what the next reconcile tick retries from.
+func TestAStrayIsKeptWhileItsTableStillHoldsOurRoute(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase)
+	f := &fakeRunner{
+		replies: map[string]string{
+			"ip rule show table 220": pinned + ":\tfrom 10.99.0.3 lookup 220\n",
+			"ip rule show": pinned + ":\tfrom 10.99.0.3 lookup 220\n" +
+				pinned + ":\tfrom 10.99.0.3 lookup 200\n",
+			"ip route show default table 200": "default via 192.168.1.2 dev eth0",
+		},
+		fail: map[string]string{
+			"ip route del default via 192.168.1.2 table 200": "RTNETLINK answers: Operation not permitted",
+		},
+	}
+	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", "192.168.1.2", 220); err != nil {
+		t.Fatalf("EnsureLinkerRule: %v", err)
+	}
+	if f.ran("ip rule del from 10.99.0.3 lookup 200") {
+		t.Errorf("the marker rule was deleted although its table still holds our route: %v", f.calls)
+	}
+}
+
+// The same when the table cannot even be read: not knowing whether our route is
+// still there is a reason to keep the marker, not to discard it.
+func TestAStrayIsKeptWhileItsTableCannotBeRead(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase)
+	f := &fakeRunner{
+		replies: map[string]string{
+			"ip rule show table 220": pinned + ":\tfrom 10.99.0.3 lookup 220\n",
+			"ip rule show": pinned + ":\tfrom 10.99.0.3 lookup 220\n" +
+				pinned + ":\tfrom 10.99.0.3 lookup 200\n",
+		},
+		fail: map[string]string{
+			"ip route show default table 200": "Error: ipv4: FIB table does not exist.",
+		},
+	}
+	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", "192.168.1.2", 220); err != nil {
+		t.Fatalf("EnsureLinkerRule: %v", err)
+	}
+	if f.ran("ip rule del from 10.99.0.3 lookup 200") {
+		t.Errorf("the marker rule was deleted although its table could not be read: %v", f.calls)
+	}
+}
+
+// An abandoned table holding somebody else's default - the operator noticed and
+// put theirs back - has nothing of ours left in it: the rule goes, the route
+// stays.
+func TestAStrayGoesWhenItsTableHoldsTheOperatorsDefault(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase)
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 220": pinned + ":\tfrom 10.99.0.3 lookup 220\n",
+		"ip rule show": pinned + ":\tfrom 10.99.0.3 lookup 220\n" +
+			pinned + ":\tfrom 10.99.0.3 lookup 200\n",
+		"ip route show default table 200": "default via 10.0.0.1 dev eth1",
+	}}
+	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", "192.168.1.2", 220); err != nil {
+		t.Fatalf("EnsureLinkerRule: %v", err)
+	}
+	if !f.ran("ip rule del from 10.99.0.3 lookup 200 pref " + pinned) {
+		t.Errorf("the stray was kept although its table holds nothing of ours: %v", f.calls)
+	}
+	if f.ran("ip route del") {
+		t.Errorf("a default this system did not install was deleted: %v", f.calls)
 	}
 }
 
@@ -434,7 +512,7 @@ func TestLinkerMarkRuleLeavesTheHostsOwnRuleAlone(t *testing.T) {
 		"ip rule show": pinned + ":\tfrom all fwmark 0x201 lookup 200\n" +
 			"1000:\tfrom all fwmark 0x201 lookup vpn\n",
 	}}
-	if err := EnsureLinkerMarkRule(context.Background(), f, 200); err != nil {
+	if err := EnsureLinkerMarkRule(context.Background(), f, "192.168.1.2", 200); err != nil {
 		t.Fatalf("EnsureLinkerMarkRule: %v", err)
 	}
 	for _, c := range f.calls {
@@ -453,7 +531,7 @@ func TestRemoveLinkerRulesetsLeaveTheHostsOwnRuleAlone(t *testing.T) {
 		"ip rule show": pinned + ":\tfrom all fwmark 0x201 lookup 200\n" +
 			"1000:\tfrom all fwmark 0x201 lookup vpn\n",
 	}}
-	RemoveLinkerReturnRuleset(context.Background(), f, 200)
+	RemoveLinkerReturnRuleset(context.Background(), f, "192.168.1.2", 200)
 	if !f.ran("ip rule del fwmark 0x201 lookup 200 pref " + pinned) {
 		t.Errorf("this system's own rule was left behind: %v", f.calls)
 	}
@@ -474,6 +552,7 @@ func TestRemoveLinkerRoutingSweepsTheAbandonedTable(t *testing.T) {
 		"ip rule show table 220": pinned + ":\tfrom 10.99.0.3 lookup 220\n",
 		"ip rule show": pinned + ":\tfrom 10.99.0.3 lookup 220\n" +
 			pinned + ":\tfrom 10.99.0.3 lookup isp2\n",
+		"ip route show default table isp2": "default via 192.168.1.2 dev eth0",
 	}}
 	RemoveLinkerRouting(context.Background(), f, "10.99.0.3", "192.168.1.2", 220)
 	if !f.ran("ip rule del from 10.99.0.3 lookup isp2 pref " + pinned) {
