@@ -23,24 +23,62 @@ var Version = "dev"
 // can never initiate anything toward home - which is also why the tunnels
 // themselves must be brought up from this side with a persistent keepalive.
 func (a *Agent) runControlClient(ctx context.Context) {
-	backoff := time.Second
+	backoff := dialBackoffMin
 	for ctx.Err() == nil {
+		started := time.Now()
 		err := a.controlSession(ctx)
 		if ctx.Err() != nil {
 			return
 		}
+		lasted := time.Since(started)
 		if err != nil {
-			a.log.Warn("control channel down", "err", err, "retry_in", backoff)
+			a.log.Warn("control channel down", "err", err,
+				"session", lasted.Round(time.Second), "retry_in", backoff)
 		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
+		backoff = nextDialBackoff(backoff, lasted)
 	}
+}
+
+// Bounds on the wait between control-channel dials.
+const (
+	dialBackoffMin = time.Second
+	dialBackoffMax = 30 * time.Second
+
+	// sessionSettled is how long a session must last to count as one that
+	// worked. Authentication and the first push are done inside a second, so
+	// anything past a minute is a channel that was up and then went, rather
+	// than one that never came up.
+	sessionSettled = time.Minute
+)
+
+// nextDialBackoff is the wait after a session that lasted this long, given the
+// wait that preceded it.
+//
+// A session that stayed up resets it. Without that the backoff only ever grows,
+// and it has nothing to do with whether the frontend is reachable: every
+// failover drops the TCP connection, so after five or six of them the backend
+// waits the full thirty seconds before redialling for the rest of the process's
+// life. Nothing is lost while it waits, usage buffers to disk and the routing
+// decision rides on the probes, but the portal reports the backend unreachable
+// for half a minute after each switch and a mode change takes that much longer
+// to reach it.
+func nextDialBackoff(previous, sessionFor time.Duration) time.Duration {
+	if sessionFor >= sessionSettled {
+		return dialBackoffMin
+	}
+	next := previous * 2
+	if next > dialBackoffMax {
+		next = dialBackoffMax
+	}
+	if next < dialBackoffMin {
+		next = dialBackoffMin
+	}
+	return next
 }
 
 func (a *Agent) controlSession(ctx context.Context) error {
