@@ -175,8 +175,17 @@ func TestRevertLeavesTheOverlayAddressAlone(t *testing.T) {
 	if !strings.Contains(joined, "ip rule del from 10.99.0.3 lookup 200") {
 		t.Errorf("revert should remove the policy rule, calls were %v", f.calls)
 	}
-	if !strings.Contains(joined, "ip route flush table 200") {
-		t.Errorf("revert should empty the overlay table, calls were %v", f.calls)
+	// By name, never a flush. The table number belongs to the host and not to
+	// this system: the first real deployment landed on a machine already using
+	// 200 for a second ISP, and a flush would have deleted that machine's own
+	// routing while reporting a clean revert.
+	if !strings.Contains(joined, "ip route del default table 200") {
+		t.Errorf("revert should remove the default route it installed, calls were %v", f.calls)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "route flush") {
+			t.Errorf("revert flushed a table it does not own: %s", c)
+		}
 	}
 	if strings.Contains(joined, "addr del") || strings.Contains(joined, "link delete") {
 		t.Errorf("revert must not remove the overlay address: %v", f.calls)

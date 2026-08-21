@@ -72,8 +72,18 @@ func TestBackendRevertDeletesTheDefaultRouteRatherThanFlushingTheTable(t *testin
 	a.Revert(context.Background())
 
 	for _, c := range q.writes() {
-		if strings.Contains(c, "route flush table 100") {
-			t.Errorf("revert flushed the return table, taking any of the host's own routes with it: %s", c)
+		if strings.Contains(c, "route flush") {
+			t.Errorf("revert flushed a table it does not own, taking any of the host's own routes with it: %s", c)
+		}
+	}
+	// The probe tables are the same promise: they hold one route each, and it
+	// goes by name.
+	for _, want := range []string{
+		"ip route del 10.99.0.1/32 table 101",
+		"ip route del 10.99.0.1/32 table 102",
+	} {
+		if q.wrote(want) == 0 {
+			t.Errorf("revert left %q behind; writes were %v", want, q.writes())
 		}
 	}
 }

@@ -805,7 +805,7 @@ func (a *Agent) Revert(ctx context.Context) {
 	// always, and the overlay range wherever a subnet is configured.
 	sysx.RemoveReturnRoutes(ctx, r, cfg.Overlay.BackendIP, cfg.Overlay.Subnet)
 	sysx.RemoveOverlayLocalRule(ctx, r, cfg.Overlay.Subnet)
-	sysx.RemoveProbeRoutes(ctx, r, paths, cfg.Overlay.FrontendIP+"/32")
+	sysx.RemoveProbeRoutes(ctx, r, paths, cfg.Overlay.FrontendIP+"/32", cfg.Overlay.FrontendIP+"/32")
 
 	a.log.Warn("reverted all system changes on the backend",
 		"note", "the WireGuard tunnels and the overlay address are left in place; "+

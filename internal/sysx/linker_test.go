@@ -218,3 +218,88 @@ func (r *recordRunner) Run(_ context.Context, name string, args ...string) (stri
 }
 
 func (r *recordRunner) Applying() bool { return true }
+
+// The mark rules are pinned like every other rule this package installs.
+//
+// Both of these used to accept a rule at any priority: if one was there at all,
+// the agent was satisfied. That is invariant 3 with one side pinned and the
+// other left wherever the kernel happened to put it, next to a source rule that
+// selects the same packets.
+func TestLinkerMarkRuleIsMovedToItsPinnedPriority(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 200": "31000:\tfrom all fwmark 0x201 lookup 200\n",
+		"ip rule show":           "31000:\tfrom all fwmark 0x201 lookup 200\n",
+	}}
+	if err := EnsureLinkerMarkRule(context.Background(), f, 200); err != nil {
+		t.Fatalf("EnsureLinkerMarkRule: %v", err)
+	}
+	want := "ip rule add fwmark 0x201 lookup 200 pref " + strconv.Itoa(LinkerRulePrefBase+1)
+	if !f.ran(want) {
+		t.Errorf("the rule was not installed at its pinned priority: %v", f.calls)
+	}
+	if !f.ran("ip rule del fwmark 0x201 lookup 200 pref 31000") {
+		t.Errorf("the rule at the old priority was left behind: %v", f.calls)
+	}
+	// Added before the stray goes: in the gap a marked reply falls through to
+	// main and leaves by the LAN instead of going to the backend.
+	if f.index(want) > f.index("ip rule del fwmark 0x201 lookup 200 pref 31000") {
+		t.Errorf("the stray was removed before the replacement went in: %v", f.calls)
+	}
+}
+
+// Changing linker.table leaves the old table's rule behind, and it is not
+// inert: it still claims the marked packets and sends them to a table whose
+// route nothing maintains any more.
+func TestLinkerMarkRuleClearsARuleLeftInAnotherTable(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 220": "",
+		"ip rule show":           "32401:\tfrom all fwmark 0x201 lookup 200\n",
+	}}
+	if err := EnsureLinkerMarkRule(context.Background(), f, 220); err != nil {
+		t.Fatalf("EnsureLinkerMarkRule: %v", err)
+	}
+	if !f.ran("ip rule add fwmark 0x201 lookup 220 pref " + strconv.Itoa(LinkerRulePrefBase+1)) {
+		t.Errorf("the rule was not installed in the new table: %v", f.calls)
+	}
+	if !f.ran("ip rule del fwmark 0x201 lookup 200 pref 32401") {
+		t.Errorf("the rule in the old table was left behind: %v", f.calls)
+	}
+}
+
+// An intact rule is left completely alone, so a reconcile tick on a healthy
+// host issues nothing but the two listings.
+func TestLinkerMarkRuleLeavesAnIntactRuleAlone(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase + 2)
+	listing := pinned + ":\tfrom all fwmark 0x301 lookup 200\n"
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 200": listing,
+		"ip rule show":           listing,
+	}}
+	if err := EnsureLinkerEgressRule(context.Background(), f, 200); err != nil {
+		t.Fatalf("EnsureLinkerEgressRule: %v", err)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, " add ") || strings.Contains(c, " del ") {
+			t.Errorf("an intact rule was rewritten: %s", c)
+		}
+	}
+}
+
+// Revert removes it at the priority it was found at. Deleting by selector alone
+// takes one arbitrary match, so a duplicate from an older build would survive.
+func TestRemoveLinkerRulesetsDeleteByPriority(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 200": "32401:\tfrom all fwmark 0x201 lookup 200\n" +
+			"31000:\tfrom all fwmark 0x201 lookup 200\n",
+	}}
+	RemoveLinkerReturnRuleset(context.Background(), f, 200)
+	for _, want := range []string{
+		"ip rule del fwmark 0x201 lookup 200 pref 32401",
+		"ip rule del fwmark 0x201 lookup 200 pref 31000",
+		"nft delete table ip failover_linker_return",
+	} {
+		if !f.ran(want) {
+			t.Errorf("revert left %q behind: %v", want, f.calls)
+		}
+	}
+}

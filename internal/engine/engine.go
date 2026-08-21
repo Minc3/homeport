@@ -1835,7 +1835,10 @@ func (e *Engine) Revert(ctx context.Context) {
 			sysx.RemoveQdisc(ctx, runner, p.Iface)
 		}
 	}
-	sysx.RemoveProbeRoutes(ctx, runner, cfg.Paths, cfg.Overlay.RoutePrefix())
+	// The probe tables always carry the backend's /32; only the main-table
+	// route widens with a subnet. Passing one prefix for both would have revert
+	// asking the kernel to delete a range from a table that holds a host route.
+	sysx.RemoveProbeRoutes(ctx, runner, cfg.Paths, cfg.Overlay.BackendIP+"/32", cfg.Overlay.RoutePrefix())
 	sysx.RemoveControlRoute(ctx, runner, cfg.Overlay.RoutePrefix(),
 		cfg.Overlay.BackendIP, cfg.Overlay.FrontendIP)
 	sysx.RemoveForwardExceptions(ctx, runner)

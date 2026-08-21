@@ -547,3 +547,57 @@ func TestMovingARuleAddsBeforeItDeletes(t *testing.T) {
 		t.Errorf("the old probe rule was removed before the new one existed; calls were %v", g.calls)
 	}
 }
+
+// The probe tables go the same way the control table does: by name.
+//
+// 101 to 103 are numbers this system picked, not property it owns. A host that
+// already policy-routes may keep its own entries in them, and `ip route flush`
+// would take those with it while the revert reported success. Invariant 8, and
+// what uninstall.sh promises in as many words.
+func TestRemoveProbeRoutesNeverFlushesATable(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 101": "30001:\tfrom all fwmark 0x101 lookup 101\n",
+		"ip rule show table 102": "30002:\tfrom all fwmark 0x102 lookup 102\n",
+	}}
+	paths := []model.PathConfig{
+		{ID: 1, Name: "nbn", Iface: "wg-nbn", Table: 101, Mark: 0x101},
+		{ID: 2, Name: "lte1", Iface: "wg-lte1", Table: 102, Mark: 0x102},
+	}
+	RemoveProbeRoutes(context.Background(), f, paths, "10.99.0.2/32", "10.99.0.0/24")
+
+	for _, c := range f.calls {
+		if strings.Contains(c, "route flush") {
+			t.Errorf("revert flushed a table it does not own: %s", c)
+		}
+	}
+	for _, want := range []string{
+		"ip route del 10.99.0.2/32 table 101",
+		"ip route del 10.99.0.2/32 table 102",
+		"ip rule del fwmark 0x101 lookup 101 pref 30001",
+		"ip rule del fwmark 0x102 lookup 102 pref 30002",
+		// The main-table route, at whatever width it was installed.
+		"ip route del 10.99.0.0/24",
+	} {
+		if !f.ran(want) {
+			t.Errorf("revert left %q behind, calls were %v", want, f.calls)
+		}
+	}
+}
+
+// The two prefixes are not interchangeable. A probe table always holds the far
+// end's /32 however wide the main-table route has become, so a revert that
+// passed the data prefix to both would ask the kernel to delete a range from a
+// table that holds a host route, and leave the host route there. Invariant 20.
+func TestRemoveProbeRoutesUsesTheProbePrefixInTheProbeTable(t *testing.T) {
+	f := &fakeRunner{}
+	RemoveProbeRoutes(context.Background(), f,
+		[]model.PathConfig{{ID: 1, Name: "nbn", Iface: "wg-nbn", Table: 101, Mark: 0x101}},
+		"10.99.0.2/32", "10.99.0.0/24")
+
+	if f.ran("ip route del 10.99.0.0/24 table 101") {
+		t.Errorf("the overlay range was never installed in a probe table: %v", f.calls)
+	}
+	if !f.ran("ip route del 10.99.0.2/32 table 101") {
+		t.Errorf("the probe route was not removed by name: %v", f.calls)
+	}
+}

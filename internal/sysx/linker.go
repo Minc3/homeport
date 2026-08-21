@@ -135,6 +135,116 @@ func sourceRuleTables(rules, source string) []sourceRule {
 	return out
 }
 
+// markRuleTables finds every rule selecting on this fwmark, whatever table it
+// points at, with the table recorded exactly as printed so it can be named back
+// to iproute2 when deleting. The companion to sourceRuleTables.
+func markRuleTables(rules, mark string) []sourceRule {
+	var out []sourceRule
+	for _, line := range strings.Split(rules, "\n") {
+		pref, rest, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(pref)
+		if err != nil {
+			continue
+		}
+		var hasMark bool
+		var table string
+		fields := strings.Fields(rest)
+		for i, f := range fields {
+			if i+1 >= len(fields) {
+				break
+			}
+			switch f {
+			case "fwmark":
+				hasMark = hasMark || fields[i+1] == mark
+			case "lookup":
+				table = fields[i+1]
+			}
+		}
+		if hasMark && table != "" {
+			out = append(out, sourceRule{pref: n, table: table})
+		}
+	}
+	return out
+}
+
+// ensureLinkerMarkRule installs one of the linker's mark rules at its pinned
+// priority, and clears the same mark from anywhere else.
+//
+// Both of its callers used to accept a rule at any priority, which is invariant
+// 3 with only one side pinned: a rule left at whatever the kernel chose sits
+// wherever it happens to sit relative to the source rule beside it, and nothing
+// would ever move it. The second listing catches the other half of that, a rule
+// pointing at a table this host no longer uses - which is what changing
+// linker.table leaves behind, and it is not inert: it still claims the marked
+// packets and sends them to a table whose route nothing maintains.
+//
+// Added before the stray is withdrawn. In the gap a marked reply matches no
+// rule and falls through to main, which sends it out the LAN default route
+// instead of to the backend: a dropped answer to a real client rather than a
+// slow one. Same ordering, and the same reason, as ensureProbeRoute.
+func ensureLinkerMarkRule(ctx context.Context, r Runner, tbl int, mark string, want int) error {
+	mine, err := listRulesInTable(ctx, r, tbl)
+	if err != nil {
+		return err
+	}
+	all, err := listRules(ctx, r)
+	if err != nil {
+		return err
+	}
+	table := strconv.Itoa(tbl)
+
+	inMyTable := map[int]bool{}
+	for _, pref := range markRulePrefs(mine, mark, "") {
+		inMyTable[pref] = true
+	}
+	strays := make([]sourceRule, 0, 2)
+	correct := false
+	for _, rule := range markRuleTables(all, mark) {
+		if rule.pref == want && inMyTable[rule.pref] {
+			correct = true
+			continue
+		}
+		strays = append(strays, rule)
+	}
+	if !correct {
+		if _, err := r.Run(ctx, "ip", "rule", "add", "fwmark", mark, "lookup", table,
+			"pref", strconv.Itoa(want)); err != nil {
+			return err
+		}
+	}
+	for _, rule := range strays {
+		// With the table token exactly as the kernel printed it: a host that
+		// has named the table in rt_tables prints the name, and the number is
+		// still accepted, but the name is what the listing gave us.
+		_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", rule.table,
+			"pref", strconv.Itoa(rule.pref))
+	}
+	return nil
+}
+
+// removeLinkerMarkRule withdraws one of them, at every priority it is found at.
+//
+// `ip rule del` given only a selector removes one arbitrary match, so a
+// duplicate from a build that pinned nothing would survive the revert and go on
+// steering marked packets into a table this has just emptied.
+func removeLinkerMarkRule(ctx context.Context, r Runner, tbl int, mark string) {
+	table := strconv.Itoa(tbl)
+	found := 0
+	if existing, err := listRulesInTable(ctx, r, tbl); err == nil {
+		for _, pref := range markRulePrefs(existing, mark, "") {
+			found++
+			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", table,
+				"pref", strconv.Itoa(pref))
+		}
+	}
+	if found == 0 {
+		_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", table)
+	}
+}
+
 // EnsureLinkerRoute points the linker's table at the backend.
 //
 // `via` an address rather than `dev` an interface, because the backend is a
@@ -179,8 +289,33 @@ func gatewayFrom(out string) string {
 // routing change into a crash.
 func RemoveLinkerRouting(ctx context.Context, r Runner, overlayIP string, tbl int) {
 	table := strconv.Itoa(tbl)
-	_, _ = r.Run(ctx, "ip", "rule", "del", "from", overlayIP, "lookup", table)
-	_, _ = r.Run(ctx, "ip", "route", "flush", "table", table)
+
+	// By the priority each rule was found at. `ip rule del` given only a
+	// selector removes one arbitrary match, so a duplicate left by an older
+	// build survives the revert, and a leftover here is not inert: it still
+	// steers everything this host sends from its overlay address into a table
+	// whose route has just been taken out.
+	found := 0
+	if existing, err := listRulesInTable(ctx, r, tbl); err == nil {
+		for _, pref := range sourceRulePrefs(existing, overlayIP, "") {
+			found++
+			_, _ = r.Run(ctx, "ip", "rule", "del", "from", overlayIP, "lookup", table,
+				"pref", strconv.Itoa(pref))
+		}
+	}
+	// A backstop for the case where the listing could not be read, or read
+	// nothing. The selector alone is only unsafe where duplicates exist, and
+	// duplicates are exactly what the loop above has just proved it can see.
+	if found == 0 {
+		_, _ = r.Run(ctx, "ip", "rule", "del", "from", overlayIP, "lookup", table)
+	}
+
+	// The default route by name, never a flush. This table belongs to the host
+	// rather than to this system, and 200 is the number the first real
+	// deployment found already in use for a second ISP: flushing it would have
+	// deleted that machine's own routing while reporting a clean revert.
+	// Invariant 8.
+	_, _ = r.Run(ctx, "ip", "route", "del", "default", "table", table)
 }
 
 // RPFilterOn reports whether reverse-path filtering is enabled system-wide.
@@ -349,27 +484,13 @@ func ApplyLinkerReturnRuleset(ctx context.Context, r Runner, stateDir, ruleset s
 // to the overlay address on the host itself is still matched by source, and
 // costs no connection tracking to route.
 func EnsureLinkerMarkRule(ctx context.Context, r Runner, tbl int) error {
-	existing, err := listRulesInTable(ctx, r, tbl)
-	if err != nil {
-		return err
-	}
-	table := strconv.Itoa(tbl)
-	mark := fmt.Sprintf("0x%x", LinkerReturnMark)
-	pref := strconv.Itoa(LinkerRulePrefBase + 1)
-	// The listing is already scoped to this table, so the mark alone identifies
-	// the rule - matching "lookup <number>" here is what broke on a host that
-	// had given the table a name.
-	if len(markRulePrefs(existing, mark, "")) > 0 {
-		return nil
-	}
-	_, err = r.Run(ctx, "ip", "rule", "add", "fwmark", mark, "lookup", table, "pref", pref)
-	return err
+	return ensureLinkerMarkRule(ctx, r, tbl,
+		fmt.Sprintf("0x%x", LinkerReturnMark), LinkerRulePrefBase+1)
 }
 
 // RemoveLinkerReturnRuleset takes down the marking table and its rule.
 func RemoveLinkerReturnRuleset(ctx context.Context, r Runner, tbl int) {
-	mark := fmt.Sprintf("0x%x", LinkerReturnMark)
-	_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", strconv.Itoa(tbl))
+	removeLinkerMarkRule(ctx, r, tbl, fmt.Sprintf("0x%x", LinkerReturnMark))
 	_, _ = r.Run(ctx, "nft", "delete", "table", "ip", NFTLinkerReturnTable)
 }
 
@@ -440,25 +561,14 @@ func ApplyLinkerEgressRuleset(ctx context.Context, r Runner, stateDir, ruleset s
 // RemoveLinkerEgressRuleset takes it down again, for when the last network is
 // removed from the portal or the feature is switched off.
 func RemoveLinkerEgressRuleset(ctx context.Context, r Runner, tbl int) {
-	mark := fmt.Sprintf("0x%x", LinkerEgressMark)
-	_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", strconv.Itoa(tbl))
+	removeLinkerMarkRule(ctx, r, tbl, fmt.Sprintf("0x%x", LinkerEgressMark))
 	_, _ = r.Run(ctx, "nft", "delete", "table", "ip", NFTLinkerEgressTable)
 }
 
 // EnsureLinkerEgressRule routes marked egress traffic to the linker's table.
 func EnsureLinkerEgressRule(ctx context.Context, r Runner, tbl int) error {
-	existing, err := listRulesInTable(ctx, r, tbl)
-	if err != nil {
-		return err
-	}
-	table := strconv.Itoa(tbl)
-	mark := fmt.Sprintf("0x%x", LinkerEgressMark)
-	if len(markRulePrefs(existing, mark, "")) > 0 {
-		return nil
-	}
-	_, err = r.Run(ctx, "ip", "rule", "add", "fwmark", mark, "lookup", table,
-		"pref", strconv.Itoa(LinkerRulePrefBase+2))
-	return err
+	return ensureLinkerMarkRule(ctx, r, tbl,
+		fmt.Sprintf("0x%x", LinkerEgressMark), LinkerRulePrefBase+2)
 }
 
 // LanIfaceTo reports which interface this host reaches an address through.

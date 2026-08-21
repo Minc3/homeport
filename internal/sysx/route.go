@@ -751,9 +751,13 @@ func RPFilterOff(ctx context.Context, r Runner, iface string) (bool, error) {
 
 // RemoveProbeRoutes tears down everything EnsureProbeRoutes created. Used by
 // `failoverctl revert`.
-// dataPrefix is what the main-table route was installed as, so revert takes
-// down the same prefix it put up rather than a /32 that may not exist.
-func RemoveProbeRoutes(ctx context.Context, r Runner, paths []model.PathConfig, dataPrefix string) {
+//
+// Two prefixes, because the two routes are not the same shape and each call
+// site knows its own. probeDst is the far end's /32, which is what every probe
+// table carries whether or not a subnet is configured; dataPrefix is what the
+// main-table route was installed as, so revert takes down the same prefix it
+// put up rather than a /32 that may not exist. Invariant 20.
+func RemoveProbeRoutes(ctx context.Context, r Runner, paths []model.PathConfig, probeDst, dataPrefix string) {
 	// Delete by explicit priority. Deleting without one removes a single
 	// arbitrary match, which would leave duplicates from an older build behind
 	// - and a leftover rule still steers probes into a table that revert has
@@ -767,7 +771,13 @@ func RemoveProbeRoutes(ctx context.Context, r Runner, paths []model.PathConfig, 
 			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", table,
 				"pref", strconv.Itoa(pref))
 		}
-		_, _ = r.Run(ctx, "ip", "route", "flush", "table", table)
+		// The one route this installed, by name, never a flush of the table.
+		// 101 to 103 are numbers this system picked, not property it owns: a
+		// host that already policy-routes may keep its own entries in them, and
+		// a flush would take those with it while reporting a clean revert.
+		// Invariant 8, and the same reasoning RemoveControlRoute and
+		// RemoveReturnRoutes were already written to.
+		_, _ = r.Run(ctx, "ip", "route", "del", probeDst, "table", table)
 	}
 	_, _ = r.Run(ctx, "ip", "route", "del", dataPrefix)
 }
