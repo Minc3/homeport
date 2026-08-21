@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -86,5 +87,63 @@ func TestBackendVersionSurvivesTheChannelDropping(t *testing.T) {
 	}
 	if st.BackendUp {
 		t.Error("backend should still report as down; the version is not a liveness signal")
+	}
+}
+
+// The WAN badge in the portal header shows the address published services are
+// reachable at. A configured public IP must win over anything read from an
+// interface, because it is what the DNAT rules actually match: an interface
+// holding several addresses would otherwise show one the rules may not cover.
+func TestPublicAddressPrefersTheConfiguredIPOverTheInterface(t *testing.T) {
+	if got := publicAddress("203.0.113.10", "eth0"); got != "203.0.113.10" {
+		t.Errorf("publicAddress = %q, want the configured 203.0.113.10", got)
+	}
+}
+
+// With nothing configured there is nothing truthful to show, and the portal
+// hides the badge on an empty string. An interface the host does not have is
+// the same case, not an error: the portal is often opened before the settings
+// are right, and a broken read must not take the status endpoint with it.
+func TestPublicAddressIsEmptyRatherThanAnErrorWhenUnconfigured(t *testing.T) {
+	if got := publicAddress("", ""); got != "" {
+		t.Errorf("publicAddress with nothing configured = %q, want empty", got)
+	}
+	if got := publicAddress("", "no-such-interface-xyz"); got != "" {
+		t.Errorf("publicAddress on a missing interface = %q, want empty", got)
+	}
+}
+
+// The kernel lists an interface's addresses in the order they were added, not
+// in order of meaning, and a datacentre NIC often carries a management or
+// carrier-NAT address alongside the public one. The badge exists to say where
+// services are reachable, so the publicly routable address must win whatever
+// position it holds; with only private addresses on the interface the first
+// one is shown rather than nothing.
+func TestPickWANAddressPrefersPubliclyRoutableOverPrivateAndCGNAT(t *testing.T) {
+	mustNet := func(cidr string) net.Addr {
+		ip, ipn, err := net.ParseCIDR(cidr)
+		if err != nil {
+			t.Fatalf("parse %s: %v", cidr, err)
+		}
+		ipn.IP = ip
+		return ipn
+	}
+
+	got := pickWANAddress([]net.Addr{
+		mustNet("10.20.30.40/24"),  // management subnet, added first
+		mustNet("100.90.1.2/10"),   // carrier-grade NAT space
+		mustNet("203.0.113.10/24"), // the actual WAN
+	})
+	if got != "203.0.113.10" {
+		t.Errorf("pickWANAddress = %q, want the public 203.0.113.10 over the private and CGNAT addresses before it", got)
+	}
+
+	got = pickWANAddress([]net.Addr{mustNet("10.20.30.40/24"), mustNet("192.168.1.5/24")})
+	if got != "10.20.30.40" {
+		t.Errorf("pickWANAddress with only private addresses = %q, want the first (10.20.30.40) rather than a blank", got)
+	}
+
+	if got = pickWANAddress(nil); got != "" {
+		t.Errorf("pickWANAddress with no addresses = %q, want empty", got)
 	}
 }

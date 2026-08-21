@@ -39,13 +39,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Overlay addressing comes from the bootstrap file on both hosts and is not
-	// editable here. Changing it through the portal would tear down the very
-	// channel the change has to travel over: the probes would rebind to a new
-	// address, the control server would still be listening on the old one, and
-	// the backend could never be told. It was also silently reverted on the next
-	// restart, so an edit looked accepted and then vanished.
-	cfg.Overlay = s.eng.Config().Overlay
+	pinServerOwnedFields(&cfg, s.eng.Config())
 
 	if err := validate(&cfg); err != nil {
 		clientErr(w, err)
@@ -56,6 +50,28 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// pinServerOwnedFields overwrites the parts of a PUT body that the settings
+// page carries but must never change, with the running engine's own values.
+//
+// Overlay addressing comes from the bootstrap file on both hosts and is not
+// editable here. Changing it through the portal would tear down the very
+// channel the change has to travel over: the probes would rebind to a new
+// address, the control server would still be listening on the old one, and
+// the backend could never be told. It was also silently reverted on the next
+// restart, so an edit looked accepted and then vanished.
+//
+// The mode rides inside the blob but is not a setting on the page that sends
+// it: it changes from the dashboard (POST /api/mode), from failoverctl, and
+// by a revert dropping the system to observe. Applying the copy a browser tab
+// loaded would re-impose however the system stood when that tab last
+// refreshed. A settings save from a tab left open across a revert would
+// silently re-arm the frontend, and Reconfigure clears the revert latch, so
+// the rules the revert had just removed came straight back.
+func pinServerOwnedFields(cfg *model.Config, current model.Config) {
+	cfg.Overlay = current.Overlay
+	cfg.Mode = current.Mode
 }
 
 // validate rejects configurations that would leave the system unable to make a

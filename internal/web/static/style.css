@@ -405,3 +405,33 @@ label.inline .help, .sticky-save .help { margin-left: 0; }
    public address a tunnel shares with another - the card itself still shows the
    path as healthy, because it is. */
 .hint.bad-text { color: var(--bad); }
+
+/* The Settings tab carries a dot while edits are pending, so leaving the tab
+   cannot hide that something is unsaved. */
+nav button.dirty::after {
+  content: '\25CF';
+  color: var(--warn);
+  font-size: 9px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+/* The per-linker setup instructions. A bare <details> rendered as one line of
+   body text and vanished among the hints; drawn as a panel with a button-like
+   summary it reads as the next step after filling in the row. */
+.setup-block {
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+  border-radius: var(--radius);
+  background: var(--panel-2);
+  margin: 12px 0;
+}
+.setup-block summary {
+  cursor: pointer;
+  padding: 10px 14px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.setup-block summary:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.setup-block[open] summary { border-bottom: 1px solid var(--line); }
+.setup-block > *:not(summary) { margin-left: 14px; margin-right: 14px; }
+.setup-block[open] { padding-bottom: 12px; }

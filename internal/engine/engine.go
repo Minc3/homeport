@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -67,6 +68,17 @@ type Engine struct {
 	// invisible except as a path being probed faster than its configured
 	// interval.
 	liveProbers atomic.Int64
+
+	// The WAN address shown in the portal header, cached for a few seconds.
+	// Reading it is two netlink dumps and the portal polls Status every
+	// second, so without the cache the kernel is enumerated once a second to
+	// re-answer a question that changes on the order of never. Guarded by its
+	// own mutex because Status holds only mu.RLock, and two concurrent Status
+	// calls (the portal and failoverctl) may both refresh it.
+	wanMu   sync.Mutex
+	wanKey  string
+	wanAddr string
+	wanAt   time.Time
 
 	// reconfMu serialises Reconfigure and Revert against each other. It is
 	// deliberately a separate lock from mu: it has to be held across
@@ -1836,8 +1848,92 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 }
 
 // Status renders the whole system for the portal.
+// publicAddress is the WAN address the frontend is publishing on, for the
+// portal's header. The configured Frontend.PublicIP wins because it is what
+// the DNAT rules match; with it blank the rules match any address on the
+// public interface, so the address shown is read from that interface instead.
+// Read with the stdlib rather than the runner: it is a display-only read that
+// must behave identically in observe mode and after a revert, and it asks the
+// kernel the same question `ip addr show dev` would. IPv4 only, like
+// everything else here.
+func publicAddress(publicIP, publicIface string) string {
+	if publicIP != "" {
+		return publicIP
+	}
+	if publicIface == "" {
+		return ""
+	}
+	ifi, err := net.InterfaceByName(publicIface)
+	if err != nil {
+		return ""
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return ""
+	}
+	return pickWANAddress(addrs)
+}
+
+// pickWANAddress chooses which of an interface's addresses to call the WAN.
+// A publicly routable IPv4 wins over anything else there: a datacentre NIC
+// often carries a management or carrier-NAT address alongside the public one,
+// and the kernel lists addresses in the order they were added, not in order
+// of meaning, so "first in the list" showed players an address they could
+// never reach. With only private addresses to choose from, the first ordinary
+// one is shown rather than nothing: a deliberately private deployment is
+// better served by the truth than by a blank.
+func pickWANAddress(addrs []net.Addr) string {
+	first := ""
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipn.IP.To4()
+		if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+			continue
+		}
+		// 100.64.0.0/10 is carrier-grade NAT space: not private to Go's
+		// IsPrivate, not reachable from the internet either.
+		cgnat := ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+		if !ip4.IsPrivate() && !cgnat {
+			return ip4.String()
+		}
+		if first == "" {
+			first = ip4.String()
+		}
+	}
+	return first
+}
+
+// cachedPublicAddress serves the WAN address from the cache described on the
+// fields, refreshing it when it is older than a few seconds or the settings
+// it was derived from have changed. Five seconds keeps a renumbered interface
+// visible in the portal within a breath while cutting the per-second netlink
+// enumeration to a fifth.
+func (e *Engine) cachedPublicAddress(publicIP, publicIface string) string {
+	e.wanMu.Lock()
+	defer e.wanMu.Unlock()
+	key := publicIP + "|" + publicIface
+	if key == e.wanKey && time.Since(e.wanAt) < 5*time.Second {
+		return e.wanAddr
+	}
+	e.wanAddr = publicAddress(publicIP, publicIface)
+	e.wanKey = key
+	e.wanAt = time.Now()
+	return e.wanAddr
+}
+
 func (e *Engine) Status() model.Status {
 	now := time.Now()
+
+	// The interface read is kernel I/O, so it happens before the state lock is
+	// taken rather than under it.
+	e.mu.RLock()
+	pubIP, pubIface := e.cfg.Frontend.PublicIP, e.cfg.Frontend.PublicIface
+	e.mu.RUnlock()
+	wan := e.cachedPublicAddress(pubIP, pubIface)
+
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -1857,6 +1953,7 @@ func (e *Engine) Status() model.Status {
 		SharedEndpoints: e.sharedEndpoints,
 		LinkerStates:    e.linkerStates(),
 		PreferredPath:   preferredPathID(e.cfg),
+		PublicAddress:   wan,
 		FrontendVersion: Version,
 		BackendVersion:  e.backendVersion,
 		BackendHost:     e.backendHost,

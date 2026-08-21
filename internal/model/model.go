@@ -549,6 +549,13 @@ type Status struct {
 	// would then be free to drift from the selector's own definition.
 	PreferredPath int `json:"preferred_path"`
 
+	// PublicAddress is the WAN address published services are reachable at:
+	// the configured Frontend.PublicIP, or, with that blank, read from the
+	// public interface at the time of asking, preferring a publicly routable
+	// IPv4 over private and carrier-NAT space when the interface holds both.
+	// Display only; nothing routes or matches on it.
+	PublicAddress string `json:"public_address,omitempty"`
+
 	// Versions are here because there was no way to tell what a running host
 	// was from the portal, and a stale idea of the deployed build sends any
 	// procedure that depends on it down the wrong path. The backend's arrives

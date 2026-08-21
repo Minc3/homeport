@@ -144,7 +144,10 @@ document.querySelectorAll('nav button').forEach((btn) => {
     // squeezed to the point of being unusable.
     document.querySelector('main').classList.toggle('wide', btn.dataset.tab === 'settings');
     if (btn.dataset.tab === 'events') refreshEvents();
-    if (btn.dataset.tab === 'settings') loadSettings();
+    // Reload for freshness only when nothing is pending: loadSettings replaces
+    // `config`, so coming back to the tab must not discard edits. The edited
+    // form is still in the DOM and stays as it was left.
+    if (btn.dataset.tab === 'settings' && !settingsDirty) loadSettings();
   });
 });
 
@@ -282,9 +285,9 @@ function pathCard(p, pinned, shared) {
       title: p.peer_endpoint || '',
       text: p.peer_endpoint
         ? (shares
-          ? `WAN ${endpointHost(p.peer_endpoint)} — same as ${shares.join(' and ')}`
+          ? `WAN ${endpointHost(p.peer_endpoint)}, same as ${shares.join(' and ')}`
           : `WAN ${endpointHost(p.peer_endpoint)}`)
-        : 'WAN unknown — no handshake on this tunnel yet',
+        : 'WAN unknown: no handshake on this tunnel yet',
     }),
     el('div', { class: 'row' }, actions),
   );
@@ -302,7 +305,7 @@ function approve(p) {
     `Cap the overage at how many GB? (0 for no byte limit)\n\n` +
     'This is a hard stop in addition to the time limit.', '5');
   // Cancelling here must abort, not fall through. Treating a dismissed prompt
-  // as 0 would send "no byte limit" — an unbounded grant — which is the exact
+  // as 0 would send "no byte limit", an unbounded grant, which is the exact
   // opposite of what someone backing out of the dialog intends.
   if (gbInput === null) return;
   const gb = parseFloat(gbInput);
@@ -380,6 +383,17 @@ async function refreshStatus() {
   backend.textContent = st.backend_up ? 'backend connected' : 'backend unreachable';
   backend.className = 'badge ' + (st.backend_up ? 'ok' : 'bad');
 
+  // The WAN address published services are reachable at: the configured
+  // public IP, or the address read from the public interface when none is
+  // configured. Hidden entirely when the engine cannot report one, which is
+  // an unconfigured public interface rather than a fault.
+  const wan = document.getElementById('wan-badge');
+  wan.classList.toggle('hidden', !st.public_address);
+  if (st.public_address) {
+    wan.textContent = `WAN ${st.public_address}`;
+    wan.title = 'The public address published services are reachable at. Configured in Settings, or read from the public interface when no public IP is set.';
+  }
+
   const held = document.getElementById('held');
   held.classList.toggle('hidden', !st.held);
   if (st.held) {
@@ -436,7 +450,7 @@ function renderProtect(p) {
       el('div', { class: 'hint', text: bytes(c.bytes) })))));
     body.append(el('p', { class: 'hint', text: total === 0
       ? 'Nothing dropped since the rules were last loaded.'
-      : `${total.toLocaleString()} packets dropped since the rules were last loaded — saving the configuration resets these.` }));
+      : `${total.toLocaleString()} packets dropped since the rules were last loaded. Saving the configuration resets these.` }));
   }
 
   if (blocked.length) {
@@ -473,9 +487,9 @@ function linkerCard(l) {
         el('div', { class: 'k', text: l.up ? 'connected' : 'last contact' }),
         el('div', { class: 'v', text: since(l.up ? l.since : l.last_seen) })),
     ),
-    l.up ? null : el('p', { class: 'hint', text: 'Configured here but not connected. Published traffic still routes to it — the backend’s route does not depend on this — but nothing on that host has checked in.' }),
+    l.up ? null : el('p', { class: 'hint', text: 'Configured here but not connected. Published traffic still routes to it (the backend’s route does not depend on this), but nothing on that host has checked in.' }),
     l.up && l.table && l.table !== (l.configured_table || 200)
-      ? el('p', { class: 'hint', text: `This host is using routing table ${l.table}, but the portal has ${l.configured_table || 200}. The host wins — it reads the value from its own linker.json before this channel exists. Update one of them so they agree.` })
+      ? el('p', { class: 'hint', text: `This host is using routing table ${l.table}, but the portal has ${l.configured_table || 200}. The host wins: it reads the value from its own linker.json before this channel exists. Update one of them so they agree.` })
       : null,
   );
 }
@@ -515,6 +529,74 @@ async function refreshEvents() {
 // ---------------------------------------------------------------------------
 
 let config = null;
+
+// ---------------------------------------------------------------------------
+// Unsaved-changes tracking
+//
+// Nothing on this page is staged: an edit lives only in `config` until Save
+// sends it, and it was easy to type into a field and navigate away believing
+// it had taken. Dirtiness is the config differing from the last loaded or
+// saved copy, rather than a flag set by each input, so the Add and Remove
+// buttons, which mutate the object directly, are caught the same way a
+// keystroke is, and typing a password below, which touches no config, never
+// counts. The snapshot is taken after renderSettings has run, because
+// rendering fills in structures an older stored config lacks and that repair
+// is not an edit.
+// ---------------------------------------------------------------------------
+
+let savedConfig = null;
+let settingsDirty = false;
+
+// zeroish groups the values Go's omitempty treats as absent. A key the loaded
+// JSON never carried and one an input has set back to its default are the same
+// configuration on the wire, so they must compare equal here: ticking and
+// unticking Source engine writes `false` under a key the fetch omitted, and a
+// plain string comparison would then read dirty forever, with no way to clear
+// the badge short of saving a change that changes nothing.
+function zeroish(v) {
+  return v === undefined || v === null || v === false || v === 0 || v === ''
+    || (typeof v === 'number' && Number.isNaN(v))
+    || (Array.isArray(v) && v.length === 0);
+}
+
+function sameConfig(a, b) {
+  if (zeroish(a) && zeroish(b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => sameConfig(v, b[i]));
+  }
+  if (typeof a === 'object' && a !== null && typeof b === 'object' && b !== null) {
+    for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      if (!sameConfig(a[k], b[k])) return false;
+    }
+    return true;
+  }
+  return a === b;
+}
+
+function updateDirty() {
+  settingsDirty = config !== null && savedConfig !== null && !sameConfig(config, savedConfig);
+  document.getElementById('unsaved-badge')?.classList.toggle('hidden', !settingsDirty);
+  document.querySelector('nav button[data-tab="settings"]').classList.toggle('dirty', settingsDirty);
+}
+
+function markSaved() {
+  savedConfig = JSON.parse(JSON.stringify(config));
+  updateDirty();
+}
+
+// Delegated, because renderSettings rebuilds everything inside the form.
+// 'input' catches typing, 'change' the dropdowns and checkboxes, 'click' the
+// Add and Remove buttons.
+for (const evt of ['input', 'change', 'click']) {
+  document.getElementById('settings-form').addEventListener(evt, updateDirty);
+}
+
+// Closing or reloading the page with edits pending gets the browser's own
+// are-you-sure. Switching tabs inside the portal is handled separately: the
+// form and its edits stay in the DOM.
+window.addEventListener('beforeunload', (e) => {
+  if (settingsDirty) { e.preventDefault(); e.returnValue = ''; }
+});
 
 // caption is a label with its help marker beside it. Empty labels are the table
 // rows, where the heading carries the explanation for the whole column instead.
@@ -584,7 +666,39 @@ function pathRow(p) {
   );
 }
 
-function serviceRow(s, onRemove) {
+// hostSelect is the "which machine" dropdown: the backend, or one of the
+// configured linkers. The stored value is an overlay address (empty meaning
+// the backend), so the options are built from the linker table rather than
+// typed by hand: a mistyped address here looks exactly like the service
+// being down. A value that matches no linker (a row removed while a service
+// still points at it) is kept as its own option instead of being silently
+// shown as the backend, so what would be saved is what is on screen.
+function hostSelect(value, c, onChange) {
+  const sel = el('select', {});
+  sel.append(el('option', { value: '', text: 'the backend' }));
+  const known = new Set();
+  // The backend's own overlay address is a valid explicit way of saying "the
+  // backend": validate accepts it, and the old free-text field let it be
+  // typed. Same destination as blank, so it is labelled as such rather than
+  // flagged as unknown.
+  if (value && value === c.overlay.backend_ip) {
+    known.add(value);
+    sel.append(el('option', { value, text: `the backend (${value})` }));
+  }
+  for (const l of c.linkers || []) {
+    if (!l.overlay_ip || known.has(l.overlay_ip)) continue;
+    known.add(l.overlay_ip);
+    sel.append(el('option', { value: l.overlay_ip, text: l.name ? `${l.name} (${l.overlay_ip})` : l.overlay_ip }));
+  }
+  if (value && !known.has(value)) {
+    sel.append(el('option', { value, text: `${value} (no such linker)` }));
+  }
+  sel.value = value || '';
+  sel.addEventListener('change', () => onChange(sel.value));
+  return sel;
+}
+
+function serviceRow(s, c, onRemove) {
   const proto = el('select', {});
   for (const v of ['tcp', 'udp']) {
     const o = el('option', { value: v, text: v });
@@ -597,8 +711,8 @@ function serviceRow(s, onRemove) {
     el('td', {}, field('', s.name, (v) => (s.name = v), { placeholder: 'gmod' })),
     el('td', {}, proto),
     el('td', {}, num('', s.port, (v) => (s.port = v), { min: 1, placeholder: '27015' })),
-    el('td', {}, num('', s.port_end, (v) => (s.port_end = v), { min: 0, placeholder: '0 — single port' })),
-    el('td', {}, field('', s.target, (v) => (s.target = v), { placeholder: 'blank = the backend' })),
+    el('td', {}, num('', s.port_end, (v) => (s.port_end = v), { min: 0, placeholder: '0 = single port' })),
+    el('td', {}, hostSelect(s.target, c, (v) => (s.target = v))),
     el('td', {}, checkbox('', s.source_engine, (v) => (s.source_engine = v))),
     el('td', {}, num('', s.ceiling_pps, (v) => (s.ceiling_pps = v || 0), { min: 0, placeholder: '0 = off' })),
     el('td', {}, checkbox('', s.enabled, (v) => (s.enabled = v))),
@@ -606,10 +720,10 @@ function serviceRow(s, onRemove) {
   );
 }
 
-function egressRow(s, onRemove, onChange) {
+function egressRow(s, c, onRemove, onChange) {
   return el('tr', {},
     el('td', {}, field('', s.name, (v) => (s.name = v), { placeholder: 'gmod container' })),
-    el('td', {}, field('', s.host, (v) => (s.host = v), { placeholder: 'blank = the backend' })),
+    el('td', {}, hostSelect(s.host, c, (v) => (s.host = v))),
     el('td', {}, field('', s.cidr, (v) => (s.cidr = v), { placeholder: '172.18.0.0/16' })),
     el('td', {}, checkbox('', s.enabled, (v) => { s.enabled = v; onChange(); })),
     el('td', {}, el('button', { class: 'btn danger', type: 'button', onclick: onRemove }, 'Remove')),
@@ -647,7 +761,7 @@ async function copyText(text) {
   ta.select();
   const ok = document.execCommand('copy');
   ta.remove();
-  toast(ok ? 'Copied' : 'Could not copy — select it and copy by hand', !ok);
+  toast(ok ? 'Copied' : 'Could not copy. Select it and copy by hand', !ok);
 }
 
 // The shared secret, fetched only when somebody opens a linker's setup block.
@@ -716,6 +830,7 @@ function renderSettings() {
 
   if (!c.egress) c.egress = { sources: [] };
   if (!c.egress.sources) c.egress.sources = [];
+  if (!c.linkers) c.linkers = [];
 
   // A network configured while the master switch is off installs nothing at
   // all: the frontend only sends these to the backend once it is prepared to
@@ -735,7 +850,7 @@ function renderSettings() {
     el('div', { class: 'grid' },
       field('Public interface', c.frontend.public_iface, (v) => (c.frontend.public_iface = v), {
         placeholder: 'eth0',
-        help: 'The internet-facing NIC on this datacentre box — the one the public IP sits on. '
+        help: 'The internet-facing NIC on this datacentre box, the one the public IP sits on. '
           + 'Published traffic is only translated when it arrives here, and the backend-egress rule below is scoped to it. '
           + 'Find it with: ip -br addr. Examples: eth0, ens3, enp1s0.',
       }),
@@ -750,7 +865,7 @@ function renderSettings() {
       c.frontend.backend_egress = v;
       updateEgressWarning();
     }, 'Off by default. Turn it on when something at the far end has to appear to the outside world at this box\'s public address '
-      + 'rather than the house\'s WAN IP — a Source game server\'s heartbeat is the case this exists for. '
+      + 'rather than the house\'s WAN IP. A Source game server\'s heartbeat is the case this exists for. '
       + 'Needs the public interface above set, and it is also the master switch for the networks section further down.')),
     el('p', { class: 'hint', text: 'Sends traffic the backend starts from its overlay address out through this public address instead of the house internet. A game server is listed in the server browser at the address its heartbeat appears to come from, so without this it is advertised at the home WAN IP, which has no port forward behind it and is unreachable while an LTE path is carrying traffic.' }),
     el('p', { class: 'hint', text: 'It also puts everything else the backend sends from that address on the tunnel, so it counts against the LTE quota during a failover.' }),
@@ -763,7 +878,7 @@ function renderSettings() {
         + 'Example: 10.99.0.1. Changed only in /etc/failover/frontend.json, and it must match the backend\'s copy.'),
       readOnly('Backend overlay IP', c.overlay.backend_ip,
         'The address every published service is translated to, and the one failover keeps pointing at a working tunnel. '
-        + 'It never changes — that is why a switch is a two-second stall rather than a disconnect. Example: 10.99.0.2.'),
+        + 'It never changes: that is why a switch is a two-second stall rather than a disconnect. Example: 10.99.0.2.'),
       readOnly('Device', c.overlay.device,
         'The dummy interface both overlay addresses live on. It carries nothing itself; it exists so the addresses survive a tunnel '
         + 'going down, which is what keeps connections alive across a failover. Example: dummy0.'),
@@ -779,7 +894,7 @@ function renderSettings() {
 
   const pathsTable = el('table', {},
     el('thead', {}, el('tr', {},
-      th('Name', 'Label only — what this path is called in the dashboard, the alerts and the activity log. Examples: main, lte1, lte2.'),
+      th('Name', 'Label only: what this path is called in the dashboard, the alerts and the activity log. Examples: main, lte1, lte2.'),
       th('Interface', 'The WireGuard interface on this frontend that carries this path, spelled exactly as wg show names it. '
         + 'The agent never creates tunnels, so it must already exist and be up. Example: wg-lte1.'),
       th('Priority', 'Lower number wins. 1 is the preferred path and keeps the traffic whenever it is usable. '
@@ -792,14 +907,14 @@ function renderSettings() {
         + 'Use it for a service you have cancelled, or a tunnel you are rebuilding.'),
       th('Metered', 'Tick for a link with a data cap. Only metered paths accumulate usage against a quota and appear with a usage bar on the dashboard. '
         + 'Leave it off for unmetered fixed line.'),
-      th('Quota GB', 'The monthly allowance for this link. Once it is reached the path stops being selectable — it stays up, and the dashboard offers a button to approve going over. '
+      th('Quota GB', 'The monthly allowance for this link. Once it is reached the path stops being selectable. It stays up, and the dashboard offers a button to approve going over. '
         + '0 means no quota at all. Example: 60.'),
       th('Ceiling GB', 'A hard stop that not even an approved overage can pass, for the 2am click you regret. '
         + 'Must be at or above the quota; 0 means none. Example: 80.'),
       th('Down Mbit/s', 'Shapes what this frontend sends into that tunnel, which is the home end\'s download. '
         + '0 is off and installs nothing. Enter about 90% of a measured speed test: the point is to hold the queue here, where it is kept short and shared fairly, '
         + 'instead of in the carrier\'s buffer where a download puts seconds of delay in front of every game packet. Too high and it does nothing at all.'),
-      th('Up Mbit/s', 'The same for what the backend sends into that tunnel — the home end\'s upload, and the one that matters most for a game server, '
+      th('Up Mbit/s', 'The same for what the backend sends into that tunnel: the home end\'s upload, and the one that matters most for a game server, '
         + 'because srcds sends far more than it receives. 0 is off. Needs the sch_cake module, which Debian 12 has: modprobe sch_cake.'),
       th('Reset day', 'Day of the month your carrier\'s billing period starts, 1-31. Months too short for it clamp to the last day. Example: 1.'),
       th('Timezone', 'The zone that reset day is counted in, so the period turns over where the carrier draws it rather than at UTC midnight. '
@@ -834,7 +949,7 @@ function renderSettings() {
       num('Losses before down', c.probe.fail_threshold, (v) => (c.probe.fail_threshold = v), {
         placeholder: '8',
         help: 'Consecutive unanswered probes before a path is condemned and traffic moves. '
-          + 'One loss only makes it "suspect", which stays selectable — LTE drops the odd packet routinely and that must not move traffic. Example: 8.',
+          + 'One loss only makes it "suspect", which stays selectable: LTE drops the odd packet routinely and that must not move traffic. Example: 8.',
       }),
       num('Successes before up', c.probe.recover_threshold, (v) => (c.probe.recover_threshold = v), {
         placeholder: '10',
@@ -849,7 +964,7 @@ function renderSettings() {
       num('Max loss %', c.probe.max_loss_pct, (v) => (c.probe.max_loss_pct = v), {
         step: 0.5,
         placeholder: '15',
-        help: 'Loss across that window above this figure blocks the path as degraded — it is answering, but too badly to carry a game. '
+        help: 'Loss across that window above this figure blocks the path as degraded: it is answering, but too badly to carry a game. '
           + 'It is not condemned, and becomes selectable again the moment it improves. Example: 15.',
       }),
       num('Max RTT (ms)', c.probe.max_rtt_ms, (v) => (c.probe.max_rtt_ms = v), {
@@ -905,13 +1020,13 @@ function renderSettings() {
       + 'Best measured fallback changes exactly one thing: once the preferred path is out, the replacement is whichever remaining path measures best, '
       + 'rather than simply the next one down the list. The settings below only do anything in that mode.'), selection),
     el('p', { class: 'hint', text: 'Priority order always uses the highest-priority path that works. Best measured fallback changes one thing: once the preferred path is out, it picks whichever remaining path is measuring best rather than simply the next one down the list.' }),
-    el('p', { class: 'hint', text: 'The preferred path is never second-guessed — while it is usable it keeps the traffic whatever the numbers say, and it wins the traffic back on its clean streak alone. Priority order is the cost order here, and a link that is 10ms quicker is not a reason to sit on a metered one.' }),
+    el('p', { class: 'hint', text: 'The preferred path is never second-guessed: while it is usable it keeps the traffic whatever the numbers say, and it wins the traffic back on its clean streak alone. Priority order is the cost order here, and a link that is 10ms quicker is not a reason to sit on a metered one.' }),
     el('div', { class: 'grid' },
       num('Loss weight (ms per 1%)', q.loss_weight, (v) => (q.loss_weight = v), {
         step: 1,
         placeholder: '25',
         help: 'How many milliseconds of latency one percent of packet loss is treated as being worth. '
-          + 'At 25, a link losing 1% has to be 25ms quicker just to draw level — which is right for a game server, where a clean 60ms path beats a lossy 30ms one. '
+          + 'At 25, a link losing 1% has to be 25ms quicker just to draw level, which is right for a game server, where a clean 60ms path beats a lossy 30ms one. '
           + 'Cannot be negative.',
       }),
       num('RTT weight', q.rtt_weight, (v) => (q.rtt_weight = v), {
@@ -923,7 +1038,7 @@ function renderSettings() {
       num('Jitter weight', q.jitter_weight, (v) => (q.jitter_weight = v), {
         step: 0.1,
         placeholder: '3',
-        help: 'Multiplier on jitter — how much the round trip varies. Weighted above plain latency because inconsistency is what players actually notice. '
+        help: 'Multiplier on jitter, how much the round trip varies. Weighted above plain latency because inconsistency is what players actually notice. '
           + 'Cannot be negative.',
       }),
       num('Switch margin (%)', q.margin_pct, (v) => (q.margin_pct = v), {
@@ -936,19 +1051,19 @@ function renderSettings() {
       num('Minimum time between switches (s)', q.min_dwell_sec, (v) => (q.min_dwell_sec = v), {
         step: 30,
         placeholder: '300',
-        help: 'The floor between two fallback swaps, for links genuinely taking turns being better — what a carrier working on a tower produces. '
+        help: 'The floor between two fallback swaps, for links genuinely taking turns being better, which is what a carrier working on a tower produces. '
           + 'It never delays leaving a path that has stopped working, and never delays the return to the preferred path. Example: 300.',
       }),
     ),
     el('p', { class: 'hint', text: 'Score = loss% × loss weight + RTT × RTT weight + jitter × jitter weight, in milliseconds-equivalent, lower being better. Loss is weighted heavily on purpose: for a game server a clean 60ms link beats a lossy 30ms one.' }),
     el('p', { class: 'hint', text: 'The margin is how much better a fallback must score before it takes the traffic, and it then has to hold that lead for the failback hold-down above. Because the same margin applies in reverse, there is a dead zone rather than a threshold, and two links cannot trade places on measurement noise.' }),
-    el('p', { class: 'hint', text: 'Minimum time between switches is the floor for a genuine alternation — two links really taking turns being much better, which is what a carrier working on a tower produces. It never delays leaving a path that has stopped working, and never delays the return to the preferred path.' }),
+    el('p', { class: 'hint', text: 'Minimum time between switches is the floor for a genuine alternation: two links really taking turns being much better, which is what a carrier working on a tower produces. It never delays leaving a path that has stopped working, and never delays the return to the preferred path.' }),
   ));
 
   const servicesBody = el('tbody', {});
   const renderServices = () => {
     servicesBody.textContent = '';
-    c.services.forEach((s, i) => servicesBody.append(serviceRow(s, () => {
+    c.services.forEach((s, i) => servicesBody.append(serviceRow(s, c, () => {
       c.services.splice(i, 1);
       renderServices();
     })));
@@ -957,18 +1072,18 @@ function renderSettings() {
   form.append(section('Published services',
     el('div', { class: 'table-wrap' }, el('table', {},
       el('thead', {}, el('tr', {},
-        th('Name', 'Label only — it appears as a comment in the generated ruleset and in this table. Examples: gmod, gmod-hltv, https.'),
+        th('Name', 'Label only: it appears as a comment in the generated ruleset and in this table. Examples: gmod, gmod-hltv, https.'),
         th('Proto', 'udp for game traffic (srcds and HLTV are both udp), tcp for web. '
           + 'One row per protocol: a service that needs both takes two rows.'),
-        th('Port', 'The port on the public IP, forwarded unchanged to the same port at the far end — there is no port translation to think about. '
+        th('Port', 'The port on the public IP, forwarded unchanged to the same port at the far end. There is no port translation to think about. '
           + '1-65535. Example: 27015.'),
         th('Port end', 'Publishes a contiguous range from Port up to this one, in a single rule. Leave 0 for a single port. '
           + 'Example: Port 27015 with Port end 27020 publishes six ports.'),
-        th('Published to', 'Blank sends it to the backend, which is what most sites want. '
-          + 'Otherwise the overlay address of a linker, e.g. 10.99.0.3, and that linker must already be listed below — publishing to an address with no host behind it '
-          + 'looks exactly like the service being down. Example: blank, or 10.99.0.3.'),
-        th('Source engine', 'Tick for a Source game port. It does nothing unless protection is on, and then it lets the connectionless packets — '
-          + 'the A2S queries and connection attempts, which are what gets flooded — be rate limited on their own. '
+        th('Published to', 'The machine this service runs on: the backend, which is what most sites want, '
+          + 'or one of the linkers from the section below. A linker has to be added there before it appears here, '
+          + 'because publishing to an address with no host behind it looks exactly like the service being down.'),
+        th('Source engine', 'Tick for a Source game port. It does nothing unless protection is on, and then it lets the connectionless packets, '
+          + 'the A2S queries and connection attempts, which are what gets flooded, be rate limited on their own. '
           + 'A player already in the game sends sequence-numbered packets and is never touched by it.'),
         th('Ceiling pps', 'A cap on this service in total, across every client, in packets per second. 0 is off. '
           + 'Set it above the busiest legitimate moment you have measured and below what the active tunnel can carry: '
@@ -998,17 +1113,17 @@ function renderSettings() {
         + 'translated or sent down a tunnel. That is the useful place for it: what it stops never reaches the house, '
         + 'never fills an LTE link and is never billed to a quota.' }),
       el('p', { text: 'It cannot help with an attack larger than this datacentre link. Once the port itself is full, '
-        + 'the packets are already here and dropping them changes nothing — that needs scrubbing upstream, from your provider. '
+        + 'the packets are already here and dropping them changes nothing. That needs scrubbing upstream, from your provider. '
         + 'Ask them what they include before relying on any of this.' }),
       el('p', { text: 'Nothing here can see a probe or the control channel: every rule is scoped to the public interface, '
-        + 'and the system\'s own traffic arrives on the tunnels. That is deliberate — a limiter able to drop a health check '
+        + 'and the system\'s own traffic arrives on the tunnels. That is deliberate: a limiter able to drop a health check '
         + 'would make this system condemn a working link and move traffic because of its own firewall.' }),
       el('p', { text: 'Every limit below can drop a packet a real player sent. Turn them on one at a time and watch the counters '
         + 'on the dashboard: a threshold set from a guess produces "some people cannot connect", which looks exactly like the service being down.' }),
     ),
     el('div', {}, checkbox('Enabled', pr.enabled, (v) => (pr.enabled = v),
       'The master switch. Off, nothing in this section is generated and the table is removed entirely. '
-      + 'If a limit ever locks players out, unticking this and saving is the whole fix — it reaches the system in about two seconds.')),
+      + 'If a limit ever locks players out, unticking this and saving is the whole fix. It reaches the system in about two seconds.')),
     el('p', { class: 'hint', text: 'Needs the frontend\'s public interface set, in the section at the top. Saving is refused without it, because a rule that could not be scoped to that interface would also match traffic arriving on a tunnel.' }),
 
     el('h3', { class: 'sub-head', text: 'Per-source limits' }),
@@ -1022,16 +1137,16 @@ function renderSettings() {
       num('Concurrent connections per source', pr.max_conns_per_source, (v) => (pr.max_conns_per_source = v || 0), {
         min: 0, placeholder: '0 = off',
         help: 'How many tracked TCP connections one address may hold open at once. Shared connections behind one office or carrier NAT can be surprisingly many, '
-          + 'so keep it well clear of what you see in normal use — 50 to 100 for a web service.',
+          + 'so keep it well clear of what you see in normal use: 50 to 100 for a web service.',
       }),
       num('UDP packets per second per source', pr.packets_per_sec, (v) => (pr.packets_per_sec = v || 0), {
         min: 0, placeholder: '0 = off',
-        help: 'Packets per second from one address to a published UDP port. A player in a game sends tens per second, so this wants to be generous — 400 is far above normal play '
+        help: 'Packets per second from one address to a published UDP port. A player in a game sends tens per second, so this wants to be generous: 400 is far above normal play '
           + 'and still stops a single source saturating the tunnel. This is the one that protects against one client hurting everyone else.',
       }),
       num('Source-engine queries per second per source', pr.queries_per_sec, (v) => (pr.queries_per_sec = v || 0), {
         min: 0, placeholder: '0 = off',
-        help: 'Applies only to services ticked as Source engine, and only to their connectionless packets — the A2S queries and connection attempts. '
+        help: 'Applies only to services ticked as Source engine, and only to their connectionless packets, the A2S queries and connection attempts. '
           + 'Players already in the game are unaffected, which is what makes a tight number safe here: 2 or 3 per second is ample, and this is the usual flood vector for a Source server.',
       }),
       num('Block a tripping source for (s)', pr.block_seconds, (v) => (pr.block_seconds = v || 0), {
@@ -1045,18 +1160,16 @@ function renderSettings() {
     el('p', { class: 'hint', text: 'No thresholds to get wrong, and no legitimate client sends any of what these drop. Reasonable to turn on together.' }),
     el('div', { class: 'grid' },
       checkbox('Drop invalid', pr.drop_invalid, (v) => (pr.drop_invalid = v),
-        'Packets connection tracking cannot place in any connection — late fragments, out-of-window segments, and most of what a crafted flood is made of.'),
+        'Packets connection tracking cannot place in any connection: late fragments, out-of-window segments, and most of what a crafted flood is made of.'),
       checkbox('Drop bogus TCP flags', pr.drop_bogus_tcp, (v) => (pr.drop_bogus_tcp = v),
         'Flag combinations no real stack produces: SYN+FIN, SYN+RST, null and Xmas packets. Port scans and cheap floods, dropped before conntrack has to think about them.'),
       checkbox('Drop spoofed sources', pr.drop_spoofed, (v) => (pr.drop_spoofed = v),
         'Source addresses that cannot legitimately arrive from the internet: the private ranges, loopback, link-local, multicast and reserved space. '
         + 'Leave it off if anything reaches this box\'s public interface from a private network.'),
     ),
-    el('p', { class: 'hint', text: 'There is no SYN-proxy option, and that is not an omission. SYN proxying needs the handshake to be untracked, and this frontend has to track every connection in order to translate it — the two cannot both be true. Per-source connection limiting above is what covers the same ground here.' }),
+    el('p', { class: 'hint', text: 'There is no SYN-proxy option, and that is not an omission. SYN proxying needs the handshake to be untracked, and this frontend has to track every connection in order to translate it, so the two cannot both be true. Per-source connection limiting above is what covers the same ground here.' }),
     el('p', { class: 'hint', text: 'The counters reset whenever you save, because saving reloads the rules.' }),
   ));
-
-  if (!c.linkers) c.linkers = [];
 
   const linkerBody = el('tbody', {});
   const linkerConfigs = el('div', {});
@@ -1078,7 +1191,7 @@ function renderSettings() {
         cfgPre.textContent = linkerConfigText(l, c.overlay, c.backend_lan, psk);
       };
 
-      const block = el('details', {},
+      const block = el('details', { class: 'setup-block' },
         el('summary', { text: `Set up ${l.name || l.overlay_ip}` }),
         el('p', { class: 'hint', text: 'Run this on that host, in a clone of the repo. It writes the config below, installs the unit and starts the agent. Nothing has to be run on the backend.' }),
         cmd,
@@ -1090,7 +1203,7 @@ function renderSettings() {
         el('div', { class: 'row' }, el('button', {
           class: 'btn', type: 'button', onclick: () => copyText(cfgPre.textContent),
         }, 'Copy config')),
-        el('p', { class: 'hint', text: 'Both carry this site’s shared secret. It must match the frontend exactly — that is what the linker authenticates with, and a mismatch shows up as a host that never connects.' }),
+        el('p', { class: 'hint', text: 'Both carry this site’s shared secret. It must match the frontend exactly: that is what the linker authenticates with, and a mismatch shows up as a host that never connects.' }),
       );
       block.addEventListener('toggle', async () => {
         if (!block.open || pskCache) return;
@@ -1101,12 +1214,25 @@ function renderSettings() {
       linkerConfigs.append(block);
     }
   };
+  // The Published to and On host dropdowns are built from the linker table, so
+  // editing a linker rebuilds both. Only ever fired by user input, which is why
+  // it may name renderEgress before that is declared further down. Debounced,
+  // because the linker fields fire per keystroke: rebuilt eagerly, every
+  // half-typed overlay address landed in the dropdowns as an option.
+  let linkerRefresh = 0;
+  const linkersChanged = () => {
+    renderLinkerConfigs();
+    clearTimeout(linkerRefresh);
+    linkerRefresh = setTimeout(() => { renderServices(); renderEgress(); }, 400);
+  };
   const renderLinkers = () => {
     linkerBody.textContent = '';
     c.linkers.forEach((l, i) => linkerBody.append(linkerRow(l, () => {
       c.linkers.splice(i, 1);
       renderLinkers();
-    }, renderLinkerConfigs)));
+      renderServices();
+      renderEgress();
+    }, linkersChanged)));
     renderLinkerConfigs();
   };
   renderLinkers();
@@ -1114,17 +1240,17 @@ function renderSettings() {
     el('div', { class: 'grid' },
       field("Backend's address on this network", c.backend_lan, (v) => { c.backend_lan = v; renderLinkerConfigs(); }, {
         placeholder: '10.1.1.3',
-        help: 'Where the backend sits on the LAN the extra hosts share with it — its ordinary address there, not its overlay address. '
+        help: 'Where the backend sits on the LAN the extra hosts share with it: its ordinary address there, not its overlay address. '
           + 'It routes nothing by itself; it is the one fact a linker\'s own config needs and nothing else here carries, which is what lets the portal '
           + 'generate that file below instead of you assembling it by hand. Find it on the backend with: ip -br addr. Example: 10.1.1.3.',
       }),
     ),
     el('div', { class: 'table-wrap' }, el('table', {},
       el('thead', {}, el('tr', {},
-        th('Name', 'Label only — used in error messages and on the dashboard card for this host. Examples: gs1, web.'),
+        th('Name', 'Label only: used in error messages and on the dashboard card for this host. Examples: gs1, web.'),
         th('Overlay address', 'The address that machine holds on its own dummy0, and what services are published to. '
           + 'Must be inside the overlay subnet, and not the frontend\'s or the backend\'s. Two linkers cannot share one. Example: 10.99.0.3.'),
-        th('LAN address', 'Where that machine actually is on the backend\'s network — the address the backend forwards to as a neighbour. '
+        th('LAN address', 'Where that machine actually is on the backend\'s network: the address the backend forwards to as a neighbour. '
           + 'Not the same as the overlay address above; transposing the two produces a route pointing at the address it is meant to reach. Example: 10.1.1.4.'),
         th('Table', 'The routing table that host uses for its overlay traffic. Leave 0 for the default of 200. '
           + 'The number belongs to that machine, not to this system: if it already policy-routes for a second ISP or a VPN, pick a free number, '
@@ -1138,19 +1264,19 @@ function renderSettings() {
       class: 'btn', type: 'button',
       onclick: () => { c.linkers.push({ name: 'new', overlay_ip: '', lan_ip: '', enabled: true }); renderLinkers(); },
     }, 'Add linker')),
-    el('p', { class: 'hint', text: 'A linker is a machine behind the backend that publishes its own services — a game server on its own box. It gets its own overlay address, so two of them can both listen on 27015 with nothing to translate.' }),
-    el('p', { class: 'hint', text: 'Overlay address is what services are published to, e.g. 10.99.0.3, and must sit inside the overlay subnet. LAN address is where that machine actually is on the backend’s network, e.g. 10.1.1.4 — the backend forwards to it as a neighbour.' }),
+    el('p', { class: 'hint', text: 'A linker is a machine behind the backend that publishes its own services, a game server on its own box. It gets its own overlay address, so two of them can both listen on 27015 with nothing to translate.' }),
+    el('p', { class: 'hint', text: 'Overlay address is what services are published to, e.g. 10.99.0.3, and must sit inside the overlay subnet. LAN address is where that machine actually is on the backend’s network, e.g. 10.1.1.4: the backend forwards to it as a neighbour.' }),
     el('p', { class: 'hint', text: 'Saving here installs the backend’s route to each linker and keeps it repaired. Nothing has to be run on the backend by hand.' }),
-    el('p', { class: 'hint', text: 'Table is the routing table that host uses for overlay traffic — 200 unless you change it. It belongs to that machine’s own namespace, so pick another number if the box already policy-routes (a second ISP, a VPN): two systems writing one table fight over its default route, and the loser’s traffic goes somewhere nobody intended. Check with: ip rule show, and cat /etc/iproute2/rt_tables.' }),
-    el('p', { class: 'hint', text: 'It must also be set in that host’s own linker.json — the rule it names is what carries the control connection, so the agent needs it before it can be told anything. The generated config below has it; the dashboard warns if the host reports a different one.' }),
-    el('p', { class: 'hint', text: 'Requires overlay.subnet in both bootstrap files. The frontend’s WireGuard peers must also cover that range — the shipped setup uses 10.99.0.0/24, so normally there is nothing to change. A peer still limited to the backend’s single address drops everything for a linker before it reaches the tunnel, and reports nothing: check with wg show wg-main allowed-ips.' }),
+    el('p', { class: 'hint', text: 'Table is the routing table that host uses for overlay traffic, 200 unless you change it. It belongs to that machine’s own namespace, so pick another number if the box already policy-routes (a second ISP, a VPN): two systems writing one table fight over its default route, and the loser’s traffic goes somewhere nobody intended. Check with: ip rule show, and cat /etc/iproute2/rt_tables.' }),
+    el('p', { class: 'hint', text: 'It must also be set in that host’s own linker.json: the rule it names is what carries the control connection, so the agent needs it before it can be told anything. The generated config below has it; the dashboard warns if the host reports a different one.' }),
+    el('p', { class: 'hint', text: 'Requires overlay.subnet in both bootstrap files. The frontend’s WireGuard peers must also cover that range: the shipped setup uses 10.99.0.0/24, so normally there is nothing to change. A peer still limited to the backend’s single address drops everything for a linker before it reaches the tunnel, and reports nothing: check with wg show wg-main allowed-ips.' }),
     linkerConfigs,
   ));
 
   const egressBody = el('tbody', {});
   const renderEgress = () => {
     egressBody.textContent = '';
-    c.egress.sources.forEach((s, i) => egressBody.append(egressRow(s, () => {
+    c.egress.sources.forEach((s, i) => egressBody.append(egressRow(s, c, () => {
       c.egress.sources.splice(i, 1);
       renderEgress();
     }, updateEgressWarning)));
@@ -1161,10 +1287,10 @@ function renderSettings() {
     egressWarning,
     el('div', { class: 'table-wrap' }, el('table', {},
       el('thead', {}, el('tr', {},
-        th('Name', 'Label only — it becomes the comment on the generated rule. Example: gmod container.'),
-        th('On host', 'The overlay address of the machine this network is on. Blank means the backend. '
-          + 'It matters because Docker hands out the same subnets everywhere — 172.17.0.0/16 is the default on every box — so an unowned row would pull '
-          + 'the wrong containers onto the tunnel. The same network on two hosts is fine; the same one twice on a single host is not. Example: blank, or 10.99.0.3.'),
+        th('Name', 'Label only: it becomes the comment on the generated rule. Example: gmod container.'),
+        th('On host', 'The machine this network is on: the backend, or one of the linkers from the section above. '
+          + 'It matters because Docker hands out the same subnets everywhere: 172.17.0.0/16 is the default on every box, so an unowned row would pull '
+          + 'the wrong containers onto the tunnel. The same network on two hosts is fine; the same one twice on a single host is not.'),
         th('Network (CIDR)', 'The container network whose outbound traffic should leave through the frontend\'s public address. IPv4 only. '
           + 'Find it with: docker network inspect <name> -f "{{range .IPAM.Config}}{{.Subnet}}{{end}}". Example: 172.18.0.0/16.'),
         th('Enabled', 'Untick to stop routing that network this way. Its traffic goes back to leaving by the house\'s own internet on the next save.'),
@@ -1176,16 +1302,16 @@ function renderSettings() {
       onclick: () => { c.egress.sources.push({ name: 'new', cidr: '172.18.0.0/16', enabled: true }); renderEgress(); },
     }, 'Add network')),
     el('p', { class: 'hint', text: 'Requires Backend egress via this address, in the Frontend section above.' }),
-    el('p', { class: 'hint', text: 'For services the backend cannot bind to the overlay address — a container has its own network namespace, so the overlay address does not exist inside it. Traffic from these networks is pulled onto the active tunnel and leaves with the frontend’s public address, which is what gets a containerised game server listed at the right address.' }),
-    el('p', { class: 'hint', text: 'Use the docker bridge network, e.g. 172.18.0.0/16 — find it with: docker network inspect <name> -f "{{range .IPAM.Config}}{{.Subnet}}{{end}}". Give the service its own network if the bridge carries anything you do not want routed this way.' }),
+    el('p', { class: 'hint', text: 'For services the backend cannot bind to the overlay address: a container has its own network namespace, so the overlay address does not exist inside it. Traffic from these networks is pulled onto the active tunnel and leaves with the frontend’s public address, which is what gets a containerised game server listed at the right address.' }),
+    el('p', { class: 'hint', text: 'Use the docker bridge network, e.g. 172.18.0.0/16. Find it with: docker network inspect <name> -f "{{range .IPAM.Config}}{{.Subnet}}{{end}}". Give the service its own network if the bridge carries anything you do not want routed this way.' }),
     el('p', { class: 'hint', text: 'All of that network’s internet traffic takes this route, so it counts against the LTE quota during a failover.' }),
-    el('p', { class: 'hint', text: 'On host is the overlay address of the machine the network belongs to. Leave it blank for the backend. It matters because Docker uses the same bridge subnets on every machine — 172.17.0.0/16 is the default everywhere — so a row with no owner would pull containers onto the tunnel on hosts it was never meant to touch. The same network on two different hosts is fine; the same network twice on one host is not.' }),
+    el('p', { class: 'hint', text: 'On host is the machine the network belongs to: the backend unless the containers run on a linker. It matters because Docker uses the same bridge subnets on every machine: 172.17.0.0/16 is the default everywhere, so a row with no owner would pull containers onto the tunnel on hosts it was never meant to touch. The same network on two different hosts is fine; the same network twice on one host is not.' }),
   ));
 
   form.append(section('Notifications',
     el('div', { class: 'grid' },
       el('div', {}, checkbox('Enabled', c.notify.enabled, (v) => (c.notify.enabled = v),
-        'Alerts are sent from this frontend, which is in a datacentre on its own internet — so they still arrive when every tunnel to the house is down.')),
+        'Alerts are sent from this frontend, which is in a datacentre on its own internet, so they still arrive when every tunnel to the house is down.')),
       field('Kind (ntfy, telegram, webhook)', c.notify.kind, (v) => (c.notify.kind = v), {
         placeholder: 'ntfy',
         help: 'One of ntfy, telegram or webhook. Anything else is treated as webhook. '
@@ -1193,7 +1319,7 @@ function renderSettings() {
       }),
       field('URL', c.notify.url, (v) => (c.notify.url = v), {
         placeholder: 'https://ntfy.sh/your-unguessable-topic',
-        help: 'ntfy: the full topic URL, e.g. https://ntfy.sh/your-unguessable-topic — anyone who knows it can read your alerts, so make it long. '
+        help: 'ntfy: the full topic URL, e.g. https://ntfy.sh/your-unguessable-topic. Anyone who knows it can read your alerts, so make it long. '
           + 'telegram: https://api.telegram.org/bot<bot-token>/sendMessage. '
           + 'webhook: a Discord or Slack incoming webhook URL; the body suits both.',
       }),
@@ -1205,15 +1331,15 @@ function renderSettings() {
     ),
     el('div', { class: 'grid' },
       checkbox('On switch', c.notify.on_switch, (v) => (c.notify.on_switch = v),
-        'Traffic moved to a different tunnel. The routine one — expect a few a week on a marginal fixed line.'),
+        'Traffic moved to a different tunnel. The routine one: expect a few a week on a marginal fixed line.'),
       checkbox('On path down', c.notify.on_path_down, (v) => (c.notify.on_path_down = v),
         'A path was condemned or came back. Worth having even when failover handled it silently: two of these in a week is a service to complain about.'),
       checkbox('On quota', c.notify.on_quota, (v) => (c.notify.on_quota = v),
         'A metered path crossed its quota or its ceiling, and has stopped being selectable.'),
       checkbox('When held', c.notify.on_held, (v) => (c.notify.on_held = v),
-        'Nothing is selectable at all — everything is down, over quota or quarantined. The one that needs you: the system parks and waits for an approval.'),
+        'Nothing is selectable at all: everything is down, over quota or quarantined. The one that needs you: the system parks and waits for an approval.'),
     ),
-    el('p', { class: 'hint', text: 'Worth turning on. When every usable path is over quota the system parks and waits for you to approve one — without an alert, that approval only happens when you next open this page.' }),
+    el('p', { class: 'hint', text: 'Worth turning on. When every usable path is over quota the system parks and waits for you to approve one. Without an alert, that approval only happens when you next open this page.' }),
   ));
 
   // Not part of the configuration blob, so it saves on its own rather than
@@ -1229,7 +1355,7 @@ function renderSettings() {
         + 'journalctl -u failover-frontend | grep "portal account created".'), pwCurrent),
       el('label', { class: 'field' }, caption('New password',
         'At least 10 characters. The portal is reachable only over the admin WireGuard tunnel, so this login is defence in depth for a lost phone '
-        + 'rather than the perimeter — a passphrase you will actually remember beats a short one you have to write down.'), pwNew),
+        + 'rather than the perimeter. A passphrase you will actually remember beats a short one you have to write down.'), pwNew),
       el('label', { class: 'field' }, caption('Repeat new password', 'Typed twice because there is no way to recover a mistyped one from here.'), pwConfirm),
     ),
     el('div', { class: 'row' }, el('button', {
@@ -1244,10 +1370,11 @@ function renderSettings() {
       },
     }, 'Change password')),
     el('p', { class: 'hint', text: 'Changing it logs out every other session for this account, which is usually the reason for changing it. This one stays signed in.' }),
-    el('p', { class: 'hint', text: 'Locked out entirely? On the frontend itself: sudo failoverctl passwd — it prints a new one and needs no old password, because anyone who can run it is already root on that box.' }),
+    el('p', { class: 'hint', text: 'Locked out entirely? On the frontend itself: sudo failoverctl passwd. It prints a new one and needs no old password, because anyone who can run it is already root on that box.' }),
   ));
 
   form.append(el('div', { class: 'sticky-save' },
+    el('span', { id: 'unsaved-badge', class: 'badge warn hidden', text: 'Unsaved changes' }),
     el('button', { class: 'btn primary', type: 'button', onclick: saveSettings }, 'Save configuration'),
     help('Applies immediately: the probers restart, the rulesets are regenerated, and the backend and any linkers are pushed their share of it within a couple of seconds. '
       + 'Nothing here is staged. In observe mode the parts that would move traffic are still withheld.'),
@@ -1262,7 +1389,7 @@ function renderSettings() {
       },
     }, 'Revert all system changes'),
     help('Takes down the nftables tables and every policy route this agent installed, and drops back to observe mode so the next decision cannot quietly reinstall them. '
-      + 'Published services stop working until you arm it again. WireGuard tunnels are never touched — the agent did not create them.'),
+      + 'Published services stop working until you arm it again. WireGuard tunnels are never touched: the agent did not create them.'),
   ));
 }
 
@@ -1270,6 +1397,7 @@ async function loadSettings() {
   try {
     config = await api('/api/config');
     renderSettings();
+    markSaved();
   } catch (e) {
     toast(e.message, true);
   }
@@ -1278,6 +1406,7 @@ async function loadSettings() {
 async function saveSettings() {
   try {
     await api('/api/config', { method: 'PUT', body: JSON.stringify(config) });
+    markSaved();
     toast('Configuration saved');
     refreshStatus();
   } catch (e) {
