@@ -753,6 +753,18 @@ Breaking any of these is a correctness bug even if the tests pass.
     the rules without dropping to observe means the very next tick sees no
     active path, picks one, and reinstalls the route — leaving the host half
     reverted, routing restored and nftables gone.
+
+    **And it must exclude a settings save, for a worse version of the same
+    reason.** `Revert` reads the configuration, spends a few hundred
+    milliseconds tearing down a dozen things, and records `dataPlane = false`
+    only at the end. A `Reconfigure` landing in that window runs
+    `applySystemConfig` and puts the DNAT ruleset and the route straight back;
+    revert then finishes and reports the system reverted. Unlike the disarm
+    case, nothing corrects it afterwards — the engine believes there is nothing
+    installed, so nothing tries. The rules stay live while the portal says they
+    are gone, which is invariant 13 failing in the one direction it must not,
+    on the one command that exists to be trusted. `Revert` takes `reconfMu` and
+    `applyMu`, in that order.
 13. **Disarming is not a teardown.** Going armed → observe stops further
     changes but deliberately leaves installed rules in place, because deleting
     the DNAT table would drop every published service instantly. `Status.
@@ -801,6 +813,26 @@ Breaking any of these is a correctness bug even if the tests pass.
     routes (`Run`'s select, `applyLoop`), because a reconciler racing a switch
     in progress would read the kernel between the route going in and the
     decision being recorded, and undo it.
+
+    **Sharing a goroutine only settles the writers that are on it, and there
+    were others.** On the frontend, `applySystemConfig` re-asserts the route for
+    the active path and runs on an HTTP handler's goroutine; `Revert` removes
+    routes from another. On the backend, `ApplyConfig` re-asserts the return
+    path from the control client's goroutine. Each is a third writer the
+    same-goroutine argument never covered, and the collision is the one that
+    argument describes: a settings save reads the outgoing path, `evaluate`
+    installs the incoming one, and the save then writes the dead tunnel back
+    over it — published traffic down a link that has just failed, portal showing
+    the healthy one, until a reconciler notices up to 10s later. `Engine.applyMu`
+    and `Agent.applyMu` serialise every route writer, so only one goroutine is
+    ever inside `ip`. `internal/linker` had this from the start and is the
+    model: one lock, taken by both the control session and the reconcile loop.
+
+    **Frontend lock order is `reconfMu` then `applyMu`, never the reverse.**
+    `Run`'s goroutine takes only `applyMu`, so there is no cycle. `applyMu` is
+    deliberately not taken inside `applyActivePath` or `applyPlumbing`: their
+    callers hold it across several groups of shell-outs precisely so a decision
+    cannot land between them.
 
     **The queue discipline is on that list too.** A shaper belongs to the
     interface exactly as `rp_filter` does, so `wg-quick down` takes it with the
@@ -1210,6 +1242,12 @@ where a subtle regression would be invisible in production until an outage:
   duplicate generation is invisible except as a path probing faster than its
   configured interval. On the original code the last of these reported 24
   goroutines where three were wanted.
+- `engine/apply_serialise_test.go`, `agent/apply_serialise_test.go` — no two
+  goroutines are ever inside a system command at once. Both drive every route
+  writer concurrently against a runner that reports the peak number of
+  overlapping calls, which is the property that matters: each fault in this
+  family is two goroutines writing the same route, and which one lands last is
+  a matter of timing. On the unguarded code they report four and three.
 - `sysx/linker_test.go` — that a site with no subnet generates byte-identical
   rules, that the two prefix helpers agree once one is set, that a service
   target moves only the DNAT, and that the source rules stay behind the

@@ -68,11 +68,29 @@ type Engine struct {
 	// interval.
 	liveProbers atomic.Int64
 
-	// reconfMu serialises Reconfigure against itself. It is deliberately a
-	// separate lock from mu: it has to be held across applySystemConfig, which
-	// shells out to ip, nft and tc and is far too slow to hold the state lock
-	// for. See Reconfigure for the fault it prevents.
+	// reconfMu serialises Reconfigure and Revert against each other. It is
+	// deliberately a separate lock from mu: it has to be held across
+	// applySystemConfig, which shells out to ip, nft and tc and is far too slow
+	// to hold the state lock for. See Reconfigure for the fault it prevents.
 	reconfMu sync.Mutex
+
+	// applyMu serialises the shell-outs that write routes, so that only one
+	// goroutine is running `ip` at a time.
+	//
+	// evaluate and reconcileRouting already share Run's goroutine, because a
+	// reconciler reading the kernel between a route going in and the switch
+	// being recorded would undo it - invariant 18. applySystemConfig is the
+	// third writer that reasoning missed: it runs on the HTTP handler's
+	// goroutine, and it re-asserts the route for the active path. A settings
+	// save landing as a failover fires could read the outgoing path, wait for
+	// evaluate to install the new route, and then write the dead tunnel back
+	// over it - published traffic down a link that had just failed, with the
+	// portal showing the new one, until the reconciler noticed up to 10s later.
+	// Revert is a fourth: it removes routes evaluate may be installing.
+	//
+	// Always taken *after* reconfMu, never before. Run's goroutine takes only
+	// this one, so there is no cycle.
+	applyMu sync.Mutex
 
 	active      int
 	pinned      int // operator override; 0 means automatic selection
@@ -391,6 +409,13 @@ func (e *Engine) onResult(ctx context.Context, r Result) {
 
 // evaluate recomputes policy blocks, picks a path and applies the choice.
 func (e *Engine) evaluate(ctx context.Context, now time.Time) {
+	// Held for the whole decision, not just the route write: the choice is
+	// installed first and recorded second (invariant 10), and a settings save
+	// re-asserting the active path inside that gap writes the outgoing tunnel
+	// back over the incoming one.
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
 	e.mu.Lock()
 	cfg := e.cfg
 
@@ -808,6 +833,11 @@ func (e *Engine) seedActiveFromKernel(ctx context.Context) {
 // it. What observe mode does suppress is the two things that do move traffic:
 // the main-table route to the backend, and the DNAT ruleset.
 func (e *Engine) applySystemConfig(ctx context.Context) {
+	// Against evaluate and reconcileRouting, which write the same routes from
+	// Run's goroutine. See applyMu.
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
 	e.mu.RLock()
 	cfg := e.cfg
 	gated := e.runner
@@ -1110,6 +1140,11 @@ func (e *Engine) applyEgress(ctx context.Context, cfg model.Config, gated, real 
 // every ten seconds. Observe mode is still honoured for the one route that
 // moves traffic.
 func (e *Engine) reconcileRouting(ctx context.Context) {
+	// Shares Run's goroutine with evaluate, so this is only ever contended
+	// against applySystemConfig and Revert. See applyMu.
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
 	e.mu.RLock()
 	cfg := e.cfg
 	gated := e.runner
@@ -1744,7 +1779,24 @@ func (e *Engine) PinnedPath() int {
 // probe tables and their rules, and the backend route. It is the one-command
 // undo for a bad change, and it deliberately leaves the WireGuard tunnels
 // alone because the agent never created them.
+// It is serialised against Reconfigure, and that is the load-bearing part.
+// Revert reads the configuration, spends a few hundred milliseconds tearing
+// down a dozen things, and only records dataPlane = false at the end. A
+// settings save landing in that gap runs applySystemConfig and puts the DNAT
+// ruleset and the route straight back - and then this finishes and reports the
+// system reverted. Nothing corrects that afterwards, precisely because the
+// engine believes there is nothing installed: the rules stay live while the
+// portal says they are gone, which is invariant 13 failing in the one
+// direction it must not, on the one command that exists to be trusted.
 func (e *Engine) Revert(ctx context.Context) {
+	e.reconfMu.Lock()
+	defer e.reconfMu.Unlock()
+
+	// And against the decision loop, which would otherwise install a route
+	// between two of the removals below. Always after reconfMu; see applyMu.
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+
 	e.mu.RLock()
 	cfg := e.cfg
 	e.mu.RUnlock()

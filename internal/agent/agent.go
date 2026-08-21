@@ -50,6 +50,24 @@ type Agent struct {
 	pendingMu sync.Mutex
 	pending   pathDecision
 	wake      chan struct{}
+
+	// applyMu serialises the shell-outs that write routes, so only one
+	// goroutine is running `ip` at a time.
+	//
+	// applyDecision and reconcileRouting already share applyLoop's goroutine,
+	// so a repair cannot race a switch being applied. ApplyConfig is the writer
+	// that reasoning missed: it runs on the control client's goroutine and
+	// re-asserts the return path, which is the same table 100 default route a
+	// decision installs. A configuration push arriving as a failover landed
+	// could put the outgoing tunnel back over the incoming one, sending every
+	// published reply down a link that had just failed - requests arriving
+	// fine, answers going nowhere - until the reconciler noticed up to 10s
+	// later.
+	//
+	// Not taken inside applyPlumbing: ApplyConfig holds this across it and two
+	// further groups of shell-outs, so that a decision cannot slip between
+	// them, and Run calls it before any of these goroutines exist.
+	applyMu sync.Mutex
 }
 
 // New builds a backend agent.
@@ -124,6 +142,13 @@ func (a *Agent) ApplyConfig(ctx context.Context, cfg proto.BackendConfig) {
 	a.mu.Unlock()
 
 	a.cacheConfig(cfg)
+
+	// Against applyDecision and reconcileRouting, which write the same routes
+	// from applyLoop's goroutine. Held across all three groups below, not each
+	// one separately, so a decision cannot land between them. See applyMu.
+	a.applyMu.Lock()
+	defer a.applyMu.Unlock()
+
 	a.applyPlumbing(ctx, cfg)
 	// Against the config this one replaced, which after a restart is the one
 	// loaded from disk - so a linker removed while the backend was down still
@@ -468,6 +493,11 @@ func (a *Agent) applyLoop(ctx context.Context) {
 // issues nothing but `ip route show` every ten seconds. Observe mode is still
 // honoured for the one route that carries published traffic.
 func (a *Agent) reconcileRouting(ctx context.Context) {
+	// Shares applyLoop's goroutine with applyDecision, so this is only ever
+	// contended against a configuration push. See applyMu.
+	a.applyMu.Lock()
+	defer a.applyMu.Unlock()
+
 	cfg, ok := a.Config()
 	if !ok {
 		return
@@ -582,6 +612,13 @@ func (a *Agent) applyDecision(ctx context.Context, pathID int, decisionSeq uint6
 	if pathID == 0 {
 		return
 	}
+
+	// Held for the whole decision, not just the route write: the routing is
+	// installed first and the active path recorded second (invariant 10), and a
+	// configuration push re-asserting the return path inside that gap writes
+	// the outgoing tunnel back over the incoming one. See applyMu.
+	a.applyMu.Lock()
+	defer a.applyMu.Unlock()
 
 	a.mu.RLock()
 	prev, lastSeq, cfg, runner := a.active, a.lastSeq, a.cfg, a.runner
