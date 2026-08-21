@@ -11,6 +11,7 @@ import (
 	"github.com/quinlan102/homeport/internal/model"
 	"github.com/quinlan102/homeport/internal/notify"
 	"github.com/quinlan102/homeport/internal/store"
+	"github.com/quinlan102/homeport/internal/sysx"
 )
 
 // engineForProbers builds an engine whose probers will run for real - they are
@@ -155,6 +156,16 @@ func TestConcurrentReconfigureLeavesOneProberPerPath(t *testing.T) {
 // So this one binds real sockets on the loopback and points them at a listener
 // that never answers, which is what puts the read loop where it has to be:
 // blocked inside ReadFromUDP with the deadline still running.
+//
+// Both of its assertions are negative - a fast return, and no goroutines left -
+// so it passes trivially if no read loop was ever created, which is exactly
+// what happens when the sockets fail to bind. That is not hypothetical: the
+// probe socket is stamped with the path's fwmark, and on Linux SO_MARK needs
+// CAP_NET_ADMIN, so an unprivileged run there took the dial-failure path and
+// reported a pass whether or not the watcher this guards existed at all. Hence
+// the two checks below - a preflight that skips rather than lies when the
+// sockets cannot be marked, and a probe read that proves the loops are real
+// before anything is timed.
 func TestStopProbersDoesNotWaitOnTheReadDeadline(t *testing.T) {
 	// A socket that receives probes and never replies. Without it the sends
 	// would draw ICMP port-unreachable, the read would return early, and the
@@ -166,6 +177,8 @@ func TestStopProbersDoesNotWaitOnTheReadDeadline(t *testing.T) {
 	defer silent.Close()
 	port := silent.LocalAddr().(*net.UDPAddr).Port
 
+	requireMarkedSocket(t, model.Defaults().Paths[0].Mark)
+
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -176,6 +189,11 @@ func TestStopProbersDoesNotWaitOnTheReadDeadline(t *testing.T) {
 	cfg.Overlay.FrontendIP = "127.0.0.1" // bindable here, unlike 10.99.0.1
 	cfg.Overlay.BackendIP = "127.0.0.1"
 	cfg.Overlay.ProbePort = port
+	// The first send waits out one tick, and nothing is active yet, so the
+	// shipped 5s standby cadence would put the first probe well past the point
+	// this test wants to be measuring at.
+	cfg.Probe.ActiveIntervalMs = 50
+	cfg.Probe.StandbyIntervalMs = 50
 
 	log := quietLogger()
 	e := New(log, st, notify.New(log), cfg, []byte("secret"), t.TempDir())
@@ -189,8 +207,19 @@ func TestStopProbersDoesNotWaitOnTheReadDeadline(t *testing.T) {
 	e.startProbers(ctx)
 	waitForProbers(t, e, int64(len(cfg.Paths)), "after start")
 
-	// Give the read loops time to be inside ReadFromUDP rather than still
-	// setting up, so the wait being measured is the one that matters.
+	// A probe arriving is the only proof from out here that the sockets bound
+	// and the read loops exist. Without it the timing check below measures
+	// nothing, because there is no read to be blocked in.
+	if err := silent.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, _, err := silent.ReadFrom(make([]byte, 1500)); err != nil {
+		t.Fatalf("no probe arrived (%v); the sockets did not bind, so there is no read loop to wait on "+
+			"and the timing below would pass without testing anything", err)
+	}
+
+	// Let the read loops settle back inside ReadFromUDP rather than still
+	// handling the send, so the wait being measured is the one that matters.
 	time.Sleep(100 * time.Millisecond)
 
 	start := time.Now()
@@ -205,4 +234,22 @@ func TestStopProbersDoesNotWaitOnTheReadDeadline(t *testing.T) {
 	if n := e.liveProbers.Load(); n != 0 {
 		t.Fatalf("%d probers still running after stopProbers", n)
 	}
+}
+
+// requireMarkedSocket skips when this machine cannot open the kind of socket a
+// prober opens.
+//
+// Off Linux sysx.MarkControl is a no-op and this always succeeds. On Linux
+// SO_MARK needs CAP_NET_ADMIN, so an unprivileged run cannot bind a probe
+// socket at all - and a test whose assertions are both negative would call that
+// a pass. Skipping says out loud that the case went unexercised.
+func requireMarkedSocket(t *testing.T, mark int) {
+	t.Helper()
+	lc := net.ListenConfig{Control: sysx.MarkControl(mark)}
+	c, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot open an fwmark-stamped socket here (%v); "+
+			"the probers would take the dial-failure path and never start a read loop", err)
+	}
+	_ = c.Close()
 }
