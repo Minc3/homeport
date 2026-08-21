@@ -562,6 +562,25 @@ func TestMovingARuleAddsBeforeItDeletes(t *testing.T) {
 	if add > del {
 		t.Errorf("the old probe rule was removed before the new one existed; calls were %v", g.calls)
 	}
+
+	// The source-based return rule moves the same way. Its gap is worse than a
+	// wrong measurement: with no rule at all, a reply sourced from the overlay
+	// address falls through to main and leaves by the LAN to pfSense, which is
+	// a dropped reply to a real client for as long as the two commands take.
+	h := &fakeRunner{replies: map[string]string{
+		"ip rule show table 100": "30000:\tfrom 10.99.0.2 lookup 100\n",
+	}}
+	if err := EnsureReturnRule(context.Background(), h, "10.99.0.2"); err != nil {
+		t.Fatalf("EnsureReturnRule: %v", err)
+	}
+	add = h.index("ip rule add from 10.99.0.2 lookup 100 pref " + strconv.Itoa(ReturnRulePrefBase))
+	del = h.index("ip rule del from 10.99.0.2 lookup 100 pref 30000")
+	if add < 0 || del < 0 {
+		t.Fatalf("expected the return rule to be moved; calls were %v", h.calls)
+	}
+	if add > del {
+		t.Errorf("the old return rule was removed before the new one existed; calls were %v", h.calls)
+	}
 }
 
 // The probe tables go the same way the control table does: by name.

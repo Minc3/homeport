@@ -349,6 +349,22 @@ func EnsureReturnRule(ctx context.Context, r Runner, sources ...string) error {
 		for _, pref := range found {
 			if pref == want {
 				correct = true
+				break
+			}
+		}
+		// The pinned rule goes in before any stray comes out, like every other
+		// rule move here (invariant 3). In the gap the other order opens, a
+		// reply sourced from the overlay matches no rule, falls through to
+		// main, and leaves by the LAN to pfSense - a dropped reply to a real
+		// client, on the upgrade that moves the rule.
+		if !correct {
+			if _, err := r.Run(ctx, "ip", "rule", "add", "from", src, "lookup", table,
+				"pref", strconv.Itoa(want)); err != nil {
+				return err
+			}
+		}
+		for _, pref := range found {
+			if pref == want {
 				continue
 			}
 			// Anything at another priority came from a build that let the
@@ -356,13 +372,6 @@ func EnsureReturnRule(ctx context.Context, r Runner, sources ...string) error {
 			// and swallows their replies - see ReturnRulePrefBase.
 			_, _ = r.Run(ctx, "ip", "rule", "del", "from", src, "lookup", table,
 				"pref", strconv.Itoa(pref))
-		}
-		if correct {
-			continue
-		}
-		if _, err := r.Run(ctx, "ip", "rule", "add", "from", src, "lookup", table,
-			"pref", strconv.Itoa(want)); err != nil {
-			return err
 		}
 	}
 	return nil
