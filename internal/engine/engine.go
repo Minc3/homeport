@@ -409,13 +409,6 @@ func (e *Engine) onResult(ctx context.Context, r Result) {
 
 // evaluate recomputes policy blocks, picks a path and applies the choice.
 func (e *Engine) evaluate(ctx context.Context, now time.Time) {
-	// Held for the whole decision, not just the route write: the choice is
-	// installed first and recorded second (invariant 10), and a settings save
-	// re-asserting the active path inside that gap writes the outgoing tunnel
-	// back over the incoming one.
-	e.applyMu.Lock()
-	defer e.applyMu.Unlock()
-
 	e.mu.Lock()
 	cfg := e.cfg
 
@@ -448,13 +441,32 @@ func (e *Engine) evaluate(ctx context.Context, now time.Time) {
 	// applying afterwards would leave the portal claiming a path the kernel
 	// never moved to, and because the next pass sees the choice as already
 	// current, a failed `ip route replace` would never be retried.
+	//
+	// applyMu covers exactly that pair and no more. It has to cover both,
+	// because applySystemConfig reads e.active and re-asserts its route under
+	// the same lock: interleaved, a settings save would read the outgoing
+	// tunnel, wait behind the install below, and then write the dead path back
+	// over the one just chosen. Held either side of the pair it lands wholly
+	// before or wholly after, and both orders end on the chosen path.
+	//
+	// It deliberately does not cover the rest of this function. The lock is
+	// also held across every shell-out in applySystemConfig, so a settings save
+	// taken at the top would park Run's whole select for the length of the
+	// save: no decision, no reconcile, and no draining of e.results. prevActive
+	// is read without it on purpose - it only decides whether the choice
+	// changed, and a save landing beside that read still leaves the route
+	// pointing at chosen.
 	if chosen != 0 && chosen != prevActive {
 		newCfg, _ := cfg.PathByID(chosen)
-		if err := e.applyActivePath(ctx, newCfg); err != nil {
+		e.applyMu.Lock()
+		err := e.applyActivePath(ctx, newCfg)
+		if err == nil {
+			e.commitSwitch(ctx, cfg, chosen, prevActive, now)
+		}
+		e.applyMu.Unlock()
+		if err != nil {
 			e.log.Error("failed to install route, will retry", "path", newCfg.Name, "err", err)
 			_ = e.st.AddEvent(store.EventSystem, chosen, "failed to install route via %s: %v", newCfg.Iface, err)
-		} else {
-			e.commitSwitch(ctx, cfg, chosen, prevActive, now)
 		}
 	}
 
