@@ -303,10 +303,17 @@ revert_frontend() {
 # anything was actually running.
 AGENT_WAS_UP=0
 stop_agent() {
+	# 'deactivating' counts as up: a unit caught mid-stop was serving moments
+	# ago, and telling the operator it "was not running to begin with" would
+	# be the report lying in the other direction.
 	case "$(systemctl is-active "$UNIT" 2>/dev/null)" in
-	active | activating | reloading) AGENT_WAS_UP=1 ;;
+	active | activating | reloading | deactivating) AGENT_WAS_UP=1 ;;
 	esac
-	echo "  stopping $UNIT first, so its reconciler cannot reinstall what this removes"
+	if [ "$AGENT_WAS_UP" -eq 1 ]; then
+		echo "  stopping $UNIT first, so its reconciler cannot reinstall what this removes"
+	else
+		echo "  $UNIT is not running; stopping it anyway in case it is on its way up"
+	fi
 	systemctl stop "$UNIT" >/dev/null 2>&1 || true
 	systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
 }
