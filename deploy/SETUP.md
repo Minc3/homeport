@@ -727,34 +727,6 @@ Do not copy the binary over the running one by hand. The scripts install
 alongside and rename into place, and they refresh the systemd unit, which a
 hand copy skips.
 
-### If your tunnels are still called `wg-nbn`
-
-The shipped defaults name the first path `main` on `wg-main`. An update never
-rewrites your saved configuration, so a site installed under the old names
-keeps working exactly as it did. Two things reference the shipped name: the
-installers warn that `wg-main` is missing during their environment check, and
-the backend's unit orders itself after `wg-quick@wg-main.service`. Neither
-affects routing, so ignoring both is a valid answer.
-
-The ordering is the one worth knowing about. `After=` naming a unit this host
-does not have is not an error, it simply orders nothing, so after a reboot the
-backend can start before your tunnel is up and that path's probe table is empty
-until the reconciler refills it, within ten seconds. Nothing is misrouted in the
-meantime; the path reads as down for that long.
-
-To rename instead, on the frontend and the backend:
-
-```sh
-systemctl disable --now wg-quick@wg-nbn
-mv /etc/wireguard/wg-nbn.conf /etc/wireguard/wg-main.conf
-systemctl enable --now wg-quick@wg-main
-```
-
-Then in **Settings, Paths** change that path's interface to `wg-main` and save.
-Do the portal edit last: the agent probes whatever the configuration names, so
-a path pointing at an interface that no longer exists reads as down until you
-do.
-
 From a workstation instead, without a clone on the host:
 
 ```sh
