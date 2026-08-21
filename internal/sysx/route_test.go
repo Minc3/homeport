@@ -120,6 +120,10 @@ func TestDryRunnerSuppressesMutationsButRunsQueries(t *testing.T) {
 		{"ip", "link", "add", "dummy0", "type", "dummy"},
 		{"nft", "-f", "/var/lib/failover/ruleset.nft"},
 		{"sysctl", "-w", "net.ipv4.ip_forward=1"},
+		// Nothing issues `wg set` today; this pins that the day something
+		// does, observe mode suppresses it rather than running it for real
+		// because "every wg is a read" happened to be true at the time.
+		{"wg", "set", "wg-main", "peer", "abc", "endpoint", "1.2.3.4:51820"},
 	}
 	for _, m := range mutations {
 		if isReadOnly(m[0], m[1:]) {

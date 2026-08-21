@@ -114,7 +114,11 @@ func isReadOnly(name string, args []string) bool {
 	}
 	switch name {
 	case "wg":
-		return true
+		// Only the show forms. Nothing here issues `wg set` today, but "every
+		// wg is a read" would run one for real in observe mode the day
+		// something does - the reverse of the failure direction above, and the
+		// one direction observe mode must never fail in.
+		return args[0] == "show" || args[0] == "showconf"
 	case "ip", "tc":
 		// Both put the verb after a subsystem word - `ip route show`,
 		// `tc qdisc show` - so the whole argument list is scanned. None of the
