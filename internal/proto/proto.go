@@ -125,6 +125,7 @@ const (
 	MsgHello     = "hello"     // backend  -> frontend, after auth
 	MsgConfig    = "config"    // frontend -> backend, the pushed configuration
 	MsgUsage     = "usage"     // backend  -> frontend, buffered counter deltas
+	MsgUsageAck  = "usage_ack" // frontend -> backend, sequences safely in the ledger
 	MsgLink      = "link"      // backend  -> frontend, WireGuard handshake ages
 	MsgPing      = "ping"
 	MsgPong      = "pong"
@@ -216,6 +217,21 @@ type UsageDelta struct {
 // Usage is a batch of deltas.
 type Usage struct {
 	Deltas []UsageDelta `json:"deltas"`
+}
+
+// UsageAck reports, per path, the highest delta sequence the frontend has
+// durably recorded. The backend keeps a delta buffered until an ack covers it.
+//
+// It exists because a successful TCP write is not delivery: the bytes sit in
+// the local send buffer, and the connection dying right there - which is what
+// a failover does to it - loses them. The backend used to drop its buffered
+// copy the moment the write returned, so the batch in flight at every
+// disconnect was silently gone from the ledger, and the loss always fell on
+// exactly the usage a failover causes. Acking what was *applied* rather than
+// what was sent closes that: anything unacked is resent on the next tick, and
+// the per-path sequence dedupe makes the overlap free.
+type UsageAck struct {
+	Seqs map[int]uint64 `json:"seqs"`
 }
 
 // LinkInfo is the backend's local view of a tunnel. This is a corroborating

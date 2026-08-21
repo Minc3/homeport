@@ -155,6 +155,13 @@ func (a *Agent) runSession(ctx context.Context, conn net.Conn, addr string) erro
 				continue
 			}
 			a.ApplyConfig(ctx, cfg)
+		case proto.MsgUsageAck:
+			var ack proto.UsageAck
+			if err := proto.DecodeInto(env, &ack); err != nil {
+				a.log.Warn("bad usage ack frame", "err", err)
+				continue
+			}
+			a.meter.AckApplied(ack.Seqs)
 		case proto.MsgPing:
 			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			_ = proto.WriteFrame(conn, proto.MsgPong, nil)
@@ -189,9 +196,14 @@ func (a *Agent) reportLoop(ctx context.Context, conn net.Conn) {
 			if err := proto.WriteFrame(conn, proto.MsgUsage, proto.Usage{Deltas: batch}); err != nil {
 				return
 			}
-			// The frontend dedupes on the per-path sequence number, so a batch
-			// that is sent but never applied is safe to resend.
-			a.meter.Ack(len(batch))
+			// Deliberately not dropped here. A successful write is not delivery
+			// - the bytes can die in the send buffer with the connection, which
+			// is what a failover does to it - so the buffer holds every delta
+			// until the frontend's usage_ack says it is in the ledger. Until
+			// then each tick resends the oldest batch; the frontend dedupes on
+			// the per-path sequence, so the overlap costs nothing. (A frontend
+			// too old to ack never drains this buffer; it caps at maxBuffered
+			// and drops oldest-first, which by then is long since applied.)
 
 		case <-link.C:
 			cfg, ok := a.Config()

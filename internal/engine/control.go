@@ -179,7 +179,14 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 		case proto.MsgUsage:
 			var u proto.Usage
 			if proto.DecodeInto(env, &u) == nil {
-				s.applyUsage(u)
+				ack := s.applyUsage(u)
+				// The ack is what lets the backend drop its buffered copy. Sent
+				// from this goroutine, beside the pong: concurrent WriteFrames
+				// are safe, each is a single Write on the connection.
+				if len(ack.Seqs) > 0 {
+					_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+					_ = proto.WriteFrame(conn, proto.MsgUsageAck, ack)
+				}
 			}
 		case proto.MsgLink:
 			var l proto.Link
@@ -197,19 +204,22 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 	}
 }
 
-// applyUsage folds buffered metering deltas into the ledger.
+// applyUsage folds buffered metering deltas into the ledger and returns, per
+// path in the batch, the highest sequence now safely recorded - which is what
+// the backend needs in order to drop its buffered copies and nothing more.
 //
-// The backend replays anything it could not deliver while the control channel
-// was down, so deltas arrive more than once. Each is stamped with a per-path
-// sequence number and anything not strictly newer than what was already
-// applied is dropped, which keeps replays from double-counting LTE data.
-func (s *ControlServer) applyUsage(u proto.Usage) {
+// The backend resends anything it has not seen acked, so deltas arrive more
+// than once. Each is stamped with a per-path sequence number and anything not
+// strictly newer than what was already applied is dropped, which keeps
+// resends from double-counting LTE data.
+func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	st := s.eng.Store()
+	ack := proto.UsageAck{Seqs: map[int]uint64{}}
 	// Deltas for one path arrive in sequence order, and the watermark is a
 	// single high-water mark. If one write fails, every later delta for that
 	// path must be held back too - otherwise the next success would advance the
-	// watermark past the failed one and those metered bytes are gone for good,
-	// since the backend has already dropped its buffered copy.
+	// watermark past the failed one, the ack would tell the backend to drop it,
+	// and those metered bytes are gone for good.
 	stalled := map[int]bool{}
 	for _, d := range u.Deltas {
 		if stalled[d.PathID] {
@@ -217,12 +227,18 @@ func (s *ControlServer) applyUsage(u proto.Usage) {
 		}
 		key := "usage_seq:" + strconv.Itoa(d.PathID)
 		last, _ := strconv.ParseUint(st.Meta(key), 10, 64)
+		// A duplicate of something already applied is covered by the existing
+		// watermark, so the ack starts there: a batch of pure resends still
+		// tells the backend it may stop resending them.
+		if _, seen := ack.Seqs[d.PathID]; !seen {
+			ack.Seqs[d.PathID] = last
+		}
 		if d.Sequence <= last {
 			continue
 		}
-		// Only advance the watermark once the bytes are in the ledger.
-		// Advancing regardless would let a failed write discard metered LTE
-		// usage for good: the backend has already dropped its buffered copy.
+		// Only advance the watermark - and the ack - once the bytes are in the
+		// ledger. Acking regardless would discard metered LTE usage for good:
+		// the backend drops its buffered copy on the strength of this number.
 		if err := s.eng.AddUsage(d.PathID, d.Bytes, d.Packets, time.Unix(d.AtUnix, 0)); err != nil {
 			s.log.Warn("usage delta not recorded, holding back this path's watermark",
 				"path_id", d.PathID, "seq", d.Sequence, "err", err)
@@ -230,7 +246,9 @@ func (s *ControlServer) applyUsage(u proto.Usage) {
 			continue
 		}
 		_ = st.SetMeta(key, strconv.FormatUint(d.Sequence, 10))
+		ack.Seqs[d.PathID] = d.Sequence
 	}
+	return ack
 }
 
 func (s *ControlServer) pushLoop(ctx context.Context, conn net.Conn) {

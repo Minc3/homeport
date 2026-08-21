@@ -151,15 +151,31 @@ func (m *Meter) Pending() []proto.UsageDelta {
 	return out
 }
 
-// Ack drops the first n deltas after the frontend has accepted them.
-func (m *Meter) Ack(n int) {
+// AckApplied drops every buffered delta the frontend's ack covers: for each
+// path named, everything at or below the acked sequence.
+//
+// Driven by the frontend's usage_ack frame rather than by the send succeeding,
+// because a successful write only means the bytes reached the local send
+// buffer. The connection dying right there - which is what a failover does to
+// it - would lose the batch in flight, and it used to: the buffered copy was
+// dropped the moment the write returned, so every disconnect silently lost the
+// usage it coincided with, always in the direction of undercounting a metered
+// path. A delta the ack does not cover stays buffered and is resent.
+func (m *Meter) AckApplied(seqs map[int]uint64) {
 	m.mu.Lock()
-	if n > len(m.pending) {
-		n = len(m.pending)
+	kept := m.pending[:0]
+	for _, d := range m.pending {
+		if upTo, ok := seqs[d.PathID]; ok && d.Sequence <= upTo {
+			continue
+		}
+		kept = append(kept, d)
 	}
-	m.pending = m.pending[n:]
+	changed := len(kept) != len(m.pending)
+	m.pending = kept
 	m.mu.Unlock()
-	m.persist()
+	if changed {
+		m.persist()
+	}
 }
 
 func (m *Meter) persist() {
