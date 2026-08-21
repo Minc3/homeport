@@ -162,6 +162,19 @@ type Engine struct {
 	// rather than implying nothing is applied.
 	dataPlane bool
 
+	// reverted latches after Revert and holds until the next Reconfigure. It
+	// exists because a revert is the one state the running engine must not
+	// repair: observe mode deliberately keeps the measurement plumbing alive,
+	// so without this the reconciler reinstalled the probe tables, their rules
+	// and rp_filter within one 10s tick of Revert removing them, and evaluate
+	// reinstalled the control route within 500ms. On a running host that was
+	// merely surprising; during uninstall it was a race - the script stops the
+	// unit moments after the revert returns, and a tick landing in that gap
+	// put rules back that the about-to-be-deleted binary was the only thing
+	// able to remove. While set, nothing is installed and nothing is measured;
+	// a settings save or a mode change is what brings the engine back.
+	reverted bool
+
 	// cfgVersion increments on every configuration change. The control server
 	// watches it to know when to push a fresh config down to the backend.
 	cfgVersion uint64
@@ -410,6 +423,14 @@ func (e *Engine) onResult(ctx context.Context, r Result) {
 // evaluate recomputes policy blocks, picks a path and applies the choice.
 func (e *Engine) evaluate(ctx context.Context, now time.Time) {
 	e.mu.Lock()
+	if e.reverted {
+		// A reverted system has no probe routes and no probers, so every
+		// verdict here would be stale and every choice would reinstall routing
+		// the operator just removed - applyActivePath's control-route repair
+		// runs through the real runner whatever the mode. Reconfigure resumes.
+		e.mu.Unlock()
+		return
+	}
 	cfg := e.cfg
 
 	for _, p := range cfg.Paths {
@@ -459,6 +480,16 @@ func (e *Engine) evaluate(ctx context.Context, now time.Time) {
 	if chosen != 0 && chosen != prevActive {
 		newCfg, _ := cfg.PathByID(chosen)
 		e.applyMu.Lock()
+		// Re-checked under the apply lock: a Revert that won the lock between
+		// the check at the top and here has just torn everything down, and this
+		// install would put the control route straight back.
+		e.mu.RLock()
+		reverted := e.reverted
+		e.mu.RUnlock()
+		if reverted {
+			e.applyMu.Unlock()
+			return
+		}
 		err := e.applyActivePath(ctx, newCfg)
 		if err == nil {
 			e.commitSwitch(ctx, cfg, chosen, prevActive, now)
@@ -1161,7 +1192,17 @@ func (e *Engine) reconcileRouting(ctx context.Context) {
 	cfg := e.cfg
 	gated := e.runner
 	active := e.active
+	reverted := e.reverted
 	e.mu.RUnlock()
+
+	// After a revert there is nothing to repair: what looks missing is missing
+	// because the operator removed it, and this loop putting the probe tables
+	// and rp_filter back within a tick is exactly what let an uninstall strand
+	// them. Read after taking applyMu, so a Revert holding the lock is seen the
+	// moment it releases. Reconfigure clears the latch.
+	if reverted {
+		return
+	}
 
 	real := e.realRunner()
 
@@ -1563,6 +1604,14 @@ func (e *Engine) KnownLinker(overlayIP string) bool {
 
 func (e *Engine) persistSamples(now time.Time) {
 	e.mu.RLock()
+	if e.reverted {
+		// The probers are stopped, so the trackers are frozen at whatever they
+		// last saw. Writing that out every five seconds would draw a flat,
+		// healthy-looking line over a window in which nothing was measured;
+		// a gap in the graph is the honest record.
+		e.mu.RUnlock()
+		return
+	}
 	snaps := make([]model.PathState, 0, len(e.trackers))
 	for _, tr := range e.trackers {
 		snaps = append(snaps, tr.Snapshot(now))
@@ -1714,6 +1763,10 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 	e.cfg = cfg
 	e.runner = runnerFor(cfg.Mode, e.log)
 	e.cfgVersion++
+	// A configuration save is what ends the post-revert hold: applySystemConfig
+	// and startProbers below reinstall and re-measure everything a revert took
+	// down, so the latch that was suppressing the reconciler comes off with it.
+	e.reverted = false
 	ctx := e.baseCtx
 	dataPlane := e.dataPlane
 	e.mu.Unlock()
@@ -1819,9 +1872,19 @@ func (e *Engine) Revert(ctx context.Context) {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
 
-	e.mu.RLock()
+	// Latched before anything is torn down, so a reconcile or evaluate parked
+	// on applyMu behind this cannot repair the removals the moment it is
+	// released - see the field. Cleared only by Reconfigure.
+	e.mu.Lock()
+	e.reverted = true
 	cfg := e.cfg
-	e.mu.RUnlock()
+	e.mu.Unlock()
+
+	// The probers go too. Their routes and rules are removed below, so left
+	// running they would report every path down and fire the no-usable-path
+	// alarm about a state the operator just asked for. Reconfigure restarts
+	// them.
+	e.stopProbers()
 
 	runner := e.realRunner() // revert always acts, even in observe mode
 	sysx.RemoveRuleset(ctx, runner)
@@ -1865,8 +1928,10 @@ func (e *Engine) Revert(ctx context.Context) {
 	e.mu.Unlock()
 
 	_ = e.st.AddEvent(store.EventSystem, 0,
-		"reverted: nftables table and policy routes removed, mode set to observe")
-	e.log.Warn("reverted all system changes, now in observe mode")
+		"reverted: nftables table and policy routes removed, mode set to observe; "+
+			"probing is stopped until settings are saved or the mode is changed")
+	e.log.Warn("reverted all system changes, now in observe mode",
+		"note", "nothing is measured or repaired until the next settings save or mode change")
 }
 
 // ConfigVersion increments on every configuration change, so the control

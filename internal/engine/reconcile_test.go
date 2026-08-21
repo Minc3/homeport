@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
 	"github.com/quinlan102/homeport/internal/notify"
@@ -198,5 +199,51 @@ func TestReconcileInObserveModeRepairsProbingButNotTheTrafficRoute(t *testing.T)
 		if strings.Contains(c, "route replace 10.99.0.2/32 dev") && !strings.Contains(c, "table") {
 			t.Errorf("observe mode installed the traffic route: %q", c)
 		}
+	}
+}
+
+// A reverted engine must stop repairing, or the revert cannot stick. Observe
+// mode deliberately keeps measurement alive, so without the latch the
+// reconciler put the probe tables, their rules and rp_filter back within one
+// tick of Revert removing them - and evaluate put the control route back
+// within 500ms. On a running host that was merely surprising; during uninstall
+// it was a race, because the unit is stopped moments after the revert returns
+// and a tick landing in the gap stranded rules the deleted binary was the only
+// thing able to remove.
+func TestRevertStopsTheReconcilerAndTheDecisionLoopUntilReconfigured(t *testing.T) {
+	kernel := healthyKernel()
+	// What a revert leaves behind: an emptied probe table, which is exactly
+	// the state the reconciler exists to repair - and here must not.
+	kernel["ip route show 10.99.0.2/32 table 101"] = ""
+
+	e, q := engineForReconcile(t, kernel)
+	e.Revert(context.Background())
+
+	before := len(q.writes())
+	e.reconcileRouting(context.Background())
+	e.evaluate(context.Background(), time.Now())
+	if got := q.writes()[before:]; len(got) != 0 {
+		t.Errorf("a reverted engine repaired or installed something: %v", got)
+	}
+
+	// A settings save is what ends the hold: the operator has asked for a
+	// working system again, so the reconciler goes back to work.
+	cfg := e.Config()
+	cfg.Mode = model.ModeObserve
+	if err := e.Reconfigure(cfg); err != nil {
+		t.Fatalf("Reconfigure: %v", err)
+	}
+	t.Cleanup(e.stopProbers) // Reconfigure restarted the probers
+
+	before = len(q.writes())
+	e.reconcileRouting(context.Background())
+	repaired := false
+	for _, c := range q.writes()[before:] {
+		if strings.Contains(c, "table 101") {
+			repaired = true
+		}
+	}
+	if !repaired {
+		t.Errorf("after a reconfigure the probe table was not repaired; writes were %v", q.writes()[before:])
 	}
 }
