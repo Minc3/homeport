@@ -1688,6 +1688,15 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 	}
 	e.stopProbers()
 
+	// The swap is made under applyMu, briefly, for the same reason the backend's
+	// is: evaluate reads the runner under e.mu at its start and then shells out
+	// for as long as `ip` takes, so a swap outside this lock could land mid
+	// decision, after the previous runner had been captured - one route
+	// installed with the armed runner after the mode had gone to observe.
+	// Released again immediately, because applySystemConfig takes it itself and
+	// these mutexes are not reentrant; evaluate running in the gap sees the new
+	// configuration and is correct to.
+	e.applyMu.Lock()
 	e.mu.Lock()
 	prevMode := e.cfg.Mode
 	e.cfg = cfg
@@ -1696,6 +1705,7 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 	ctx := e.baseCtx
 	dataPlane := e.dataPlane
 	e.mu.Unlock()
+	e.applyMu.Unlock()
 
 	e.notifier.SetConfig(cfg.Notify)
 	e.applySystemConfig(ctx)

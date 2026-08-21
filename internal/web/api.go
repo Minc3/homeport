@@ -642,8 +642,28 @@ func (s *Server) handleClearQuarantine(w http.ResponseWriter, r *http.Request) {
 
 // handleRevert is the panic button: it removes the nftables table and every
 // policy route the agent installed, leaving the WireGuard tunnels untouched.
+//
+// The request's context is deliberately detached first. ExecRunner builds every
+// command with exec.CommandContext, so a cancelled context does not abort the
+// revert - it makes each command fail instantly while Revert, which checks none
+// of their errors, goes on to record dataPlane = false and answer "reverted".
+// The rules stay live and the engine believes they are gone, which is the exact
+// state a revert exists to escape.
+//
+// Reaching that needed the client to give up first, which used to mean the
+// revert itself outrunning the timeout - unlikely, at a dozen commands. Now
+// that Revert waits for reconfMu and applyMu it can also be cancelled before it
+// has done anything at all, and the wait is longest when a settings save is
+// stuck on a slow nft: the moment somebody reaches for this button.
+// failoverctl gives up after 15s, and a browser tab closes whenever its owner
+// decides to.
+//
+// No outer timeout, because there is nothing to protect against: ExecRunner
+// caps every command at 10s on its own, so this is bounded by construction, and
+// a ceiling low enough to matter could truncate a slow revert - reintroducing
+// the same fault in a smaller form.
 func (s *Server) handleRevert(w http.ResponseWriter, r *http.Request) {
-	s.eng.Revert(r.Context())
+	s.eng.Revert(context.WithoutCancel(r.Context()))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reverted"})
 }
 

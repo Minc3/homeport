@@ -16,11 +16,13 @@ type overlapRunner struct {
 	mu       sync.Mutex
 	inFlight int
 	max      int
+	calls    int
 	delay    time.Duration
 }
 
 func (r *overlapRunner) Run(_ context.Context, _ string, _ ...string) (string, error) {
 	r.mu.Lock()
+	r.calls++
 	r.inFlight++
 	if r.inFlight > r.max {
 		r.max = r.inFlight
@@ -41,6 +43,12 @@ func (r *overlapRunner) peak() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.max
+}
+
+func (r *overlapRunner) total() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
 }
 
 // ApplyConfig runs on the control client's goroutine; applyDecision and
@@ -98,7 +106,7 @@ func TestBackendRouteWritersNeverOverlap(t *testing.T) {
 	if peak := detector.peak(); peak != 1 {
 		t.Fatalf("%d goroutines were inside a system command at once, want 1", peak)
 	}
-	if detector.peak() == 0 {
-		t.Fatal("the detector saw no commands at all; the test proved nothing")
+	if detector.total() == 0 {
+		t.Fatal("the detector was never called; the test proved nothing")
 	}
 }

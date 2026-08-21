@@ -134,6 +134,19 @@ func (a *Agent) Config() (proto.BackendConfig, bool) {
 // disk, so a frontend outage does not leave the backend unable to route
 // replies correctly after a restart.
 func (a *Agent) ApplyConfig(ctx context.Context, cfg proto.BackendConfig) {
+	// Against applyDecision and reconcileRouting, which write the same routes
+	// from applyLoop's goroutine. Held across everything below, not each group
+	// separately, so a decision cannot land between them. See applyMu.
+	//
+	// Taken before the state swap, not after: applyDecision reads the runner
+	// under a.mu at its start and then shells out for as long as `ip` takes, so
+	// a swap outside this lock could land in the middle of a decision that had
+	// already captured the previous one - one route installed with the armed
+	// runner after the mode had gone to observe. Lock order is applyMu then
+	// a.mu, the same as every other holder.
+	a.applyMu.Lock()
+	defer a.applyMu.Unlock()
+
 	a.mu.Lock()
 	prev := a.cfg
 	a.cfg = cfg
@@ -142,12 +155,6 @@ func (a *Agent) ApplyConfig(ctx context.Context, cfg proto.BackendConfig) {
 	a.mu.Unlock()
 
 	a.cacheConfig(cfg)
-
-	// Against applyDecision and reconcileRouting, which write the same routes
-	// from applyLoop's goroutine. Held across all three groups below, not each
-	// one separately, so a decision cannot land between them. See applyMu.
-	a.applyMu.Lock()
-	defer a.applyMu.Unlock()
 
 	a.applyPlumbing(ctx, cfg)
 	// Against the config this one replaced, which after a restart is the one

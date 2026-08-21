@@ -765,6 +765,21 @@ Breaking any of these is a correctness bug even if the tests pass.
     are gone, which is invariant 13 failing in the one direction it must not,
     on the one command that exists to be trusted. `Revert` takes `reconfMu` and
     `applyMu`, in that order.
+
+    **And it must never be handed a request context.** `ExecRunner` builds every
+    command with `exec.CommandContext`, so a cancelled context does not abort a
+    revert — it makes each command fail instantly while `Revert`, which checks
+    none of their errors, goes on to record `dataPlane = false` and answer
+    "reverted". That is the same corrupt state as above, reached from the other
+    side. Waiting on the two locks is what made it reachable: the wait is
+    longest when a settings save is stuck on a slow `nft`, which is exactly when
+    somebody reaches for this button, and `failoverctl` gives up after 15s.
+    `web.handleRevert` detaches with `context.WithoutCancel`, and deliberately
+    adds no timeout of its own — `ExecRunner` caps every command at 10s, so the
+    whole thing is bounded by construction, and a ceiling low enough to matter
+    could truncate a slow revert and reintroduce the fault in miniature.
+    `engine/revert_context_test.go` pins the hazard rather than the handler,
+    because the hazard is what a future edit has to keep in mind.
 13. **Disarming is not a teardown.** Going armed → observe stops further
     changes but deliberately leaves installed rules in place, because deleting
     the DNAT table would drop every published service instantly. `Status.
@@ -800,6 +815,17 @@ Breaking any of these is a correctness bug even if the tests pass.
     The pattern is a `go func() { <-ctx.Done(); conn.Close() }()` beside the
     loop; `Responder.listen`, `Agent.runSession` and `ControlServer.serve` all
     carry it.
+
+    **`Prober.loop` was the exception, and stayed one until something waited on
+    it.** It relied on its one-second read deadline instead, which cost nothing
+    while `stopProbers` merely cancelled. Once that started waiting — it has to,
+    or a replaced generation goes on probing the same path as its replacement —
+    the deadline became a second of latency on every settings save. It is
+    invisible on a development machine, where the probe sockets cannot bind to
+    the overlay address and there is no read loop to wait for at all, so
+    `TestStopProbersDoesNotWaitOnTheReadDeadline` binds loopback sockets and
+    points them at a listener that never answers. Every read loop here now
+    carries the watcher; do not add one that does not.
 18. **Per-interface state must be reconciled against the kernel, not just
     installed once.** Deleting an interface deletes every route that used it
     *and* resets its sysctls, and `wg-quick down` deletes the interface.
@@ -827,6 +853,17 @@ Breaking any of these is a correctness bug even if the tests pass.
     and `Agent.applyMu` serialise every route writer, so only one goroutine is
     ever inside `ip`. `internal/linker` had this from the start and is the
     model: one lock, taken by both the control session and the reconcile loop.
+
+    **The runner swap is inside `applyMu` too, and that is not tidiness.**
+    `evaluate` and `applyDecision` read the runner under the state lock at their
+    start and then shell out for as long as `ip` takes. A swap outside the apply
+    lock can therefore land in the middle of a decision that has already
+    captured the previous runner — one route installed with the armed runner
+    after the mode has gone to observe. `Agent.ApplyConfig` takes `applyMu`
+    before the swap; `Engine.Reconfigure` takes it around the swap and releases
+    it again immediately, because `applySystemConfig` takes it itself and these
+    mutexes are not reentrant. A decision running in that gap sees the new
+    configuration and is right to.
 
     **Frontend lock order is `reconfMu` then `applyMu`, never the reverse.**
     `Run`'s goroutine takes only `applyMu`, so there is no cycle. `applyMu` is
@@ -1248,6 +1285,10 @@ where a subtle regression would be invisible in production until an outage:
   overlapping calls, which is the property that matters: each fault in this
   family is two goroutines writing the same route, and which one lands last is
   a matter of timing. On the unguarded code they report four and three.
+- `engine/revert_context_test.go` — a revert handed a cancelled context runs no
+  commands at all and still reports the rules gone, which is why
+  `web.handleRevert` detaches the request context; and the same revert with a
+  live one does the work.
 - `sysx/linker_test.go` — that a site with no subnet generates byte-identical
   rules, that the two prefix helpers agree once one is set, that a service
   target moves only the DNAT, and that the source rules stay behind the

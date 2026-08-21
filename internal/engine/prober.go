@@ -167,6 +167,22 @@ func (p *Prober) loop(ctx context.Context) {
 		p.mu.Unlock()
 	}()
 
+	// A context does not interrupt a read in progress. This was the one read
+	// loop here without the watcher, relying on its one-second read deadline
+	// instead, and while nothing waited on it that cost nothing. stopProbers
+	// waits now - it has to, or a replaced generation goes on probing the same
+	// path as its replacement - so the deadline became a second of latency on
+	// every settings save. Closing the socket unblocks the read at once.
+	//
+	// It is safe to close from here: net.UDPConn is safe for concurrent use,
+	// and closing during a read is the documented way to end one. The deferred
+	// close above may get there first, in which case this is a second close on
+	// an already-closed socket, which is an error nobody reads.
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {

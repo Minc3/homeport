@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"net"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -140,4 +141,68 @@ func TestConcurrentReconfigureLeavesOneProberPerPath(t *testing.T) {
 
 	e.stopProbers()
 	waitForProbers(t, e, 0, "after stopProbers")
+}
+
+// stopProbers must not be left waiting on a read deadline.
+//
+// Prober.loop was the one read loop here without the close-on-cancel watcher
+// invariant 17 describes, relying on its one-second read deadline instead.
+// While nothing waited on the probers that cost nothing. stopProbers waits now,
+// so the deadline turned into a second of latency on every settings save - and
+// it is invisible on a development machine, where the probe sockets cannot bind
+// to the overlay address and there is no read loop to wait for at all.
+//
+// So this one binds real sockets on the loopback and points them at a listener
+// that never answers, which is what puts the read loop where it has to be:
+// blocked inside ReadFromUDP with the deadline still running.
+func TestStopProbersDoesNotWaitOnTheReadDeadline(t *testing.T) {
+	// A socket that receives probes and never replies. Without it the sends
+	// would draw ICMP port-unreachable, the read would return early, and the
+	// test would pass without ever reaching the case it is about.
+	silent, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer silent.Close()
+	port := silent.LocalAddr().(*net.UDPAddr).Port
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := model.Defaults()
+	cfg.Overlay.FrontendIP = "127.0.0.1" // bindable here, unlike 10.99.0.1
+	cfg.Overlay.BackendIP = "127.0.0.1"
+	cfg.Overlay.ProbePort = port
+
+	log := quietLogger()
+	e := New(log, st, notify.New(log), cfg, []byte("secret"), t.TempDir())
+	e.runner = &stubRunner{}
+	e.real = &stubRunner{}
+	e.ifaceExists = func(string) bool { return true }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e.startProbers(ctx)
+	waitForProbers(t, e, int64(len(cfg.Paths)), "after start")
+
+	// Give the read loops time to be inside ReadFromUDP rather than still
+	// setting up, so the wait being measured is the one that matters.
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	e.stopProbers()
+	took := time.Since(start)
+
+	// The read deadline is a full second. Anything near it means the sockets
+	// are being left to time out instead of being closed.
+	if took > 400*time.Millisecond {
+		t.Fatalf("stopProbers took %v; it is waiting out the read deadline rather than closing the sockets", took)
+	}
+	if n := e.liveProbers.Load(); n != 0 {
+		t.Fatalf("%d probers still running after stopProbers", n)
+	}
 }
