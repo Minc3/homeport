@@ -292,10 +292,23 @@ revert_frontend() {
 # above: the reconciler would put the routing back within ten seconds of the
 # revert removing it, and the binary that knows what to remove is deleted below.
 # Not for the frontend, whose revert needs its agent up.
+#
+# The stop is unconditional. `is-active` answers no for a unit that is
+# 'activating' - mid-start, or sitting in a Restart= loop, which is a likely
+# state for an agent somebody is uninstalling - and a unit skipped on that
+# answer finishes starting seconds later and reinstalls everything the revert
+# just removed. `systemctl stop` is a no-op on a unit that is already down and
+# cancels one that is on its way up, so there is nothing to gain by asking
+# first; the state is only read to keep the final report honest about whether
+# anything was actually running.
+AGENT_WAS_UP=0
 stop_agent() {
-	systemctl is-active --quiet "$UNIT" 2>/dev/null || return 0
+	case "$(systemctl is-active "$UNIT" 2>/dev/null)" in
+	active | activating | reloading) AGENT_WAS_UP=1 ;;
+	esac
 	echo "  stopping $UNIT first, so its reconciler cannot reinstall what this removes"
 	systemctl stop "$UNIT" >/dev/null 2>&1 || true
+	systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
 }
 
 if [ "$REVERT" -eq 1 ]; then
@@ -347,9 +360,13 @@ EOF
 		esac
 		if [ "$ROLE" != frontend ]; then
 			echo >&2
-			echo "  $UNIT was stopped for the revert and has been left stopped, so that" >&2
-			echo "  nothing reinstalls the rules underneath you. 'systemctl start $UNIT'" >&2
-			echo "  puts the agent back if you would rather keep serving for now." >&2
+			if [ "$AGENT_WAS_UP" -eq 1 ]; then
+				echo "  $UNIT was stopped for the revert and has been left stopped, so that" >&2
+				echo "  nothing reinstalls the rules underneath you. 'systemctl start $UNIT'" >&2
+				echo "  puts the agent back if you would rather keep serving for now." >&2
+			else
+				echo "  $UNIT was not running to begin with and has been left that way." >&2
+			fi
 		fi
 		exit 1
 	fi
