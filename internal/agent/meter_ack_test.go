@@ -3,6 +3,7 @@ package agent
 import (
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -42,5 +43,39 @@ func TestAckAppliedDropsOnlyWhatTheAckCovers(t *testing.T) {
 	}
 	if got[1].PathID != 3 || got[1].Sequence != 1 {
 		t.Errorf("path 3 was never acked and must keep its delta; pending = %v", got)
+	}
+}
+
+// The buffer file holds one JSON object per line, which is what its .jsonl
+// name promises - but older builds wrote a single JSON array under the same
+// name, and an upgrade must not discard the deltas that build had buffered:
+// they exist precisely because they could not be delivered yet.
+func TestBufferLoadsTheLegacyArrayFormatAndWritesJSONLines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage-buffer.jsonl")
+	legacy := `[{"path_id":2,"bytes":10,"packets":1,"at":1700000000,"seq":1},` +
+		`{"path_id":2,"bytes":20,"packets":2,"at":1700000010,"seq":2}]`
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m := NewMeter(log, path)
+	if got := m.Pending(); len(got) != 2 || got[1].Sequence != 2 {
+		t.Fatalf("legacy array buffer not restored; pending = %v", got)
+	}
+
+	// Persisting rewrites it as JSON lines, and a fresh meter reads those back.
+	m.persist()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[0] == '[' {
+		t.Errorf("buffer still written as a JSON array: %s", raw)
+	}
+	again := NewMeter(log, path)
+	if got := again.Pending(); len(got) != 2 || got[0].Bytes != 10 {
+		t.Fatalf("JSON-lines buffer not restored; pending = %v", got)
 	}
 }

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -178,14 +179,25 @@ func (m *Meter) AckApplied(seqs map[int]uint64) {
 	}
 }
 
+// persist writes the pending deltas out as JSON lines, one delta per line -
+// which is both what the file's name promises and the format that stays
+// readable when somebody opens it mid-incident to see what has not been
+// delivered yet.
 func (m *Meter) persist() {
 	m.mu.Lock()
-	raw, err := json.Marshal(m.pending)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	var err error
+	for _, d := range m.pending {
+		if err = enc.Encode(d); err != nil {
+			break
+		}
+	}
 	m.mu.Unlock()
 	if err != nil {
 		return
 	}
-	writeAtomic(m.log, m.bufferPath, raw)
+	writeAtomic(m.log, m.bufferPath, buf.Bytes())
 }
 
 func (m *Meter) save() {
@@ -208,8 +220,8 @@ func (m *Meter) save() {
 
 func (m *Meter) load() {
 	if raw, err := os.ReadFile(m.bufferPath); err == nil {
-		var pending []proto.UsageDelta
-		if err := json.Unmarshal(raw, &pending); err == nil {
+		pending, err := decodeBuffer(raw)
+		if err == nil && len(pending) > 0 {
 			m.pending = pending
 			m.log.Info("restored buffered usage deltas", "count", len(pending))
 		}
@@ -225,6 +237,33 @@ func (m *Meter) load() {
 			}
 		}
 	}
+}
+
+// decodeBuffer reads a buffer file in either format it has ever had: JSON
+// lines, or the single JSON array older builds wrote despite the .jsonl name.
+// The legacy branch exists so an upgrade does not discard deltas buffered by
+// the build it replaced - which would lose usage at exactly the moment the
+// buffer was doing its job.
+func decodeBuffer(raw []byte) ([]proto.UsageDelta, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	if trimmed[0] == '[' {
+		var pending []proto.UsageDelta
+		err := json.Unmarshal(trimmed, &pending)
+		return pending, err
+	}
+	var pending []proto.UsageDelta
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	for dec.More() {
+		var d proto.UsageDelta
+		if err := dec.Decode(&d); err != nil {
+			return nil, err
+		}
+		pending = append(pending, d)
+	}
+	return pending, nil
 }
 
 func writeAtomic(log *slog.Logger, path string, data []byte) {
