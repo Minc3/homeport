@@ -736,6 +736,12 @@ installers warn that `wg-main` is missing during their environment check, and
 the backend's unit orders itself after `wg-quick@wg-main.service`. Neither
 affects routing, so ignoring both is a valid answer.
 
+The ordering is the one worth knowing about. `After=` naming a unit this host
+does not have is not an error, it simply orders nothing, so after a reboot the
+backend can start before your tunnel is up and that path's probe table is empty
+until the reconciler refills it, within ten seconds. Nothing is misrouted in the
+meantime; the path reads as down for that long.
+
 To rename instead, on the frontend and the backend:
 
 ```sh
