@@ -77,7 +77,12 @@ failover-linker -revert
 ```
 
 The frontend's revert needs its agent **up**, because it goes over the control
-socket into the running engine, which is also what disarms it. The other two
+socket into the running engine, which is also what disarms it. It also latches
+the engine: the probers stop and the reconciler and decision loop hold off
+until the next settings save or mode change, because observe mode deliberately
+repairs measurement plumbing and would otherwise reinstall the probe tables
+within a tick of the revert removing them. A reverted frontend measures
+nothing until it is told to resume. The other two
 need theirs **stopped**: those reverts are separate processes with no way to
 tell a running agent anything, and the reconciler puts back everything it finds
 missing within ten seconds. Reverting underneath a live agent leaves a host that
@@ -282,6 +287,12 @@ there is no second layer of encryption.
 4. Ships batches up the control channel; the frontend dedupes on the sequence
    (`meta` key `usage_seq:<pathID>`) and folds them into the SQLite ledger,
    converting to billed bytes with `quota.Metered`.
+5. The frontend acks the highest sequence per path that is durably in the
+   ledger (`usage_ack`), and only then does the backend drop its buffered
+   copy. A successful TCP write is not delivery — the batch in flight when the
+   connection dies would otherwise be lost, and the connection dies at every
+   failover, which is exactly when LTE usage is accruing. Anything unacked is
+   resent on the next tick; the sequence dedupe makes the overlap free.
 
 ---
 
@@ -772,7 +783,16 @@ Breaking any of these is a correctness bug even if the tests pass.
 
     **Only the frontend can disarm itself, and the other two need the unit
     stopped instead.** `failoverctl revert` runs inside the engine, so setting
-    observe mode is enough. `failover-backend -revert` and `failover-linker
+    observe mode is enough — but observe mode alone was not: its whole point is
+    to keep measuring, so the reconciler went on repairing probe tables and
+    rp_filter, and put back within one tick what the revert had just removed.
+    `Engine.reverted` is the latch that stops it: set by `Revert` before the
+    teardown, it stops the probers and holds the reconciler, the decision loop
+    and the sample writer down until `Reconfigure` clears it. Without it,
+    uninstalling the frontend was a race — the script stops the unit moments
+    after the revert returns, and a reconcile tick landing in that gap stranded
+    rules the about-to-be-deleted binary was the only thing able to remove.
+    `failover-backend -revert` and `failover-linker
     -revert` are separate processes, and a running agent's reconciler reinstalls
     the probe tables and their rules, the overlay route, the routes to every
     extra host, and the return path if the cached mode is still armed, within
