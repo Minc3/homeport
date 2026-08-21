@@ -287,20 +287,39 @@ func TestLinkerMarkRuleLeavesAnIntactRuleAlone(t *testing.T) {
 
 // Revert removes it at the priority it was found at. Deleting by selector alone
 // takes one arbitrary match, so a duplicate from an older build would survive.
+//
+// And in whatever table it is found in, not only the configured one: a change
+// of linker.table leaves the old rule holding the mark, and a revert blind to
+// it would leave that behind steering marked packets into a table nothing
+// maintains. Every rule on this mark is ours, since web.validate refuses a path
+// mark equal to any of the linker's.
 func TestRemoveLinkerRulesetsDeleteByPriority(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
-		"ip rule show table 200": "32401:\tfrom all fwmark 0x201 lookup 200\n" +
-			"31000:\tfrom all fwmark 0x201 lookup 200\n",
+		"ip rule show": "32401:\tfrom all fwmark 0x201 lookup 200\n" +
+			"31000:\tfrom all fwmark 0x201 lookup 200\n" +
+			"32401:\tfrom all fwmark 0x201 lookup isp2\n",
 	}}
 	RemoveLinkerReturnRuleset(context.Background(), f, 200)
 	for _, want := range []string{
 		"ip rule del fwmark 0x201 lookup 200 pref 32401",
 		"ip rule del fwmark 0x201 lookup 200 pref 31000",
+		// By the table token the kernel printed, name and all.
+		"ip rule del fwmark 0x201 lookup isp2 pref 32401",
 		"nft delete table ip failover_linker_return",
 	} {
 		if !f.ran(want) {
 			t.Errorf("revert left %q behind: %v", want, f.calls)
 		}
+	}
+}
+
+// With no listing to read, the selector alone is still tried: it removes one
+// arbitrary match, which is worth more than leaving the rule in place.
+func TestRemoveLinkerRulesetsFallBackToTheSelector(t *testing.T) {
+	f := &fakeRunner{}
+	RemoveLinkerEgressRuleset(context.Background(), f, 200)
+	if !f.ran("ip rule del fwmark 0x301 lookup 200") {
+		t.Errorf("nothing was withdrawn when the listing came back empty: %v", f.calls)
 	}
 }
 

@@ -254,23 +254,35 @@ func ensureLinkerMarkRule(ctx context.Context, r Runner, tbl int, mark string, w
 	return nil
 }
 
-// removeLinkerMarkRule withdraws one of them, at every priority it is found at.
+// removeLinkerMarkRule withdraws one of them, at every priority and in every
+// table it is found in.
 //
 // `ip rule del` given only a selector removes one arbitrary match, so a
 // duplicate from a build that pinned nothing would survive the revert and go on
 // steering marked packets into a table this has just emptied.
+//
+// The whole listing rather than this table's, because the rule left behind by a
+// change of linker.table points at the old one, and a revert that looked only
+// at the configured table would leave it holding the mark for a table nothing
+// maintains. Every rule selecting on this mark is ours whatever it points at:
+// the linker marks are this system's own, and web.validate refuses a path mark
+// equal to any of them. Deleted with the table token exactly as the kernel
+// printed it, since a host that has named the table in rt_tables prints the
+// name.
 func removeLinkerMarkRule(ctx context.Context, r Runner, tbl int, mark string) {
-	table := strconv.Itoa(tbl)
 	found := 0
-	if existing, err := listRulesInTable(ctx, r, tbl); err == nil {
-		for _, pref := range markRulePrefs(existing, mark, "") {
+	if all, err := listRules(ctx, r); err == nil {
+		for _, rule := range markRuleTables(all, mark) {
 			found++
-			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", table,
-				"pref", strconv.Itoa(pref))
+			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", rule.table,
+				"pref", strconv.Itoa(rule.pref))
 		}
 	}
+	// A backstop for a listing that could not be read. The selector alone is
+	// only unsafe where duplicates exist, and duplicates are what the loop
+	// above has just proved it can see.
 	if found == 0 {
-		_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", table)
+		_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", strconv.Itoa(tbl))
 	}
 }
 
