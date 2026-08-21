@@ -291,8 +291,9 @@ func TestLinkerMarkRuleLeavesAnIntactRuleAlone(t *testing.T) {
 // And in whatever table it is found in, not only the configured one: a change
 // of linker.table leaves the old rule holding the mark, and a revert blind to
 // it would leave that behind steering marked packets into a table nothing
-// maintains. Every rule on this mark is ours, since web.validate refuses a path
-// mark equal to any of the linker's.
+// maintains. A rule in another table is only swept when it sits at the pinned
+// priority, which is what ties it to this system - see the host-owned test
+// below for the other side of that line.
 func TestRemoveLinkerRulesetsDeleteByPriority(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		"ip rule show": "32401:\tfrom all fwmark 0x201 lookup 200\n" +
@@ -381,11 +382,20 @@ func TestLinkerRuleClearsAStrayAtTheSamePriority(t *testing.T) {
 		"ip rule show": pinned + ":\tfrom 10.99.0.3 lookup 220\n" +
 			pinned + ":\tfrom 10.99.0.3 lookup 200\n",
 	}}
-	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", 220); err != nil {
+	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", "192.168.1.2", 220); err != nil {
 		t.Fatalf("EnsureLinkerRule: %v", err)
 	}
 	if !f.ran("ip rule del from 10.99.0.3 lookup 200 pref " + pinned) {
 		t.Errorf("the stray in the old table was left behind: %v", f.calls)
+	}
+	// The table the stray pointed at is one this system stopped using, and it
+	// still holds our `default via <backend>`: on the host the configurable
+	// table exists for, that table is the host's own, with the host's own
+	// rules still pointing at it, so leaving the route sends that host's
+	// second-ISP traffic to the backend forever. Qualified by the gateway, so
+	// a default the operator has since put back is never the one removed.
+	if !f.ran("ip route del default via 192.168.1.2 table 200") {
+		t.Errorf("the abandoned table kept this system's default route: %v", f.calls)
 	}
 }
 
@@ -400,12 +410,81 @@ func TestLinkerRuleRecognisesItsOwnRuleInANamedTable(t *testing.T) {
 		"ip rule show table 200": listing,
 		"ip rule show":           listing,
 	}}
-	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", 200); err != nil {
+	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", "192.168.1.2", 200); err != nil {
 		t.Fatalf("EnsureLinkerRule: %v", err)
 	}
 	for _, c := range f.calls {
 		if strings.Contains(c, " add ") || strings.Contains(c, " del ") {
 			t.Errorf("a correct rule in a named table was rewritten: %s", c)
 		}
+	}
+}
+
+// A mark rule the host owns is never swept. The mark constants are this
+// system's, but a fwmark is only a number and the linker's host archetype is a
+// machine that already policy-routes - web.validate constrains this system's
+// configuration, not the host's. A rule at the host's own priority pointing at
+// the host's own table is indistinguishable from one, and invariant 8 says the
+// tie goes to leaving it: deleting it here would fight whatever maintains it,
+// on every reconcile tick.
+func TestLinkerMarkRuleLeavesTheHostsOwnRuleAlone(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase + 1)
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 200": pinned + ":\tfrom all fwmark 0x201 lookup 200\n",
+		"ip rule show": pinned + ":\tfrom all fwmark 0x201 lookup 200\n" +
+			"1000:\tfrom all fwmark 0x201 lookup vpn\n",
+	}}
+	if err := EnsureLinkerMarkRule(context.Background(), f, 200); err != nil {
+		t.Fatalf("EnsureLinkerMarkRule: %v", err)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "lookup vpn") {
+			t.Errorf("touched a rule belonging to the host: %q", c)
+		}
+	}
+}
+
+// The same boundary on revert: the rules this system can prove are its own go,
+// and the host's survive the command run to undo us.
+func TestRemoveLinkerRulesetsLeaveTheHostsOwnRuleAlone(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase + 1)
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 200": pinned + ":\tfrom all fwmark 0x201 lookup 200\n",
+		"ip rule show": pinned + ":\tfrom all fwmark 0x201 lookup 200\n" +
+			"1000:\tfrom all fwmark 0x201 lookup vpn\n",
+	}}
+	RemoveLinkerReturnRuleset(context.Background(), f, 200)
+	if !f.ran("ip rule del fwmark 0x201 lookup 200 pref " + pinned) {
+		t.Errorf("this system's own rule was left behind: %v", f.calls)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "lookup vpn") {
+			t.Errorf("revert touched a rule belonging to the host: %q", c)
+		}
+	}
+}
+
+// Revert is as blind to the configured table as the ensure path: a change of
+// linker.table followed by a revert has to take this system's rule *and* its
+// default route out of the table it stopped using, or the host's own traffic
+// keeps going to the backend after the command that was run to undo us.
+func TestRemoveLinkerRoutingSweepsTheAbandonedTable(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase)
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show table 220": pinned + ":\tfrom 10.99.0.3 lookup 220\n",
+		"ip rule show": pinned + ":\tfrom 10.99.0.3 lookup 220\n" +
+			pinned + ":\tfrom 10.99.0.3 lookup isp2\n",
+	}}
+	RemoveLinkerRouting(context.Background(), f, "10.99.0.3", "192.168.1.2", 220)
+	if !f.ran("ip rule del from 10.99.0.3 lookup isp2 pref " + pinned) {
+		t.Errorf("the rule in the abandoned table was left behind: %v", f.calls)
+	}
+	// By the token the kernel printed, and qualified by our gateway, so the
+	// delete fails harmlessly if the operator already put their default back.
+	if !f.ran("ip route del default via 192.168.1.2 table isp2") {
+		t.Errorf("the abandoned table kept this system's default route: %v", f.calls)
+	}
+	if !f.ran("ip route del default via 192.168.1.2 table 220") {
+		t.Errorf("the configured table kept this system's default route: %v", f.calls)
 	}
 }

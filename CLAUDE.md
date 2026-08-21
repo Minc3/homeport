@@ -1322,7 +1322,16 @@ where a subtle regression would be invisible in production until an outage:
 - `sysx/linker_test.go` — that a site with no subnet generates byte-identical
   rules, that the two prefix helpers agree once one is set, that a service
   target moves only the DNAT, and that the source rules stay behind the
-  per-path rules and get moved when found elsewhere.
+  per-path rules and get moved when found elsewhere. Also the ownership line
+  the sweeps hold: a mark rule in another table is swept only when it sits at
+  the pinned priority — the mark constants are this system's but a fwmark is
+  only a number, and a host that already policy-routes may select on the same
+  value for its own tables (invariant 8) — while the source rule may claim
+  every match, because nothing but this system holds the overlay address. And
+  that a table abandoned by a change of `linker.table` is relieved of this
+  system's `default via <backend>` when its stray rule is swept, on ensure and
+  on revert, gateway-qualified so a default the operator has put back is never
+  the one removed.
 - `agent/revert_test.go` — the backend takes down what it installed: both return
   sources, the mark rule, the marking and egress tables, the routes to extra
   hosts, the probe tables and the overlay route; that it deletes table 100's

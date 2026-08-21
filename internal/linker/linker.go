@@ -233,7 +233,7 @@ func (l *Linker) apply(ctx context.Context) {
 		l.log.Error("cannot establish the overlay address; nothing published to this host will work",
 			"address", li.OverlayIP, "device", ov.Device, "err", err)
 	}
-	if err := sysx.EnsureLinkerRule(ctx, l.runner, li.OverlayIP, l.table()); err != nil {
+	if err := sysx.EnsureLinkerRule(ctx, l.runner, li.OverlayIP, li.BackendLAN, l.table()); err != nil {
 		l.log.Error("cannot install the overlay policy rule; replies will leave by the LAN default route",
 			"address", li.OverlayIP, "err", err)
 	}
@@ -283,7 +283,7 @@ func (l *Linker) reconcile(ctx context.Context) {
 		l.log.Error("overlay address missing and could not be restored",
 			"address", li.OverlayIP, "err", err)
 	}
-	if err := sysx.EnsureLinkerRule(ctx, l.runner, li.OverlayIP, l.table()); err != nil {
+	if err := sysx.EnsureLinkerRule(ctx, l.runner, li.OverlayIP, li.BackendLAN, l.table()); err != nil {
 		l.log.Error("overlay policy rule missing and could not be restored", "err", err)
 	}
 	if err := sysx.EnsureLinkerMarkRule(ctx, l.runner, l.table()); err != nil {
