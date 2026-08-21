@@ -882,9 +882,6 @@ keep working off the old agent's rules while the portal says nothing is armed.
 | Extra host unreachable, routing correct everywhere | `iptables -S FORWARD` on the backend | Docker's drop policy (step 14.7) |
 | Agent logs `File exists` for rules that are present | the table has a name in `rt_tables` | a table number this system uses is already taken (step 1.4) |
 
-Deeper diagnosis, including the first multi-host deployment's fault log, is in
-[LINKER-NOTES.md](LINKER-NOTES.md).
-
 ## Reference
 
 Bootstrap files live in `/etc/failover/{frontend,backend,linker}.json` and must
@@ -895,5 +892,3 @@ directory as `*.json.example`; the install scripts write them for you.
 
 - [REFERENCE.md](../REFERENCE.md), how the system behaves and why
 - [CLAUDE.md](../CLAUDE.md), design reasoning, invariants and traps
-- [LINKER-NOTES.md](LINKER-NOTES.md), field notes from the first multi-host
-  deployment

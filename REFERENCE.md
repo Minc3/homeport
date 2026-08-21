@@ -162,9 +162,6 @@ Nothing changes for a site that does not configure one: with no overlay subnet
 set, the generated rules and routing commands are identical to a build without
 the feature.
 
-[`deploy/LINKER-NOTES.md`](deploy/LINKER-NOTES.md) is the field record from the
-first one: the faults hit bringing it up, and how to debug this path.
-
 ## The portal
 
 One page on the frontend, bound to an admin WireGuard interface. No
@@ -315,7 +312,5 @@ internal/web             portal and JSON API
 
 - [README.md](README.md) — what this is and whether you want it
 - [deploy/SETUP.md](deploy/SETUP.md) — installation, WireGuard and pfSense
-- [deploy/LINKER-NOTES.md](deploy/LINKER-NOTES.md) — the field record from the
-  first multi-host deployment
 - [CLAUDE.md](CLAUDE.md) — the design reasoning, invariants and traps, written
   for anyone about to change the code

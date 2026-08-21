@@ -7,12 +7,6 @@ notice from a passing test run.
 
 If you only read one section, read **Invariants** and **Why it is like this**.
 
-If you are working on linkers specifically, read
-[`deploy/LINKER-NOTES.md`](deploy/LINKER-NOTES.md) as well. This file has the
-design reasoning; that one is the field record from the first real deployment —
-which faults were hit, in what order, what each looked like at the time, and
-what is still unfinished.
-
 ---
 
 ## 1. What the system does

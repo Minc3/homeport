@@ -335,7 +335,5 @@ problem if you ask for the feature.
 - **[deploy/SETUP.md](deploy/SETUP.md)** is the step by step install: what to
   type, in what order, and what to check at each stage. WireGuard, pfSense, both
   agents, the portal, arming it, then updating and removing it again.
-- **[deploy/LINKER-NOTES.md](deploy/LINKER-NOTES.md)** holds field notes from
-  the first multi-host deployment, and how to debug that path.
 - **[CLAUDE.md](CLAUDE.md)** has the design reasoning, the invariants and the
   traps. Read it before changing the code.
