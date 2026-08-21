@@ -498,9 +498,12 @@ docker network inspect <name> -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
 ```
 
 Add it under **Settings, Backend networks routed out through the frontend**,
-leaving **On host** blank for the backend. This catches everything on that
-network, so give the service its own Docker network if the bridge carries
-anything else.
+leaving **On host** blank for the backend. A `pterodactyl` row for
+`172.18.0.0/16` ships there already, disabled: tick it if that is your bridge,
+correct the CIDR if it is not.
+
+This catches everything on that network, so give the service its own Docker
+network if the bridge carries anything else.
 
 ### 10.3 Check
 

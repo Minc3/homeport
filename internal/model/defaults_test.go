@@ -1,0 +1,44 @@
+package model
+
+import "testing"
+
+// A fresh install must not move or divert a single packet on the strength of
+// nobody having deleted a shipped example row. The services are DNAT rules and
+// the egress source pulls a whole Docker bridge onto the tunnel, and through
+// the metered quota; both are examples of what to fill in, not requests.
+func TestNothingInTheShippedConfigurationIsLive(t *testing.T) {
+	cfg := Defaults()
+
+	if cfg.Mode != ModeObserve {
+		t.Errorf("mode = %q, want %q", cfg.Mode, ModeObserve)
+	}
+	for _, s := range cfg.Services {
+		if s.Enabled {
+			t.Errorf("service %s ships enabled", s.Name)
+		}
+	}
+	if cfg.Frontend.BackendEgress {
+		t.Error("backend egress ships on, which would send the row below out the tunnel")
+	}
+	for _, s := range cfg.Egress.Sources {
+		if s.Enabled {
+			t.Errorf("egress source %s (%s) ships enabled", s.Name, s.CIDR)
+		}
+	}
+}
+
+// The Pterodactyl bridge is the one network almost every site here ends up
+// adding by hand, so it ships as a row to tick rather than a CIDR to look up.
+func TestTheShippedEgressRowIsThePterodactylBridge(t *testing.T) {
+	srcs := Defaults().Egress.Sources
+	if len(srcs) != 1 {
+		t.Fatalf("egress sources = %d, want the one example row", len(srcs))
+	}
+	if srcs[0].Name != "pterodactyl" || srcs[0].CIDR != "172.18.0.0/16" {
+		t.Errorf("row = %+v, want pterodactyl on 172.18.0.0/16", srcs[0])
+	}
+	// Empty Host means the backend, which is where a single-host site runs it.
+	if srcs[0].Host != "" {
+		t.Errorf("host = %q, want empty so it belongs to the backend", srcs[0].Host)
+	}
+}

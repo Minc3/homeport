@@ -723,6 +723,16 @@ func Defaults() Config {
 			{Name: "http", Proto: "tcp", Port: 80},
 			{Name: "https", Proto: "tcp", Port: 443},
 		},
+		// The Docker network a Pterodactyl install puts its containers on,
+		// ready to tick once Frontend.BackendEgress is on. Disabled for the
+		// same reason the services above are: a row that arrives enabled
+		// would pull every container on that bridge onto the tunnel, and
+		// through the metered quota, on the strength of nobody deleting it.
+		Egress: EgressConfig{
+			Sources: []EgressSource{
+				{Name: "pterodactyl", CIDR: "172.18.0.0/16", Enabled: false},
+			},
+		},
 		Notify: NotifyConfig{
 			Enabled: false, Kind: "ntfy",
 			OnSwitch: true, OnPathDown: true, OnQuota: true, OnHeld: true,

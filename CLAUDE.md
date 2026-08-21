@@ -1217,6 +1217,13 @@ DNAT rule, and a fresh install must not publish a port on the strength of
 nobody having deleted it. Arming is when the shipped list would have gone live,
 which is why observe mode is not the answer to this on its own.
 
+The one shipped egress source, `pterodactyl` on `172.18.0.0/16`, is disabled
+for the same reason and needs it more: enabled, it would pull every container
+on that bridge onto the tunnel and bill them to the LTE quota. It is there
+because it is the row this deployment adds by hand every time, and because a
+CIDR somebody has to go and look up is a CIDR that gets typed wrong.
+`model/defaults_test.go` pins both.
+
 Ports in use: probe `51999/udp`, control `51998/tcp`, tunnels
 `51820`/`51821`/`51822` (distinct so pfSense can policy-route by source port),
 admin tunnel `51830/udp`, portal `10.98.0.2:8080`.
@@ -1360,6 +1367,10 @@ where a subtle regression would be invisible in production until an outage:
   frontend or backend, no publishing to an address no linker holds.
 - `engine/linker_push_test.go` — only enabled linkers reach the backend, and a
   site with none sends nothing.
+- `model/defaults_test.go` — nothing in the shipped configuration is live: the
+  mode is observe, no example service is enabled, backend egress is off and the
+  shipped egress row is disabled. A fresh install must not publish a port or
+  divert a container network because nobody deleted a row.
 - `web/validate_test.go` — a path mark colliding with any of the five the system
   reserves, duplicate marks/tables, contradictory ceilings,
   unknown timezones, and a blank timezone taking the deployment's own zone
