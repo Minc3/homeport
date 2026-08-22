@@ -220,7 +220,9 @@ func (a *Agent) provisionalConfig() proto.BackendConfig {
 // applyPlumbing installs everything the backend needs in order to be reachable
 // and measurable: the overlay address, sysctls, per-path probe reply routes and
 // the return rule. None of it moves published traffic, so it runs in observe
-// mode too - see the observe-mode invariant in CLAUDE.md.
+// mode too - see the observe-mode invariant in CLAUDE.md. The one nftables
+// table here, the connection marking, is the exception: it moves nothing in
+// observe mode either, but observe mode promises to load no table at all.
 func (a *Agent) applyPlumbing(ctx context.Context, cfg proto.BackendConfig) {
 	paths := make([]model.PathConfig, 0, len(cfg.Paths))
 	ifaces := make([]string, 0, len(cfg.Paths))
@@ -310,7 +312,18 @@ func (a *Agent) applyPlumbing(ctx context.Context, cfg proto.BackendConfig) {
 	// further - a container on a bridge network - is routed before its source
 	// is rewritten back, so it needs the connection mark instead. Both are
 	// installed: they cost nothing and cover each other.
-	if _, err := sysx.ApplyReturnRuleset(ctx, real, a.stateDir, sysx.BuildReturnRuleset(ifaces)); err != nil {
+	//
+	// The marking table goes through the gated runner. It is inert in observe
+	// mode - the mark it restores selects a table whose default route observe
+	// mode never installs - but it is an nftables table loaded on the host,
+	// and the portal's promise for observe mode is that there is none. The
+	// ip rule beside it stays plumbing: a rule into an empty table is the
+	// same nothing as the probe rules, and it is what makes arming take
+	// effect with a single reload rather than a rule add that can fail.
+	a.mu.RLock()
+	gated := a.runner
+	a.mu.RUnlock()
+	if _, err := sysx.ApplyReturnRuleset(ctx, gated, a.stateDir, sysx.BuildReturnRuleset(ifaces)); err != nil {
 		a.log.Warn("return path marking not installed; containerised services will not reply through the tunnel",
 			"err", err)
 	}

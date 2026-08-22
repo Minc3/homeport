@@ -61,6 +61,8 @@ func backendKernel() map[string]string {
 			"29998: from all fwmark 0x200 lookup 100\n" +
 			"30001: from all fwmark 0x101 lookup 101\n" +
 			"30002: from all fwmark 0x102 lookup 102\n" +
+			"31001: from all fwmark 0x101 unreachable\n" +
+			"31002: from all fwmark 0x102 unreachable\n" +
 			"32500: from 10.99.0.2 lookup 100\n" +
 			"32766: from all lookup main\n",
 		// The agent reads rules filtered by table, because `ip rule show` prints

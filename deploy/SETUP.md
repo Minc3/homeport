@@ -502,8 +502,11 @@ leaving **On host** blank for the backend. A `pterodactyl` row for
 `172.18.0.0/16` ships there already, disabled: tick it if that is your bridge,
 correct the CIDR if it is not.
 
-This catches everything on that network, so give the service its own Docker
-network if the bridge carries anything else.
+This catches every internet-bound packet from that network, so give the
+service its own Docker network if the bridge carries anything else. Traffic to
+private, link-local and multicast addresses - the LAN, the host, the resolver,
+another bridge - is left on its normal route, because the frontend's public
+address can do nothing with a private destination.
 
 ### 10.3 Check
 

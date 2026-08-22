@@ -1,7 +1,7 @@
 [Unit]
 Description=Path failover backend (probe responder, return routing, LTE metering)
 Documentation=https://github.com/quinlan102/homeport
-# nftables.service flushes the ruleset when it starts, and the backend now
+# nftables.service flushes the ruleset when it starts, and an armed backend
 # installs two tables of its own (failover_return, and failover_egress when
 # egress networks are configured). The reconcilers repair routes and
 # rp_filter but not nftables, so a late nftables.service would take the

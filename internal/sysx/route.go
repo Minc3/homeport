@@ -2,7 +2,6 @@ package sysx
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -24,8 +23,23 @@ import (
 // Three extra tables exist purely so the prober can reach the backend through
 // one specific tunnel regardless of which one is currently active:
 //
-//	ip rule  add fwmark 0x101 lookup 101
+//	ip rule  add fwmark 0x101 lookup 101      pref 30001
+//	ip rule  add fwmark 0x101 unreachable     pref 31001
 //	ip route replace 10.99.0.2/32 dev wg-main src 10.99.0.1 table 101
+//
+// The second rule is what makes a probe fail closed. A rule whose table has
+// no matching route is simply skipped, and the lookup carries on to main -
+// which on the frontend always has a default route out the public interface.
+// So with the tunnel absent, the probes did not fail: they left by the
+// datacentre's uplink, addressed to a private address, and on a site with
+// backend egress on they matched `ip saddr 10.99.0.0/24 oifname eth0 snat`
+// on the way out. A source NAT binding belongs to the conntrack entry, not to
+// the interface, and the prober keeps one socket for as long as sends succeed,
+// so every later probe from that socket carried the public address down the
+// tunnel once it existed. The backend answered to the public address, from an
+// ephemeral port that matched no conntrack entry, and nothing was listening
+// there. A frontend that booted before its tunnels never saw a reply on any
+// path, for as long as the process lived. See ProbeDenyRulePrefBase.
 
 // EnsureOverlayAddress makes sure the stable overlay address exists on its own
 // dummy interface, creating both if needed.
@@ -76,28 +90,33 @@ func EnsureOverlayAddress(ctx context.Context, r Runner, ip, dev string) error {
 func EnsureProbeRoutes(ctx context.Context, r Runner, paths []model.PathConfig, dstIP, srcIP string) error {
 	var problems []string
 	for _, p := range paths {
+		// The rules go in whether or not the tunnel exists. They select on a
+		// mark, not on a device, so nothing about them needs the interface -
+		// and the unreachable rule is needed most precisely when the
+		// interface is missing, because that is when an unguarded probe
+		// would fall through to main and leave by the public uplink. Before
+		// this the whole path was skipped, rules included, on a frontend that
+		// booted ahead of wg-quick, and the leak described at the top of this
+		// file followed.
+		if err := ensureProbeRules(ctx, r, p); err != nil {
+			// A rule that cannot be installed is not a per-path problem: the
+			// rules are shared plumbing, and failing to add one means policy
+			// routing is not working at all.
+			return err
+		}
 		// A tunnel that does not exist yet is expected: wg-quick may not have
 		// run, or the interface may be being rebuilt. The path simply probes as
-		// down until it appears.
+		// down until it appears, and the reconciler installs the route then.
 		if !IfaceExists(p.Iface) {
 			problems = append(problems, p.Name+": interface "+p.Iface+" does not exist")
 			continue
 		}
-		err := ensureProbeRoute(ctx, r, p, dstIP, srcIP)
-		if err == nil {
-			continue
+		// Anything that fails here - most often the overlay source address
+		// missing - leaves just this path unprobeable, and silently skipping
+		// it would report a healthy link as an unreachable one.
+		if err := ensureProbeRouteOnly(ctx, r, p, dstIP, srcIP); err != nil {
+			problems = append(problems, p.Name+": "+err.Error())
 		}
-		// A rule that cannot be installed is not a per-path problem: the rules
-		// are shared plumbing, and failing to add one means policy routing is
-		// not working at all.
-		var re ruleAddError
-		if errors.As(err, &re) {
-			return err
-		}
-		// Anything else - most often the overlay source address missing -
-		// leaves just this path unprobeable, and silently skipping it would
-		// report a healthy link as an unreachable one.
-		problems = append(problems, p.Name+": "+err.Error())
 	}
 	if len(problems) > 0 {
 		return fmt.Errorf("some paths cannot be probed: %s", strings.Join(problems, "; "))
@@ -127,12 +146,25 @@ func (e ruleAddError) Error() string { return e.err.Error() }
 func (e ruleAddError) Unwrap() error { return e.err }
 
 func ensureProbeRoute(ctx context.Context, r Runner, p model.PathConfig, dstIP, srcIP string) error {
-	table := strconv.Itoa(p.Table)
-	mark := fmt.Sprintf("0x%x", p.Mark)
-	if _, err := r.Run(ctx, "ip", "route", "replace", dstIP+"/32",
-		"dev", p.Iface, "src", srcIP, "table", table); err != nil {
+	if err := ensureProbeRouteOnly(ctx, r, p, dstIP, srcIP); err != nil {
 		return err
 	}
+	return ensureProbeRules(ctx, r, p)
+}
+
+// ensureProbeRouteOnly installs the table entry and nothing else. It needs the
+// interface to exist, which is the caller's business to know.
+func ensureProbeRouteOnly(ctx context.Context, r Runner, p model.PathConfig, dstIP, srcIP string) error {
+	_, err := r.Run(ctx, "ip", "route", "replace", dstIP+"/32",
+		"dev", p.Iface, "src", srcIP, "table", strconv.Itoa(p.Table))
+	return err
+}
+
+// ensureProbeRules installs the two rules for one path's mark: the lookup into
+// its table, and the unreachable behind it. Neither needs the interface.
+func ensureProbeRules(ctx context.Context, r Runner, p model.PathConfig) error {
+	table := strconv.Itoa(p.Table)
+	mark := fmt.Sprintf("0x%x", p.Mark)
 
 	// Read this path's own table rather than grepping the whole listing for a
 	// number. `ip rule show` prints a table's *name* wherever
@@ -179,7 +211,79 @@ func ensureProbeRoute(ctx context.Context, r Runner, p model.PathConfig, dstIP, 
 		_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", table,
 			"pref", strconv.Itoa(pref))
 	}
+
+	// The backstop. Read from the full listing, because an unreachable rule
+	// names no table and so cannot be asked for by one; it carries no table
+	// token for an rt_tables alias to rewrite either.
+	all, err := listRules(ctx, r)
+	if err != nil {
+		return err
+	}
+	deny := probeDenyRulePref(p)
+	for _, pref := range denyRulePrefs(all, mark) {
+		if pref == deny {
+			return nil
+		}
+	}
+	if _, err := r.Run(ctx, "ip", "rule", "add", "fwmark", mark, "unreachable",
+		"pref", strconv.Itoa(deny)); err != nil {
+		return ruleAddError{fmt.Errorf("add unreachable rule for %s: %w", p.Name, err)}
+	}
 	return nil
+}
+
+// ProbeDenyRulePrefBase is the priority band of the per-path unreachable
+// rules, immediately behind the lookup band and ahead of everything that could
+// otherwise claim a marked packet: the backend's egress rule, its source rules
+// and main.
+//
+// A rule whose table has no route for the destination is skipped, not
+// terminal, so on its own `fwmark 0x101 lookup 101` fails open: the moment the
+// tunnel is deleted, or has not been created yet, a probe marked for it goes
+// on to whatever the next rule says. On the frontend that is main and the
+// public uplink; on the backend it is `from 10.99.0.2 lookup 100` and the
+// active tunnel, which is the mixed measurement invariant 3 exists to prevent.
+// With this rule behind the lookup, a marked packet with no route in its own
+// table gets ENETUNREACH instead - which is what the prober's hold path was
+// always written for, and had never actually been reached on a host with a
+// default route.
+//
+// It is a rule rather than an `unreachable default` inside the table so that
+// the table itself carries only the one route this system installs. The
+// number belongs to the host (invariant 8); a default it did not choose would
+// be a change to a table it may be using for its own policy routing.
+const ProbeDenyRulePrefBase = 31000
+
+func probeDenyRulePref(p model.PathConfig) int { return ProbeDenyRulePrefBase + p.ID }
+
+// denyRulePrefs returns the priorities of every unreachable rule selecting on
+// this mark. The kernel prints one as "<pref>:\tfrom all fwmark 0x101 unreachable".
+func denyRulePrefs(rules, mark string) []int {
+	var prefs []int
+	for _, line := range strings.Split(rules, "\n") {
+		pref, rest, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(pref)
+		if err != nil {
+			continue
+		}
+		fields := strings.Fields(rest)
+		var hasMark, unreachable bool
+		for i, f := range fields {
+			switch f {
+			case "fwmark":
+				hasMark = hasMark || (i+1 < len(fields) && fields[i+1] == mark)
+			case "unreachable":
+				unreachable = true
+			}
+		}
+		if hasMark && unreachable {
+			prefs = append(prefs, n)
+		}
+	}
+	return prefs
 }
 
 // ProbeRulePrefBase is the priority band the per-path fwmark rules live in.
@@ -217,7 +321,7 @@ func markRulePrefs(rules, mark, table string) []int {
 		}
 		// Matched on whole fields, not substrings: "lookup 101" is a prefix of
 		// "lookup 1010", and deleting the wrong rule here would strand a path.
-		var hasMark, hasTable bool
+		var hasMark, hasLookup, hasTable bool
 		fields := strings.Fields(rest)
 		for i, f := range fields {
 			if i+1 >= len(fields) {
@@ -227,12 +331,16 @@ func markRulePrefs(rules, mark, table string) []int {
 			case "fwmark":
 				hasMark = hasMark || fields[i+1] == mark
 			case "lookup":
+				hasLookup = true
 				hasTable = hasTable || fields[i+1] == table
 			}
 		}
 		// An empty table means the listing was already filtered to one by the
 		// kernel, so there is nothing to match here - see listRulesInTable.
-		if hasMark && (hasTable || table == "") {
+		// A rule with no lookup at all - the unreachable backstop on the same
+		// mark - selects no table and is never one of these, whatever the
+		// listing it turned up in.
+		if hasMark && hasLookup && (hasTable || table == "") {
 			prefs = append(prefs, n)
 		}
 	}
@@ -772,12 +880,21 @@ func RemoveProbeRoutes(ctx context.Context, r Runner, paths []model.PathConfig, 
 	// - and a leftover rule still steers probes into a table that revert has
 	// just emptied. The listing is per table and filtered by the kernel, so a
 	// host that has named one of these tables does not hide its own rules.
+	all, _ := listRules(ctx, r)
 	for _, p := range paths {
 		table := strconv.Itoa(p.Table)
 		mark := fmt.Sprintf("0x%x", p.Mark)
 		existing, _ := listRulesInTable(ctx, r, p.Table)
 		for _, pref := range markRulePrefs(existing, mark, "") {
 			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", table,
+				"pref", strconv.Itoa(pref))
+		}
+		// The backstop behind it, at whatever priority it was found. Left in
+		// place it would refuse every packet carrying this mark, and a host
+		// that selects on the same value for its own policy routing would
+		// find that traffic blackholed by a system it had just uninstalled.
+		for _, pref := range denyRulePrefs(all, mark) {
+			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "unreachable",
 				"pref", strconv.Itoa(pref))
 		}
 		// The one route this installed, by name, never a flush of the table.

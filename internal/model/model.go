@@ -843,11 +843,18 @@ func Defaults() Config {
 		// operator ticks what this site actually serves. Observe mode delays
 		// that rather than preventing it - arming a site is the moment the
 		// shipped list would have gone live.
+		//
+		// The list is the shape of the deployment this was built for: the web
+		// front, a Pterodactyl panel's SFTP and Wings daemon, the Source
+		// engine's port range - one rule for every server the panel spawns -
+		// and a Minecraft server.
 		Services: []Service{
-			{Name: "gmod", Proto: "udp", Port: 27015},
-			{Name: "gmod-hltv", Proto: "udp", Port: 27020},
 			{Name: "http", Proto: "tcp", Port: 80},
 			{Name: "https", Proto: "tcp", Port: 443},
+			{Name: "pterodactyl-sftp", Proto: "tcp", Port: 2022},
+			{Name: "pterodactyl-wings", Proto: "tcp", Port: 8080},
+			{Name: "source", Proto: "udp", Port: 27015, PortEnd: 27030},
+			{Name: "minecraft", Proto: "tcp", Port: 25565},
 		},
 		// The Docker network a Pterodactyl install puts its containers on,
 		// ready to tick once Frontend.BackendEgress is on. Disabled for the

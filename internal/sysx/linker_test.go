@@ -285,6 +285,38 @@ func TestLinkerMarkRuleLeavesAnIntactRuleAlone(t *testing.T) {
 	}
 }
 
+// A linker has one interface, and it is both the way to the backend and the way
+// to everything else on the LAN. So the exclusion of private destinations has
+// to cover the translation here as well as the mark: unqualified, a container's
+// packet to a printer or a database down the hall left with the overlay
+// address as its source, and the reply went to the LAN's default gateway
+// instead of back to this host.
+func TestLinkerEgressLeavesPrivateDestinationsAlone(t *testing.T) {
+	rs := BuildLinkerEgressRuleset([]string{"172.18.0.0/16"}, "eth0", "10.99.0.3")
+	var mark, snat string
+	for _, line := range strings.Split(rs, "\n") {
+		switch {
+		case strings.Contains(line, "meta mark set"):
+			mark = line
+		case strings.Contains(line, "snat to"):
+			snat = line
+		}
+	}
+	for name, line := range map[string]string{"mark": mark, "snat": snat} {
+		if line == "" {
+			t.Fatalf("no %s rule:\n%s", name, rs)
+		}
+		for _, private := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
+			if !strings.Contains(line, private) {
+				t.Errorf("the %s rule would fire on a packet to %s: %q", name, private, line)
+			}
+		}
+	}
+	if !strings.Contains(snat, `oifname "eth0"`) {
+		t.Errorf("the translation must stay scoped to the LAN interface: %q", snat)
+	}
+}
+
 // Revert removes it at the priority it was found at. Deleting by selector alone
 // takes one arbitrary match, so a duplicate from an older build would survive.
 //

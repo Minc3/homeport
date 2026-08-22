@@ -40,10 +40,12 @@ func TestRulesetPublishesEnabledServices(t *testing.T) {
 	rs := BuildRuleset(cfg)
 
 	for _, want := range []string{
-		`udp dport 27015 dnat to 10.99.0.2`,
-		`udp dport 27020 dnat to 10.99.0.2`,
 		`tcp dport 80 dnat to 10.99.0.2`,
 		`tcp dport 443 dnat to 10.99.0.2`,
+		`tcp dport 2022 dnat to 10.99.0.2`,
+		`tcp dport 8080 dnat to 10.99.0.2`,
+		`udp dport 27015-27030 dnat to 10.99.0.2`,
+		`tcp dport 25565 dnat to 10.99.0.2`,
 		`iifname "eth0"`,
 	} {
 		if !strings.Contains(rs, want) {
@@ -54,7 +56,11 @@ func TestRulesetPublishesEnabledServices(t *testing.T) {
 
 func TestRulesetSkipsDisabledServices(t *testing.T) {
 	cfg := defaultsPublishing()
-	cfg.Services[0].Enabled = false // gmod
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "source" {
+			cfg.Services[i].Enabled = false
+		}
+	}
 	rs := BuildRuleset(cfg)
 	if strings.Contains(rs, "dport 27015") {
 		t.Errorf("disabled service was published:\n%s", rs)
@@ -285,13 +291,48 @@ func TestBackendEgressRulesetPullsANetworkOntoTheTunnel(t *testing.T) {
 	if !strings.Contains(rs, "type filter hook prerouting priority mangle") {
 		t.Errorf("marking must happen in prerouting for forwarded traffic:\n%s", rs)
 	}
-	if !strings.Contains(rs, "ip saddr 172.18.0.0/16 meta mark set 0x300") {
+	if !strings.Contains(rs, "ip saddr 172.18.0.0/16 ip daddr != {") ||
+		!strings.Contains(rs, "} meta mark set 0x300") {
 		t.Errorf("network not marked:\n%s", rs)
 	}
 	// The source has to become the overlay address: that is what the frontend's
 	// egress rule matches, and the only address it can route a reply back to.
 	if !strings.Contains(rs, `ip saddr 172.18.0.0/16 oifname { "wg-main", "wg-lte1" } snat to 10.99.0.2`) {
 		t.Errorf("source not rewritten to the overlay address:\n%s", rs)
+	}
+}
+
+// The mark is limited to internet destinations, and that limit is the feature
+// working at all on a real host. Matched on source alone, the rule stamped
+// everything a container sent: its DNS queries to the LAN resolver, its
+// traffic to the host's own LAN address, to a database on the next bridge, to
+// the panel that manages it. All of it went down the tunnel to a frontend
+// that can do nothing with a private destination, and the symptom was the
+// containers "going offline" the moment their network was ticked - unable to
+// resolve a name or reach their panel, while their internet traffic was fine.
+func TestBackendEgressLeavesPrivateDestinationsOnTheirNormalRoute(t *testing.T) {
+	rs := BuildBackendEgressRuleset([]string{"172.25.50.0/24"}, []string{"wg-main"}, "10.99.0.2")
+	var markLine string
+	for _, line := range strings.Split(rs, "\n") {
+		if strings.Contains(line, "meta mark set") {
+			markLine = line
+		}
+	}
+	if markLine == "" {
+		t.Fatalf("no mark rule:\n%s", rs)
+	}
+	for _, private := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8"} {
+		if !strings.Contains(markLine, private) {
+			t.Errorf("a packet to %s would be marked and sent down the tunnel: %q", private, markLine)
+		}
+	}
+	if !strings.Contains(markLine, "ip daddr != {") {
+		t.Errorf("the destination set must be an exclusion: %q", markLine)
+	}
+	// A multicast or reserved destination has no business on the tunnel
+	// either; both ranges sit under 224.0.0.0/3.
+	if !strings.Contains(markLine, "224.0.0.0/3") {
+		t.Errorf("multicast and reserved destinations are not excluded: %q", markLine)
 	}
 }
 

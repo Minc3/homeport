@@ -397,6 +397,19 @@ matching work on locally *originated* packets, and a container's are *forwarded*
 through the host, so there is no local socket to inspect. What is left is the
 bridge network's address range, which is what `Egress.Sources` configures.
 
+**And only the internet-bound part of it.** Both egress rulesets qualify the
+source match with `ip daddr != { … }` over `sysx.NonInternetDestinations` —
+RFC 1918, CGNAT, loopback, link-local, `0.0.0.0/8` and `224.0.0.0/3`. Matched on
+source alone the mark stamped everything a container sent: its DNS queries to
+the LAN resolver, its traffic to the host's own LAN address, to a database on
+the next bridge, to the panel that manages it. All of it went down the tunnel to
+a frontend that can do nothing with a private destination, and the symptom was
+the containers going offline the moment their network was ticked — unable to
+resolve a name or reach their panel, while their internet traffic was fine. The
+frontend's NAT is an internet address; only internet traffic should seek it out.
+On the linker the same set qualifies the SNAT too, because its one interface is
+both its way to the backend and its way to everything else on the LAN.
+
 Two rules on the backend, doing two jobs (`BuildBackendEgressRuleset`). The
 prerouting `meta mark` diverts the traffic — a forwarded packet is routed after
 that hook, so the mark is what sends it to table 100 rather than out to pfSense,
@@ -744,6 +757,37 @@ Breaking any of these is a correctness bug even if the tests pass.
    route at all. `ensureProbeRoute`, `EnsureControlRoute`, `EnsureEgressRule`
    and `EnsureReturnMarkRule` all install the pinned rule first and clear the
    strays afterwards.
+
+   **And a path's rules fail closed, because a lookup rule on its own fails
+   open.** A rule whose table holds no route for the destination is skipped,
+   not terminal, so with the tunnel absent `fwmark 0x101 lookup 101` sends the
+   probe on to the next rule that matches — on the frontend that is main and
+   the public uplink, on the backend it is `from 10.99.0.2 lookup 100` and the
+   active tunnel. Each path therefore carries a second rule, `fwmark 0x101
+   unreachable` at `sysx.ProbeDenyRulePrefBase + id` (31001–31003), behind the
+   lookup and ahead of everything else, so a marked packet with no route in its
+   own table gets ENETUNREACH. That is the failure `Prober.sendFailed` and
+   `hold` were written for and had never actually been reached on a host with
+   a default route.
+
+   The reason this is an invariant and not a tidy-up is conntrack. A frontend
+   that boots before `wg-quick` has no probe routes, and its probes used to
+   leave the datacentre addressed to `10.99.0.2`. On a site with backend egress
+   on they matched `ip saddr 10.99.0.0/24 oifname eth0 snat` on the way out. A
+   source NAT binding belongs to the connection, not to the interface, and the
+   prober keeps one socket for as long as sends succeed — so once the tunnels
+   came up every probe from that socket still carried the public address, the
+   backend answered to the public address from an ephemeral port that matched
+   no conntrack entry, and nothing was listening there. Three dead paths for
+   the life of the process; a restart, with the tunnels now present before
+   the sockets opened, fixed it instantly. The rules go in for every path
+   whether or not its interface exists yet (`EnsureProbeRoutes`), because the
+   interface-less case is the one they are for, and the route follows from the
+   reconciler when the tunnel appears. It is a rule rather than an
+   `unreachable default` inside the table so the table carries only the one
+   route this system installs — the number belongs to the host (invariant 8).
+   `RemoveProbeRoutes` takes the deny rules down with the rest; left behind they
+   would blackhole every packet carrying the mark.
 4. Probe results reach the tracker in sequence order. Out-of-order delivery
    scrambles the consecutive-loss counts that condemn a path.
 5. Every probe and control frame is HMAC-authenticated. Nobody outside can
@@ -763,6 +807,17 @@ Breaking any of these is a correctness bug even if the tests pass.
    rate limiter plainly does; observe mode's promise is that nothing the agent
    has done can be felt by a player. See `Engine.applySystemConfig` and
    `Agent.ApplyConfig`; `realRunner()` is the escape hatch.
+
+   **It also loads no nftables table, on either host.** The backend's
+   connection-marking table (`failover_return`) was installed as plumbing on
+   the strength of being inert — the mark it restores selects table 100, whose
+   default route observe mode never installs — and it is inert, but it was
+   also a table sitting in `nft list ruleset` on a host whose portal said there
+   was none. It now goes through the gated runner with the rest of the data
+   plane: the file is written in both modes, loaded only when armed. The `ip
+   rule` beside it stays plumbing, exactly like the probe rules — a rule into
+   an empty table is nothing — and that is what lets arming take effect with
+   one reload rather than a rule add that can fail.
 
    **`sysx.isReadOnly` is the other half of that promise, and it fails in the
    dangerous direction.** A command it wrongly calls a mutation is not run and
@@ -1326,11 +1381,14 @@ Defaults (`model.Defaults()`) match the intended deployment: main/LTE1/LTE2 at
 priorities 1/2/3, tables 101/102/103, marks `0x101`/`0x102`/`0x103`, 250ms
 active and 5s standby probing, 8 losses to condemn (~2.6s detection), 90s
 failback hold-down, 60 GB and 20 GB quotas resetting on the 1st in
-`model.DefaultTimezone` (`Australia/Melbourne`), and **observe mode**. The four example services —
-`27015/udp`, `27020/udp`, `80/tcp`, `443/tcp` — ship **disabled**: a row is a
-DNAT rule, and a fresh install must not publish a port on the strength of
-nobody having deleted it. Arming is when the shipped list would have gone live,
-which is why observe mode is not the answer to this on its own.
+`model.DefaultTimezone` (`Australia/Melbourne`), and **observe mode**. The six example services —
+`http 80/tcp`, `https 443/tcp`, `pterodactyl-sftp 2022/tcp`, `pterodactyl-wings
+8080/tcp`, `source 27015–27030/udp`, `minecraft 25565/tcp` — ship **disabled**:
+a row is a DNAT rule, and a fresh install must not publish a port on the
+strength of nobody having deleted it. Arming is when the shipped list would
+have gone live, which is why observe mode is not the answer to this on its own.
+A row added in the portal starts at `5000/tcp`, a port nothing here listens on,
+so a row saved before it was edited publishes nothing that exists.
 
 The one shipped egress source, `pterodactyl` on `172.18.0.0/16`, is disabled
 for the same reason and needs it more: enabled, it would pull every container
@@ -1366,6 +1424,9 @@ where a subtle regression would be invisible in production until an outage:
 - `proto/proto_test.go` — round trip, and rejection of wrong keys, tampering,
   wrong sizes and replayed challenges.
 - `sysx/nft_test.go` — the published ruleset never masquerades; atomic replace;
+  the egress mark leaves private, link-local and multicast destinations on
+  their normal route (and `sysx/linker_test.go` holds the same for a linker's
+  mark and its SNAT);
   the egress source NAT stays in its own table, stays scoped to the public
   interface, and renders nothing at all when it is off; the two forward-exception
   comments cannot match each other; the backend egress SNAT stays ahead of
@@ -1408,7 +1469,10 @@ where a subtle regression would be invisible in production until an outage:
   priority adds before it deletes, the control rule selects on mark not addresses,
   rp_filter is off rather than loose, the path rules are pinned ahead of the
   return rule, and a purged table reads back as no interface rather than an
-  error.
+  error. Also that a path's rules go in without its interface and the
+  unreachable backstop lands behind the lookup, that the backstop is refused
+  rather than falling through to main, and that revert removes it at whatever
+  priority it is found.
 - `engine/reconcile_test.go`, `agent/reconcile_test.go` — what a tunnel restart
   leaves behind gets repaired, an intact system is left completely alone, a
   tunnel that has not come back is skipped, and observe mode repairs
@@ -1524,7 +1588,11 @@ where a subtle regression would be invisible in production until an outage:
   frontend or backend, no publishing to an address no linker holds.
 - `engine/linker_push_test.go` — only enabled linkers reach the backend, and a
   site with none sends nothing.
-- `model/defaults_test.go` — nothing in the shipped configuration is live: the
+- `agent/agent_test.go` — observe mode loads no nftables table: the marking
+  table's file is written, `nft -f` is not run, the return-mark rule still goes
+  in as plumbing, and arming loads it.
+- `model/defaults_test.go` — the shipped service rows are this deployment's
+  ports, and nothing in the shipped configuration is live: the
   mode is observe, no example service is enabled, backend egress is off and the
   shipped egress row is disabled. A fresh install must not publish a port or
   divert a container network because nobody deleted a row.
@@ -1559,7 +1627,8 @@ next agent learns which behaviours are deliberate.
   still leaves via pfSense, and `-ip` does not change that. Covering it would
   mean `meta skuid` or cgroup matching in an output chain, which is not built.
   The container case has the opposite property: the network match catches
-  *everything* in that network, wanted or not.
+  every internet-bound packet from that network, wanted or not. Only the
+  destination is considered, never which process sent it.
 - The reconcilers repair routes and `rp_filter`. Anything else the kernel
   attaches to an interface — a queue discipline, an nftables device set — would
   be lost on a restart with nothing to notice.

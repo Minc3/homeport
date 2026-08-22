@@ -1159,7 +1159,7 @@ function renderSettings() {
       servicesBody)),
     el('div', { class: 'row' }, el('button', {
       class: 'btn', type: 'button',
-      onclick: () => { c.services.push({ name: 'new', proto: 'tcp', port: 8080, port_end: 0, enabled: true }); renderServices(); },
+      onclick: () => { c.services.push({ name: 'new', proto: 'tcp', port: 5000, port_end: 0, enabled: true }); renderServices(); },
     }, 'Add service')),
     el('p', { class: 'hint', text: 'Destination NAT only. Source addresses are never rewritten, so the game server and the web server see real client IPs.' }),
   ));
@@ -1370,6 +1370,7 @@ function renderSettings() {
     el('p', { class: 'hint', text: 'For services the backend cannot bind to the overlay address: a container has its own network namespace, so the overlay address does not exist inside it. Traffic from these networks is pulled onto the active tunnel and leaves with the frontend’s public address, which is what gets a containerised game server listed at the right address.' }),
     el('p', { class: 'hint', text: 'Use the docker bridge network, e.g. 172.18.0.0/16. Find it with: docker network inspect <name> -f "{{range .IPAM.Config}}{{.Subnet}}{{end}}". Give the service its own network if the bridge carries anything you do not want routed this way.' }),
     el('p', { class: 'hint', text: 'All of that network’s internet traffic takes this route, so it counts against the LTE quota during a failover.' }),
+    el('p', { class: 'hint', text: 'Only internet destinations are diverted. Traffic to private, link-local and multicast addresses (RFC 1918, 169.254.0.0/16, 100.64.0.0/10, 224.0.0.0/3) keeps its normal route, so the network can still reach the LAN, the host, its resolver and the other container networks.' }),
     el('p', { class: 'hint', text: 'On host is the machine the network belongs to: the backend unless the containers run on a linker. It matters because Docker uses the same bridge subnets on every machine: 172.17.0.0/16 is the default everywhere, so a row with no owner would pull containers onto the tunnel on hosts it was never meant to touch. The same network on two different hosts is fine; the same network twice on one host is not.' }),
   ));
 

@@ -602,15 +602,23 @@ func BuildLinkerEgressRuleset(cidrs []string, lanIface, overlayIP string) string
 
 	b.WriteString("\tchain prerouting {\n")
 	b.WriteString("\t\ttype filter hook prerouting priority mangle; policy accept;\n")
+	// Internet destinations only, as on the backend - see NonInternetDestinations.
 	for _, c := range cidrs {
-		fmt.Fprintf(&b, "\t\tip saddr %s meta mark set %#x\n", c, LinkerEgressMark)
+		fmt.Fprintf(&b, "\t\tip saddr %s %s meta mark set %#x\n", c, internetOnly(), LinkerEgressMark)
 	}
 	b.WriteString("\t}\n")
 
+	// The same limit on the translation, and here it matters more than it
+	// does on the backend: the backend's SNAT is scoped to the tunnels, which
+	// only internet-bound traffic leaves by, but a linker's one interface is
+	// both its way to the backend and its way to everything else on the LAN.
+	// Unqualified, a container's packet to a printer or a database down the
+	// hall left with the overlay address as its source, and the reply went
+	// to the LAN's default gateway instead of back here.
 	b.WriteString("\tchain postrouting {\n")
 	b.WriteString("\t\ttype nat hook postrouting priority -10; policy accept;\n")
 	for _, c := range cidrs {
-		fmt.Fprintf(&b, "\t\tip saddr %s oifname %q snat to %s\n", c, lanIface, overlayIP)
+		fmt.Fprintf(&b, "\t\tip saddr %s %s oifname %q snat to %s\n", c, internetOnly(), lanIface, overlayIP)
 	}
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")

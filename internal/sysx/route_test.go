@@ -380,7 +380,9 @@ func TestProbeRulesArePinnedAheadOfTheReturnRule(t *testing.T) {
 // tick churns the rule set.
 func TestProbeRuleIsNotReinstalledWhenAlreadyCorrect(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
-		"ip rule show": "30001:\tfrom all fwmark 0x101 lookup 101\n32766:\tfrom all lookup main\n",
+		"ip rule show": "30001:\tfrom all fwmark 0x101 lookup 101\n" +
+			"31001:\tfrom all fwmark 0x101 unreachable\n" +
+			"32766:\tfrom all lookup main\n",
 	}}
 	p := model.PathConfig{ID: 1, Name: "main", Iface: "lo", Table: 101, Mark: 0x101}
 
@@ -390,6 +392,72 @@ func TestProbeRuleIsNotReinstalledWhenAlreadyCorrect(t *testing.T) {
 	for _, c := range f.calls {
 		if strings.HasPrefix(c, "ip rule") && !strings.HasPrefix(c, "ip rule show") {
 			t.Errorf("touched a correct rule set: %s", c)
+		}
+	}
+}
+
+// A rule whose table has no route for the destination is skipped, and the
+// lookup carries on to main. On the frontend main always has a default route
+// out the public uplink, so a probe for a tunnel that did not exist yet was
+// not refused: it left the datacentre addressed to a private address, and on
+// a site with backend egress on it picked up a source NAT binding on the way.
+// That binding belongs to the conntrack entry, and the prober keeps one socket
+// for as long as sends succeed, so every probe it ever sent afterwards carried
+// the public address down the tunnel and no reply ever came back. A frontend
+// rebooted before wg-quick measured three dead paths until the service was
+// restarted. The unreachable rule behind the lookup is what makes the probe
+// fail instead, which is the behaviour the prober's hold path was written for.
+func TestProbeMarkIsRefusedRatherThanFallingThroughToMain(t *testing.T) {
+	if ProbeDenyRulePrefBase <= ProbeRulePrefBase+100 {
+		t.Fatalf("deny band %d is not behind the lookup band at %d", ProbeDenyRulePrefBase, ProbeRulePrefBase)
+	}
+	if ProbeDenyRulePrefBase >= OverlayLocalRulePref || ProbeDenyRulePrefBase >= ReturnRulePrefBase {
+		t.Fatalf("deny band %d sits behind the source rules, which would route a marked packet first",
+			ProbeDenyRulePrefBase)
+	}
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show": "0:\tfrom all lookup local\n32766:\tfrom all lookup main\n",
+	}}
+	paths := []model.PathConfig{
+		// An interface that cannot exist, which is the case this guards: the
+		// rules go in now, and the route waits for the reconciler.
+		{ID: 1, Name: "main", Iface: "wg-does-not-exist-here", Table: 101, Mark: 0x101},
+	}
+	err := EnsureProbeRoutes(context.Background(), f, paths, "10.99.0.2", "10.99.0.1")
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("a missing tunnel must still be reported, got %v", err)
+	}
+	add := f.index("ip rule add fwmark 0x101 lookup 101 pref 30001")
+	deny := f.index("ip rule add fwmark 0x101 unreachable pref 31001")
+	if add < 0 || deny < 0 {
+		t.Fatalf("rules not installed without the interface; calls were %v", f.calls)
+	}
+	if add > deny {
+		t.Errorf("the lookup must be in place before the refusal behind it; calls were %v", f.calls)
+	}
+	if f.ran("ip route replace") {
+		t.Errorf("a route was installed on an interface that does not exist: %v", f.calls)
+	}
+}
+
+// And the revert takes the refusal down with the rest, at whatever priority it
+// was found. Left behind it would blackhole every packet carrying the mark on
+// a host that had just uninstalled this system.
+func TestRemoveProbeRoutesTakesTheUnreachableRuleDown(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show": "30001:\tfrom all fwmark 0x101 lookup 101\n" +
+			"31001:\tfrom all fwmark 0x101 unreachable\n" +
+			"31777:\tfrom all fwmark 0x101 unreachable\n",
+	}}
+	RemoveProbeRoutes(context.Background(), f,
+		[]model.PathConfig{{ID: 1, Name: "main", Iface: "wg-main", Table: 101, Mark: 0x101}},
+		"10.99.0.2/32", "10.99.0.0/24")
+	for _, want := range []string{
+		"ip rule del fwmark 0x101 unreachable pref 31001",
+		"ip rule del fwmark 0x101 unreachable pref 31777",
+	} {
+		if !f.ran(want) {
+			t.Errorf("revert left %q behind: %v", want, f.calls)
 		}
 	}
 }
@@ -447,6 +515,8 @@ func TestProbeRuleIsFoundWhenTheTableHasAName(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		// What the kernel prints once the operator has named table 101.
 		"ip rule show table 101": "30001:\tfrom all fwmark 0x101 lookup isp2\n",
+		"ip rule show": "30001:\tfrom all fwmark 0x101 lookup isp2\n" +
+			"31001:\tfrom all fwmark 0x101 unreachable\n",
 	}}
 	p := model.PathConfig{ID: 1, Name: "main", Iface: "lo", Table: 101, Mark: 0x101}
 

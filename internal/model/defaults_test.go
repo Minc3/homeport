@@ -42,3 +42,27 @@ func TestTheShippedEgressRowIsThePterodactylBridge(t *testing.T) {
 		t.Errorf("host = %q, want empty so it belongs to the backend", srcs[0].Host)
 	}
 }
+
+// The shipped services are the shape of the deployment this was built for, so
+// a fresh portal shows the rows to tick rather than a list to type. Every one
+// ships disabled - the test above holds that - and the Source row is a range,
+// one rule for every server a panel spawns.
+func TestTheShippedServicesAreThisDeploymentsPorts(t *testing.T) {
+	want := []Service{
+		{Name: "http", Proto: "tcp", Port: 80},
+		{Name: "https", Proto: "tcp", Port: 443},
+		{Name: "pterodactyl-sftp", Proto: "tcp", Port: 2022},
+		{Name: "pterodactyl-wings", Proto: "tcp", Port: 8080},
+		{Name: "source", Proto: "udp", Port: 27015, PortEnd: 27030},
+		{Name: "minecraft", Proto: "tcp", Port: 25565},
+	}
+	got := Defaults().Services
+	if len(got) != len(want) {
+		t.Fatalf("services = %d rows, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("service %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}

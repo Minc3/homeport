@@ -66,6 +66,9 @@ func healthyKernel() map[string]string {
 			"30001: from all fwmark 0x101 lookup 101\n" +
 			"30002: from all fwmark 0x102 lookup 102\n" +
 			"30003: from all fwmark 0x103 lookup 103\n" +
+			"31001: from all fwmark 0x101 unreachable\n" +
+			"31002: from all fwmark 0x102 unreachable\n" +
+			"31003: from all fwmark 0x103 unreachable\n" +
 			"32766: from all lookup main\n",
 		// Rules are read back filtered by table, not grepped out of the full
 		// listing: `ip rule show` prints a table's *name* wherever rt_tables

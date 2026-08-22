@@ -188,3 +188,31 @@ func TestReturnPathIsNotGuessedBeforeAnyDecision(t *testing.T) {
 		t.Errorf("nothing should be installed before the first decision, got: %v", runner.calls)
 	}
 }
+
+// Observe mode promises that no nftables table of this system's is loaded on
+// the host. The connection-marking table was the one exception: installed as
+// plumbing on the strength of being inert - the mark it restores selects a
+// table whose default route observe mode never installs - and it is inert, but
+// it is also a table sitting in `nft list ruleset` on a host whose portal says
+// there is none. Armed, it loads; observe, the file is written and nothing is
+// loaded. The ip rule beside it stays plumbing, like the probe rules.
+func TestObserveModeLoadsNoMarkingTable(t *testing.T) {
+	a, runner := testAgent(t, true)
+	a.runner = &sysx.DryRunner{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	a.applyPlumbing(context.Background(), a.cfg)
+
+	if n := runner.count("nft -f"); n != 0 {
+		t.Errorf("observe mode loaded %d nftables table(s); calls were %v", n, runner.calls)
+	}
+	if runner.count("ip rule add fwmark 0x200 lookup 100") != 1 {
+		t.Errorf("the return-mark rule is plumbing and belongs in observe mode too; calls were %v", runner.calls)
+	}
+
+	// Armed, the same call loads it.
+	a.runner = runner
+	a.applyPlumbing(context.Background(), a.cfg)
+	if n := runner.count("nft -f"); n != 1 {
+		t.Errorf("arming loaded %d nftables table(s), want the marking table; calls were %v", n, runner.calls)
+	}
+}

@@ -160,6 +160,38 @@ func RemoveEgressRuleset(ctx context.Context, r Runner) {
 // the return mark (0x200).
 const EgressMark = 0x300
 
+// NonInternetDestinations is every IPv4 range that cannot be reached through
+// the frontend's public address: private, carrier-grade NAT, loopback,
+// link-local, "this network", and multicast plus the reserved block above it.
+//
+// The egress mark is limited to destinations outside these, and that limit
+// is the difference between the feature working and a network going dark.
+// Matching on source alone stamped *everything* a container sent, and a
+// container sends plenty that is not bound for the internet: its DNS queries
+// to the LAN resolver, its traffic to the host's own LAN address, to a
+// database on another bridge, to the panel that manages it. Every one of
+// those was sent down the tunnel to a frontend that could do nothing with a
+// private destination, and the symptom was a container that could not
+// resolve a name or reach its own panel the moment its network was ticked.
+// The frontend's NAT is an internet address; only internet traffic should
+// seek it out.
+var NonInternetDestinations = []string{
+	"0.0.0.0/8",
+	"10.0.0.0/8",
+	"100.64.0.0/10",
+	"127.0.0.0/8",
+	"169.254.0.0/16",
+	"172.16.0.0/12",
+	"192.168.0.0/16",
+	"224.0.0.0/3",
+}
+
+// internetOnly renders the destination match that keeps the egress mark off
+// traffic the frontend could not carry.
+func internetOnly() string {
+	return "ip daddr != { " + strings.Join(NonInternetDestinations, ", ") + " }"
+}
+
 // BuildBackendEgressRuleset renders the backend half of the egress feature, or
 // "" when no source networks are configured.
 //
@@ -171,6 +203,8 @@ const EgressMark = 0x300
 // `ip rule fwmark 0x300 lookup 100` send them down the active tunnel instead of
 // out to pfSense. Table 100 is the return table, which already tracks the
 // frontend's choice, so this follows failover with nothing extra to maintain.
+// Only internet destinations are marked - see NonInternetDestinations for why
+// the LAN, the other bridges and the resolver have to keep their normal route.
 //
 // The postrouting SNAT rewrites the source to the overlay address, because that
 // is what the frontend's own egress rule matches and what it can route a reply
@@ -205,7 +239,7 @@ func BuildBackendEgressRuleset(cidrs, ifaces []string, overlayIP string) string 
 	b.WriteString("\tchain prerouting {\n")
 	b.WriteString("\t\ttype filter hook prerouting priority mangle; policy accept;\n")
 	for _, c := range cidrs {
-		fmt.Fprintf(&b, "\t\tip saddr %s meta mark set %#x\n", c, EgressMark)
+		fmt.Fprintf(&b, "\t\tip saddr %s %s meta mark set %#x\n", c, internetOnly(), EgressMark)
 	}
 	b.WriteString("\t}\n")
 
