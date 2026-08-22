@@ -333,3 +333,26 @@ func TestValidateAcceptsAndTrimsAnOrdinaryServiceName(t *testing.T) {
 		t.Errorf("name = %q, want it trimmed", cfg.Services[0].Name)
 	}
 }
+
+// Every detection preset has to come out of the portal's own validation
+// clean, on the shipped configuration and on one whose standby interval has
+// been tuned down below the slowest preset's active interval. The bounds are
+// asserted here by running validate, not by copying its numbers: a copy would
+// keep passing after the real rule moved, and the first anybody heard would be
+// a preset the dropdown offers that Save refuses.
+func TestEveryDetectionPresetSurvivesValidate(t *testing.T) {
+	for _, d := range model.DetectionPresets() {
+		cfg := model.Defaults()
+		d.Apply(&cfg.Probe)
+		if err := validate(&cfg); err != nil {
+			t.Errorf("preset %s on the shipped config does not validate: %v", d.Name, err)
+		}
+
+		short := model.Defaults()
+		short.Probe.StandbyIntervalMs = short.Probe.ActiveIntervalMs
+		d.Apply(&short.Probe)
+		if err := validate(&short); err != nil {
+			t.Errorf("preset %s on a site with a short standby interval does not validate: %v", d.Name, err)
+		}
+	}
+}

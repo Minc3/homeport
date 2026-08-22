@@ -938,22 +938,28 @@ function renderSettings() {
   // under it is the trade-off, shown at the moment the choice is being made,
   // because a faster condemnation is bought with false failovers and nothing
   // else on this page says so.
+  // The four fields a preset owns, by their JSON names. One list drives the
+  // match, the fill of the config and the fill of the inputs, so a field
+  // added to a preset is added here once.
+  const PRESET_KEYS = ['active_interval_ms', 'timeout_ms', 'fail_threshold', 'window_size'];
   const probeInputs = {};
   const presetSel = el('select', {});
   for (const d of presets) presetSel.append(el('option', { value: d.name, text: d.label }));
   presetSel.append(el('option', { value: 'custom', text: 'Custom' }));
   const presetNote = el('p', { class: 'hint' });
   const detectLine = el('p', { class: 'hint' });
-  const matchingPreset = () => presets.find((d) => d.active_interval_ms === c.probe.active_interval_ms
-    && d.timeout_ms === c.probe.timeout_ms && d.fail_threshold === c.probe.fail_threshold && d.window_size === c.probe.window_size);
+  const matchingPreset = () => presets.find((d) => PRESET_KEYS.every((k) => d[k] === c.probe[k]));
   const refreshDetection = () => {
     const m = matchingPreset();
     presetSel.value = m ? m.name : 'custom';
     presetNote.textContent = m ? m.note
       : 'Custom numbers. Faster detection is bought with false failovers on any link that drops bursts of packets, and each one of those '
         + 'parks players on a metered path until the failback hold-down clears. Keep the timeout above the worst round trip on the slowest link.';
+    // Mirrors ProbeConfig.DetectMs in Go. A field that is blank or not a
+    // number gives NaN here and blanks the line, rather than quoting a figure
+    // for numbers that cannot be saved.
     const p = c.probe;
-    const ms = (Math.max(p.fail_threshold || 0, 1) - 1) * (p.active_interval_ms || 0) + (p.timeout_ms || 0);
+    const ms = (Math.max(p.fail_threshold, 1) - 1) * p.active_interval_ms + p.timeout_ms;
     detectLine.textContent = Number.isFinite(ms)
       ? `With these numbers a dead active path is condemned in about ${Math.round(ms / 100) / 10}s. Players feel a freeze of roughly that long, `
         + 'plus a moment for the switch, and a link that goes quiet for that long without being dead moves traffic too.'
@@ -962,14 +968,16 @@ function renderSettings() {
   presetSel.addEventListener('change', () => {
     const d = presets.find((x) => x.name === presetSel.value);
     if (!d) { refreshDetection(); return; }
-    c.probe.active_interval_ms = d.active_interval_ms;
-    c.probe.timeout_ms = d.timeout_ms;
-    c.probe.fail_threshold = d.fail_threshold;
-    c.probe.window_size = d.window_size;
-    probeInputs.active.value = d.active_interval_ms;
-    probeInputs.timeout.value = d.timeout_ms;
-    probeInputs.fail.value = d.fail_threshold;
-    probeInputs.window.value = d.window_size;
+    for (const k of PRESET_KEYS) {
+      c.probe[k] = d[k];
+      probeInputs[k].value = d[k];
+    }
+    // Validation refuses a standby cadence faster than the active one, and a
+    // preset the portal offers must never produce a form it then refuses.
+    if (!(c.probe.standby_interval_ms >= d.active_interval_ms)) {
+      c.probe.standby_interval_ms = d.active_interval_ms;
+      probeInputs.standby_interval_ms.value = d.active_interval_ms;
+    }
     refreshDetection();
   });
   const probeField = (key, label, value, set, opts) => {
@@ -986,22 +994,23 @@ function renderSettings() {
     presetNote,
     detectLine,
     el('div', { class: 'grid' },
-      probeField('active', 'Active interval (ms)', c.probe.active_interval_ms, (v) => (c.probe.active_interval_ms = v), {
+      probeField('active_interval_ms', 'Active interval (ms)', c.probe.active_interval_ms, (v) => (c.probe.active_interval_ms = v), {
         placeholder: '250',
         help: 'How often the path currently carrying traffic is probed. Detection time is this times one less than losses-before-down, plus the timeout, '
           + 'so 250 × 7 + 800 is about 2.6 seconds. Minimum 50. Example: 250.',
       }),
-      num('Standby interval (ms)', c.probe.standby_interval_ms, (v) => (c.probe.standby_interval_ms = v), {
+      probeField('standby_interval_ms', 'Standby interval (ms)', c.probe.standby_interval_ms, (v) => (c.probe.standby_interval_ms = v), {
         placeholder: '5000',
         help: 'How often the idle paths are probed. Slower on purpose: they only need to be known-good, and on LTE every probe costs data. '
           + 'Cannot be shorter than the active interval. Example: 5000.',
       }),
-      probeField('timeout', 'Timeout (ms)', c.probe.timeout_ms, (v) => (c.probe.timeout_ms = v), {
+      probeField('timeout_ms', 'Timeout (ms)', c.probe.timeout_ms, (v) => (c.probe.timeout_ms = v), {
         placeholder: '800',
         help: 'How long an unanswered probe waits before it counts as lost. Keep it comfortably above the worst round trip you expect '
-          + 'on the slowest link, or a healthy path logs losses that are really just late replies. Minimum 50. Example: 800.',
+          + 'on the slowest link, or a healthy path logs losses that are really just late replies. A reply slower than this is never measured, '
+          + 'so a Max RTT above the timeout can never trip. Minimum 50. Example: 800.',
       }),
-      probeField('fail', 'Losses before down', c.probe.fail_threshold, (v) => (c.probe.fail_threshold = v), {
+      probeField('fail_threshold', 'Losses before down', c.probe.fail_threshold, (v) => (c.probe.fail_threshold = v), {
         placeholder: '8',
         help: 'Consecutive unanswered probes before a path is condemned and traffic moves. '
           + 'One loss only makes it "suspect", which stays selectable: LTE drops the odd packet routinely and that must not move traffic. Example: 8.',
@@ -1011,7 +1020,7 @@ function renderSettings() {
         help: 'Consecutive good probes before a condemned path counts as healthy again. It still has to serve the failback hold-down below '
           + 'before it is given traffic back. Example: 10.',
       }),
-      probeField('window', 'Window size', c.probe.window_size, (v) => (c.probe.window_size = v), {
+      probeField('window_size', 'Window size', c.probe.window_size, (v) => (c.probe.window_size = v), {
         placeholder: '60',
         help: 'How many recent probes the loss, RTT and jitter figures on the dashboard are calculated over. '
           + '60 probes at 250ms is about the last 15 seconds. Minimum 5. Example: 60.',
@@ -1451,7 +1460,13 @@ function renderSettings() {
 
 async function loadSettings() {
   try {
-    [config, presets] = await Promise.all([api('/api/config'), api('/api/presets').catch(() => [])]);
+    [config, presets] = await Promise.all([
+      api('/api/config'),
+      // A missing preset list is not fatal, but it must not be silent: the
+      // dropdown would otherwise offer only Custom under a caption that
+      // promises three choices, and show the shipped numbers as Custom.
+      api('/api/presets').catch((e) => { toast(`Detection presets unavailable: ${e.message}`, true); return []; }),
+    ]);
     renderSettings();
     markSaved();
   } catch (e) {

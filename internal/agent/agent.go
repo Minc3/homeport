@@ -443,8 +443,18 @@ func (a *Agent) SetActivePath(ctx context.Context, pathID int, decisionSeq uint6
 		return // nothing to do; keeps the common case off the worker entirely
 	}
 
+	// Only a newer decision may replace the queued one. The filter above
+	// reads active and lastSeq, which the worker updates only after its apply
+	// has finished, so while it is inside `ip` for one decision a straggling
+	// probe carrying the sequence before it still passes. Unconditional, that
+	// straggler overwrote the newer decision already queued, the worker
+	// applied the abandoned path a second time, and replies kept leaving by
+	// the tunnel the frontend had just moved off until the next regular probe.
+	// The frontend's burst on a switch made that interleaving the common one.
 	a.pendingMu.Lock()
-	a.pending = pathDecision{pathID: pathID, seq: decisionSeq}
+	if decisionSeq > a.pending.seq {
+		a.pending = pathDecision{pathID: pathID, seq: decisionSeq}
+	}
 	a.pendingMu.Unlock()
 	select {
 	case a.wake <- struct{}{}:

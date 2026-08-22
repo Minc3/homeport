@@ -359,16 +359,24 @@ type ProbeConfig struct {
 	MaxRTTMs          int     `json:"max_rtt_ms"`        // above this the path is degraded
 }
 
-// DetectSeconds is roughly how long a dead active path takes to be condemned
-// with this tuning: the first lost probe goes out, FailThreshold-1 more follow
-// at the active interval, and the last of them has to time out. It is the
-// floor under the lag spike a failover causes, and the number the portal shows
-// beside the tuning so the trade-off is visible where it is chosen.
-func (p ProbeConfig) DetectSeconds() float64 {
-	if p.FailThreshold < 1 {
-		return float64(p.TimeoutMs) / 1000
+// DetectMs is roughly how long a dead active path takes to be condemned with
+// this tuning: the first lost probe goes out, FailThreshold-1 more follow at
+// the active interval, and the last of them has to time out. It is the floor
+// under the lag spike a failover causes. The portal shows the same figure
+// beside the tuning, computed in app.js from the live fields (it cannot call
+// this), so the two must be kept in step by hand. FailThreshold is at least 1
+// by validation; anything less is treated as 1.
+func (p ProbeConfig) DetectMs() int {
+	n := p.FailThreshold
+	if n < 1 {
+		n = 1
 	}
-	return float64((p.FailThreshold-1)*p.ActiveIntervalMs+p.TimeoutMs) / 1000
+	return (n-1)*p.ActiveIntervalMs + p.TimeoutMs
+}
+
+// DetectSeconds is DetectMs as a float, for prose.
+func (p ProbeConfig) DetectSeconds() float64 {
+	return float64(p.DetectMs()) / 1000
 }
 
 // DetectionPreset is a named tuning of the four settings that decide how fast a
@@ -392,19 +400,20 @@ type DetectionPreset struct {
 	WindowSize       int    `json:"window_size"`
 }
 
-// Apply writes the preset's numbers into a ProbeConfig, leaving everything the
-// preset does not name (standby cadence, recovery, degraded thresholds) alone.
+// Apply writes the preset's numbers into a ProbeConfig, leaving recovery and
+// the degraded thresholds alone. The standby interval is raised only if the
+// new active interval would overtake it: validation refuses a standby cadence
+// faster than the active one, and a preset the portal offers must never
+// produce a form the portal then refuses to save. app.js does the same when
+// the dropdown is used; this is the copy the tests run through validate.
 func (d DetectionPreset) Apply(p *ProbeConfig) {
 	p.ActiveIntervalMs = d.ActiveIntervalMs
 	p.TimeoutMs = d.TimeoutMs
 	p.FailThreshold = d.FailThreshold
 	p.WindowSize = d.WindowSize
-}
-
-// Matches reports whether a ProbeConfig carries exactly this preset's numbers.
-func (d DetectionPreset) Matches(p ProbeConfig) bool {
-	return p.ActiveIntervalMs == d.ActiveIntervalMs && p.TimeoutMs == d.TimeoutMs &&
-		p.FailThreshold == d.FailThreshold && p.WindowSize == d.WindowSize
+	if p.StandbyIntervalMs < d.ActiveIntervalMs {
+		p.StandbyIntervalMs = d.ActiveIntervalMs
+	}
 }
 
 // Names of the shipped presets. PresetStandard is the shipped tuning and must
@@ -417,11 +426,11 @@ const (
 
 // DetectionPresets lists the shipped tunings, fastest detection first.
 //
-// The detection figures quoted in the notes are DetectSeconds for each tuning,
-// which the test also pins, so the prose cannot drift from the numbers. The
-// probe data figure for the fast preset is 10 probes a second at roughly 130
-// bytes on the wire each way, which is about 3.4 GB a month, and it is only
-// billed while a metered path is the active one.
+// The detection figures quoted in the notes are DetectMs for each tuning,
+// which the test pins, so the prose cannot drift from the numbers. The probe
+// data figure for the fast preset is 10 probes a second at roughly 130 bytes
+// on the wire, request and reply both crossing the WAN, which is about 6.7 GB
+// a month. It is only billed while a metered path is the active one.
 func DetectionPresets() []DetectionPreset {
 	return []DetectionPreset{
 		{
@@ -432,7 +441,9 @@ func DetectionPresets() []DetectionPreset {
 				"so expect the occasional failover that nothing was wrong for. Every false trip parks players on a metered link " +
 				"until failback clears the hold-down (a couple of minutes), costs a visible switch each way, and counts towards quarantine. " +
 				"The 300ms timeout must stay above the worst round trip on your slowest link, or late replies are booked as losses and " +
-				"a loaded path reads as degraded. Probing at 100ms also costs about 3.4 GB a month of data while an LTE path is the active one.",
+				"a loaded path reads as degraded. A reply slower than the timeout is never measured, so a Max RTT above 300 can no longer trip: " +
+				"lower it, or accept that latency is judged by the timeout alone. " +
+				"Probing at 100ms also costs about 6.7 GB a month of data, both directions billed, while an LTE path is the active one.",
 			ActiveIntervalMs: 100,
 			TimeoutMs:        300,
 			FailThreshold:    4,

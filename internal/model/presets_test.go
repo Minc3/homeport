@@ -11,63 +11,68 @@ import (
 // site picks to go back to the default would change its behaviour.
 func TestStandardPresetIsTheShippedTuning(t *testing.T) {
 	std := presetByName(t, PresetStandard)
-	if !std.Matches(Defaults().Probe) {
-		t.Errorf("standard preset %+v does not match Defaults().Probe %+v", std, Defaults().Probe)
+	want := Defaults().Probe
+	got := want
+	std.Apply(&got)
+	if got != want {
+		t.Errorf("standard preset applied to the defaults changes them: %+v, want %+v", got, want)
 	}
 }
 
 // The presets exist to trade detection time against false failovers, so they
 // must actually be ordered by detection time, and the figure quoted in each
-// note must be the one the numbers give, because the note is the only place
-// the trade-off is explained.
+// note must be the one DetectMs gives for its numbers, because the note is the
+// only place the trade-off is explained. Whether every preset also survives
+// validation is web's question, and web/validate_test.go asks it.
 func TestPresetsAreOrderedByDetectionTimeAndTheNotesQuoteIt(t *testing.T) {
 	presets := DetectionPresets()
-	var prev float64
-	for i, d := range presets {
+	prev := -1
+	for _, d := range presets {
 		var p ProbeConfig
 		d.Apply(&p)
-		secs := p.DetectSeconds()
-		if i > 0 && secs <= prev {
-			t.Errorf("preset %s detects in %.2fs, not slower than the one before it (%.2fs)", d.Name, secs, prev)
+		ms := p.DetectMs()
+		if ms <= prev {
+			t.Errorf("preset %s detects in %dms, not slower than the one before it (%dms)", d.Name, ms, prev)
 		}
-		prev = secs
+		prev = ms
 		// Rounded half up in integer milliseconds: 2550ms is "2.6s", and a
 		// float %.1f would print 2.5 because 2.55 is not exact in binary.
-		tenths := ((d.FailThreshold-1)*d.ActiveIntervalMs + d.TimeoutMs + 50) / 100
+		tenths := (ms + 50) / 100
 		quoted := "about " + strings.TrimSuffix(fmt.Sprintf("%d.%d", tenths/10, tenths%10), ".0") + "s"
 		if !strings.Contains(d.Note, quoted) {
 			t.Errorf("preset %s note does not quote its own detection time %q:\n%s", d.Name, quoted, d.Note)
 		}
-		if d.Note == "" {
-			t.Errorf("preset %s has no note; the trade-off has to be stated where it is chosen", d.Name)
-		}
 	}
 }
 
-// Every preset has to pass the portal's own validation, or choosing one would
-// produce a form that cannot be saved. The bounds are repeated here rather than
-// imported because model cannot depend on web.
-func TestPresetsAreWithinTheValidatedBounds(t *testing.T) {
-	standby := Defaults().Probe.StandbyIntervalMs
-	for _, d := range DetectionPresets() {
-		if d.ActiveIntervalMs < 50 || d.TimeoutMs < 50 || d.FailThreshold < 1 || d.WindowSize < 5 {
-			t.Errorf("preset %s = %+v is outside the validated bounds", d.Name, d)
-		}
-		if d.ActiveIntervalMs > standby {
-			t.Errorf("preset %s probes the active path slower than the shipped standby cadence (%dms)", d.Name, standby)
-		}
+// Validation refuses a standby cadence faster than the active one. A preset
+// that raised the active interval past a site's standby interval would hand
+// the operator a form that cannot be saved, with the error naming a field the
+// dropdown never mentioned, so Apply lifts the standby interval with it.
+func TestApplyLiftsAShortStandbyIntervalWithTheActiveOne(t *testing.T) {
+	p := Defaults().Probe
+	p.StandbyIntervalMs = 250
+	presetByName(t, PresetRelaxed).Apply(&p)
+	if p.StandbyIntervalMs != p.ActiveIntervalMs {
+		t.Errorf("standby = %d after applying relaxed (active %d); it must be lifted to at least the active interval",
+			p.StandbyIntervalMs, p.ActiveIntervalMs)
+	}
+	p = Defaults().Probe
+	presetByName(t, PresetRelaxed).Apply(&p)
+	if p.StandbyIntervalMs != Defaults().Probe.StandbyIntervalMs {
+		t.Errorf("a standby interval already slower than the new active one was changed to %d", p.StandbyIntervalMs)
 	}
 }
 
-// DetectSeconds is the floor under the lag spike: the first lost probe, the
-// rest of the streak at the active interval, and the last one's timeout.
-func TestDetectSecondsCountsTheStreakAndTheLastTimeout(t *testing.T) {
+// DetectMs is the floor under the lag spike: the first lost probe, the rest of
+// the streak at the active interval, and the last one's timeout.
+func TestDetectMsCountsTheStreakAndTheLastTimeout(t *testing.T) {
 	p := ProbeConfig{ActiveIntervalMs: 250, TimeoutMs: 800, FailThreshold: 8}
-	if got := p.DetectSeconds(); got != 2.55 {
-		t.Errorf("DetectSeconds = %v, want 2.55", got)
+	if got := p.DetectMs(); got != 2550 {
+		t.Errorf("DetectMs = %v, want 2550", got)
 	}
 	one := ProbeConfig{ActiveIntervalMs: 250, TimeoutMs: 800, FailThreshold: 1}
-	if got := one.DetectSeconds(); got != 0.8 {
+	if got := one.DetectMs(); got != 800 {
 		t.Errorf("a single-loss threshold should be just the timeout, got %v", got)
 	}
 }

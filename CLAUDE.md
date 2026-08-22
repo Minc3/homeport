@@ -288,11 +288,25 @@ there is no second layer of encryption.
    path's next probe was wherever its 5s ticker happened to be, and until one
    landed the backend went on answering down the tunnel that had just died.
    That was up to five seconds of frozen players on top of detection, and it
-   was not in any setting.
+   was not in any setting. A prober also nudges itself on entry, so a fresh
+   generation (a frontend restart mid-outage, a settings save, a redial) sends
+   at once rather than after a full interval. Each switch and each generation
+   start therefore costs one out-of-cadence probe per path, about 130 bytes
+   each way, which the standby arithmetic above does not include and which is
+   bounded by how often the system switches.
 
-A path being condemned also wakes the decision loop (`Engine.wakeDecision`)
-rather than waiting for the next 500ms tick. The tick is still there for
-everything else: quota, hold-down expiry, a degraded path improving.
+The backend keeps only the newest queued decision (`Agent.SetActivePath`
+replaces `pending` only for a higher sequence). Its pre-filter reads `active`
+and `lastSeq`, which the worker updates after its apply finishes, so while it
+is inside `ip` a straggling probe from the abandoned tunnel carrying the
+previous sequence still passes the filter. Unconditional, that straggler
+overwrote the newer decision and the abandoned path was applied a second time.
+
+Anything that changes an input to `selectPath` outside the tick wakes the
+decision loop (`Engine.wakeDecision`) rather than waiting up to 500ms: a path
+being condemned, and the operator's pin, approve, revoke and clear-quarantine
+actions. The tick remains for the purely time-based inputs: hold-down,
+quarantine and grant expiry.
 
 ### A usage delta
 
@@ -446,14 +460,22 @@ standard preset is pinned equal to `Defaults().Probe` so a fresh install reads
 "Standard" and not "Custom".
 
 Each preset carries its trade-off in `Note`, and the portal shows it beside the
-choice together with `ProbeConfig.DetectSeconds` computed from whatever is in
-the fields. That is the point of the feature, not decoration: a faster
-condemnation is bought with false failovers on any link that drops bursts of
-packets, and every false trip parks players on a metered path for the whole
-failback hold-down, costs a visible switch each way, and counts towards
-quarantine. The fast preset's 300ms timeout also has to stay above the worst
-round trip on the slowest link or late replies are booked as losses. Nothing
-else on the page says any of that, so the dropdown has to. The relaxed preset
+choice together with the detection time the current fields give. That figure
+is `ProbeConfig.DetectMs` in Go and a mirror of it in `app.js` (the page
+recomputes as the operator types, and cannot call Go); keep the two in step.
+That is the point of the feature, not decoration: a faster condemnation is
+bought with false failovers on any link that drops bursts of packets, and every
+false trip parks players on a metered path for the whole failback hold-down,
+costs a visible switch each way, and counts towards quarantine. The fast
+preset's 300ms timeout also has to stay above the worst round trip on the
+slowest link or late replies are booked as losses, and since a reply slower
+than the timeout is never measured, a Max RTT above it can no longer trip.
+Probing at 100ms costs about 6.7 GB a month, both directions billed, while an
+LTE path is the active one. Nothing else on the page says any of that, so the
+dropdown has to. `DetectionPreset.Apply` (and the dropdown) lift the standby
+interval to the new active one where needed, because validation refuses a
+standby cadence faster than the active one and a preset the portal offers must
+never produce a form it then refuses to save. The relaxed preset
 exists for the opposite problem: a link that is condemned and recovers on its
 own is one the standard tuning is too tight for, and the fix is a longer streak
 and a longer timeout, not a lower loss threshold.
@@ -1271,7 +1293,7 @@ subset down.
 
 Defaults (`model.Defaults()`) match the intended deployment: main/LTE1/LTE2 at
 priorities 1/2/3, tables 101/102/103, marks `0x101`/`0x102`/`0x103`, 250ms
-active and 5s standby probing, 8 losses to condemn (~2s detection), 90s
+active and 5s standby probing, 8 losses to condemn (~2.6s detection), 90s
 failback hold-down, 60 GB and 20 GB quotas resetting on the 1st in
 `model.DefaultTimezone` (`Australia/Melbourne`), and **observe mode**. The four example services —
 `27015/udp`, `27020/udp`, `80/tcp`, `443/tcp` — ship **disabled**: a row is a
@@ -1360,15 +1382,23 @@ where a subtle regression would be invisible in production until an outage:
   leaves behind gets repaired, an intact system is left completely alone, a
   tunnel that has not come back is skipped, and observe mode repairs
   measurement without installing anything that moves traffic.
-- `engine/detection_test.go` — a decision change probes every path at once
-  rather than on the standby ticker, proved from outside by watching a
-  loopback socket; a nudge with no loop to receive it never blocks; and a path
-  being condemned wakes the decision loop exactly once, while a loss that
-  changes nothing does not wake it at all.
-- `model/presets_test.go` — the standard preset equals the shipped tuning, the
-  presets are ordered by detection time and each note quotes the time its own
-  numbers give, every preset is inside the bounds `web.validate` enforces, and
-  `DetectSeconds` counts the streak plus the last timeout.
+- `engine/detection_test.go`: a new prober generation sends at once and a
+  decision change sends again at once rather than on the standby ticker, both
+  proved from outside by watching a loopback socket; a nudge with no loop to
+  receive it never blocks; a path being condemned wakes the decision loop
+  exactly once while a loss that changes nothing does not wake it at all, with
+  the channel drained between checks so the negative assertions can fail; and
+  pin, approve, revoke and clear-quarantine each wake it.
+- `model/presets_test.go`: the standard preset applied to the defaults changes
+  nothing, the presets are ordered by detection time and each note quotes the
+  time `DetectMs` gives for its numbers, applying a preset lifts a standby
+  interval the new active one would overtake and leaves a slower one alone,
+  and `DetectMs` counts the streak plus the last timeout.
+- `web/validate_test.go` also runs every preset through `validate`, on the
+  shipped configuration and on one with a short standby interval, because a
+  copy of the bounds would keep passing after the real rule moved.
+- `agent/decision_test.go`: a stale decision arriving after a newer one is
+  queued cannot replace it, while a newer one still can.
 - `engine/prober_lifecycle_test.go` — one generation of probers, always: a
   replaced generation is cancelled rather than orphaned, `stopProbers` returns
   only once the old goroutines are gone, and eight concurrent `Reconfigure`

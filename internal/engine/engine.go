@@ -110,10 +110,14 @@ type Engine struct {
 	lastSwitch  time.Time
 
 	// wake asks Run to evaluate now rather than on its next 500ms tick. It is
-	// raised when a tracker condemns a path, because at that moment the tick
-	// is the only thing between a known-dead route and the switch away from
-	// it. Buffered one deep and written without blocking: two condemnations
-	// in one tick are one evaluation, and nothing ever waits on it.
+	// raised whenever an input to selectPath changes outside the tick: a
+	// tracker condemning a path, where the tick is the only thing between a
+	// known-dead route and the switch away from it, and the operator's own
+	// actions (pin, approve, revoke, clear quarantine), which exist to change
+	// the decision and should not then wait on a timer to see it. Buffered one
+	// deep and written without blocking: two changes in one tick are one
+	// evaluation, and nothing ever waits on it. The tick remains for the
+	// purely time-based inputs: hold-down, quarantine and grant expiry.
 	wake chan struct{}
 
 	// beatenSince is when the active path started being out-scored by the
@@ -1741,6 +1745,7 @@ func (e *Engine) Approve(pathID int, dur time.Duration, extraBytes int64) error 
 	_ = e.st.AddEvent(store.EventGrant, pathID, "overage approved on %s for %s (%s)", p.Name, dur, limit)
 	e.log.Warn("overage approved", "path", p.Name, "duration", dur, "extra_bytes", extraBytes)
 	e.refreshQuota(now)
+	e.wakeDecision()
 	return nil
 }
 
@@ -1751,6 +1756,7 @@ func (e *Engine) RevokeApproval(pathID int) error {
 	}
 	_ = e.st.AddEvent(store.EventGrant, pathID, "overage approval revoked")
 	e.refreshQuota(time.Now())
+	e.wakeDecision()
 	return nil
 }
 
@@ -1772,6 +1778,7 @@ func (e *Engine) Pin(pathID int) error {
 	} else {
 		_ = e.st.AddEvent(store.EventSystem, pathID, "path pinned by operator")
 	}
+	e.wakeDecision()
 	return nil
 }
 
@@ -1783,6 +1790,7 @@ func (e *Engine) ClearQuarantine(pathID int) {
 	}
 	e.mu.Unlock()
 	_ = e.st.AddEvent(store.EventQuarantine, pathID, "quarantine cleared by operator")
+	e.wakeDecision()
 }
 
 // ---------------------------------------------------------------------------

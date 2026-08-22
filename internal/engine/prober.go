@@ -93,6 +93,10 @@ func NewProber(p model.PathConfig, probeCfg model.ProbeConfig, ov model.OverlayC
 // still frozen for up to five seconds more. That wait was the largest and
 // least visible part of a failover, and it was not in any setting.
 //
+// The loop also nudges itself on entry, so a fresh generation (startup, a
+// settings save, a redial after the tunnel came back) measures and carries
+// the decision at once rather than after a full interval of silence.
+//
 // Non-blocking and coalescing: a nudge that arrives while one is already
 // queued is the same request.
 func (p *Prober) Nudge() {
@@ -228,6 +232,12 @@ func (p *Prober) loop(ctx context.Context) {
 	defer send.Stop()
 	sweep := time.NewTicker(50 * time.Millisecond)
 	defer sweep.Stop()
+
+	// First probe now, not one interval from now. On a standby path that
+	// interval is 5s of measuring nothing and carrying no decision, and a
+	// generation starts at exactly the moments that matters: a frontend
+	// restart mid-outage, a settings save, a tunnel coming back.
+	p.Nudge()
 
 	current := p.interval()
 	for {
