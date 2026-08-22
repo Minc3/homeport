@@ -321,9 +321,18 @@ func EnsureLinkerRoute(ctx context.Context, r Runner, backendLAN string, tbl int
 
 // LinkerRouteVia reports the gateway currently installed in the linker's table,
 // or "" if there is none. It is the readback the reconciler compares against.
+//
+// A table that has never held a route does not exist to the kernel, which
+// reports that as an error rather than an empty listing - see RouteVia. Here
+// that is a linker whose LAN interface was not up when the agent started: the
+// first install failed, the table was never created, and the reconciler would
+// have skipped the repair on the error every tick from then on.
 func LinkerRouteVia(ctx context.Context, r Runner, tbl int) (string, error) {
 	out, err := r.Run(ctx, "ip", "route", "show", "default", "table", strconv.Itoa(tbl))
 	if err != nil {
+		if tableDoesNotExist(err) {
+			return "", nil
+		}
 		return "", err
 	}
 	return gatewayFrom(out), nil

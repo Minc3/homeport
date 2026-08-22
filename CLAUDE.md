@@ -1250,6 +1250,9 @@ bytes sent — one handshake response and not a single probe — and a service
 restart fixing it instantly, because by then every interface existed before
 the routes were installed. Both readbacks now report a nonexistent table as
 no route (`sysx.tableDoesNotExist`); any other failure is still a failure.
+`LinkerRouteVia` had the same hole — a linker whose LAN interface was down at
+agent start failed its first install, never created its table, and its
+reconciler returned on the error every tick — and takes the same answer.
 
 **`Table = off` in every `wg-quick` config.** Otherwise wg-quick installs its
 own route for the peer's AllowedIPs and the three tunnels fight over the same

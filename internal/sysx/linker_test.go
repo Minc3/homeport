@@ -650,3 +650,23 @@ func TestRemoveLinkerRoutingSweepsTheAbandonedTable(t *testing.T) {
 		t.Errorf("the configured table kept this system's default route: %v", f.calls)
 	}
 }
+
+// The same kernel answer the frontend's reconciler tripped over: a table that
+// has never held a route does not exist, and `ip route show` says so with an
+// error rather than an empty listing. For a linker that is the LAN interface
+// being down when the agent started - the first install failed, the table was
+// never created, and a reconciler that read the error as a failure would never
+// have installed the route once the LAN came up.
+func TestLinkerRouteViaReportsATableThatNeverExistedAsNoRoute(t *testing.T) {
+	f := &fakeRunner{fail: map[string]string{
+		"ip route show default table 200": "Error: ipv4: FIB table does not exist.\nDump terminated",
+	}}
+	via, err := LinkerRouteVia(context.Background(), f, 200)
+	if err != nil || via != "" {
+		t.Errorf("LinkerRouteVia(never-created table) = %q, %v; want no route and no error", via, err)
+	}
+	g := &fakeRunner{fail: map[string]string{"ip route show default table 200": "RTNETLINK answers: Operation not permitted"}}
+	if _, err := LinkerRouteVia(context.Background(), g, 200); err == nil {
+		t.Error("an unrelated ip failure was read as an empty table")
+	}
+}
