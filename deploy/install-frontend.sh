@@ -48,9 +48,9 @@ usage: sudo $0 [options]
   --psk <hex>        shared secret; must be identical on the backend.
                      Generated if omitted and no config exists yet.
   --portal <addr>    portal listen address. Defaults to the address on
-                     wg-admin, port 8080, e.g. 10.98.0.2:8080. With that tunnel
+                     wg-admin, port 8088, e.g. 10.98.0.2:8088. With that tunnel
                      down there is no address to read, and the portal falls back
-                     to 127.0.0.1:8080 - local to the frontend and nothing else.
+                     to 127.0.0.1:8088 - local to the frontend and nothing else.
   --public-iface <n> the interface facing the internet, e.g. ens3. Detected
                      from the default route, and confirmed with you when this
                      is run on a terminal.
@@ -262,7 +262,7 @@ if [ "$WRITE_CONFIG" -eq 0 ]; then
 elif [ -z "$PORTAL" ]; then
 	admin_ip="$(ip -4 -o addr show wg-admin 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)"
 	if [ -n "$admin_ip" ]; then
-		PORTAL="$admin_ip:8080"
+		PORTAL="$admin_ip:8088"
 		echo "  portal will bind $PORTAL (from wg-admin)"
 	else
 		# The usual cause is that the admin tunnel has not been brought up yet,
@@ -272,7 +272,7 @@ elif [ -z "$PORTAL" ]; then
 		# that is plainly local-only. It is a bootstrap value the portal cannot
 		# edit - the address it is served on is not something it can change out
 		# from under itself - so fixing it is a file and a restart.
-		PORTAL="127.0.0.1:8080"
+		PORTAL="127.0.0.1:8088"
 		PORTAL_FALLBACK=1
 		if ip link show wg-admin >/dev/null 2>&1; then
 			warn "wg-admin has no IPv4 address, so the portal falls back to $PORTAL"
@@ -289,9 +289,9 @@ elif [ -z "$PORTAL" ]; then
     editor $CONFIG
     systemctl restart $UNIT
 
-  The third step is one field - "portal_listen": "10.98.0.2:8080", using the
+  The third step is one field - "portal_listen": "10.98.0.2:8088", using the
   address the second step printed. Or re-run this script with --portal
-  <ip>:8080 and it will write that instead.
+  <ip>:8088 and it will write that instead.
 
   The tunnel itself is /etc/wireguard/wg-admin.conf, which no install script
   writes; the configuration this expects is in deploy/SETUP.md section 2.
@@ -468,7 +468,7 @@ if [ "$PORTAL_FALLBACK" -eq 1 ]; then
 
 The portal is on loopback, because wg-admin had no address when this ran, so it
 is reachable from this host and nowhere else. Until the admin tunnel is up,
-'ssh -L 8080:127.0.0.1:8080 <this host>' gets a browser onto it.
+'ssh -L 8088:127.0.0.1:8088 <this host>' gets a browser onto it.
 
 To move it onto the tunnel:
 
@@ -477,7 +477,7 @@ To move it onto the tunnel:
   editor $CONFIG
   systemctl restart $UNIT
 
-Set "portal_listen" to that address with :8080 on the end. The tunnel itself is
+Set "portal_listen" to that address with :8088 on the end. The tunnel itself is
 /etc/wireguard/wg-admin.conf, and deploy/SETUP.md section 2 is the configuration
 this expects.
 

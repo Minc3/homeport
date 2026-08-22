@@ -470,10 +470,11 @@ func validate(cfg *model.Config) error {
 			return fmt.Errorf("service %s has an invalid port", sv.Name)
 		}
 		// Without an interface to scope it to, a DNAT rule matches the port
-		// on every interface this host has - the admin tunnel included. The
-		// shipped wings row is 8080/tcp, which is also the portal's port, so
-		// an unscoped rule for it would hand the operator's own portal
-		// connections to the backend and take away the only way to undo it.
+		// on every interface this host has - the admin tunnel included, which
+		// is the one the portal is reached over. A row naming the portal's own
+		// port would then hand the operator's portal connections to the
+		// backend and take away the only way to undo it, and every other row
+		// takes the admin tunnel's copy of that port with it.
 		if sv.Enabled && trimmed(cfg.Frontend.PublicIface) == "" {
 			return fmt.Errorf("service %s cannot be published without a public interface to scope it to", sv.Name)
 		}

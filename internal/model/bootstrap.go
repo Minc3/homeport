@@ -18,7 +18,7 @@ type Bootstrap struct {
 	PSK          string        `json:"psk"`           // shared secret, identical on both hosts
 	StateDir     string        `json:"state_dir"`     // runtime files
 	DBPath       string        `json:"db_path"`       // frontend only
-	PortalListen string        `json:"portal_listen"` // frontend only, e.g. 10.98.0.2:8080
+	PortalListen string        `json:"portal_listen"` // frontend only, e.g. 10.98.0.2:8088
 	Overlay      OverlayConfig `json:"overlay"`       // backend needs this before config is pushed
 	Linker       LinkerInfo    `json:"linker"`        // linker only
 
@@ -95,7 +95,7 @@ func LoadBootstrap(path string) (Bootstrap, error) {
 		b.DBPath = b.StateDir + "/failover.db"
 	}
 	if b.PortalListen == "" {
-		b.PortalListen = "127.0.0.1:8080"
+		b.PortalListen = "127.0.0.1:8088"
 	}
 	if b.Overlay.FrontendIP == "" {
 		b.Overlay.FrontendIP = "10.99.0.1"

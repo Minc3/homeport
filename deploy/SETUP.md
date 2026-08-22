@@ -80,7 +80,7 @@ you already run.
 | Backend overlay address | `10.99.0.2` |
 | Overlay subnet | `10.99.0.0/24` |
 | Admin tunnel, frontend side | `10.98.0.2/24` |
-| Portal | `10.98.0.2:8080` |
+| Portal | `10.98.0.2:8088` |
 | Routing tables used | 100, 101, 102, 103 |
 | Firewall marks used | `0x101`, `0x102`, `0x103`, `0x200`, `0x300` |
 
@@ -284,7 +284,7 @@ ip -4 addr show wg-admin        # expect 10.98.0.2
 ```
 
 The installer reads the portal's listen address off this interface. With the
-interface down it falls back to `127.0.0.1:8080`, which is a file edit and a
+interface down it falls back to `127.0.0.1:8088`, which is a file edit and a
 restart to correct afterwards.
 
 ### 4.2 Run the installer
@@ -308,7 +308,7 @@ Useful flags:
 |---|---|
 | `--public-iface ens3` | give the interface outright instead of confirming |
 | `--no-ask` | never prompt, take the detected value (for scripted runs) |
-| `--portal 10.98.0.2:8080` | set the portal address explicitly |
+| `--portal 10.98.0.2:8088` | set the portal address explicitly |
 | `--psk <hex>` | reuse an existing secret instead of generating one |
 | `--subnet ''` | opt out of the overlay subnet |
 | `--force-config` | rewrite an existing bootstrap file |
@@ -327,7 +327,7 @@ nothing.
 
 ```sh
 ip -4 addr show wg-admin                     # e.g. 10.98.0.2
-sudo editor /etc/failover/frontend.json      # "portal_listen": "10.98.0.2:8080"
+sudo editor /etc/failover/frontend.json      # "portal_listen": "10.98.0.2:8088"
 sudo systemctl restart failover-frontend
 ```
 
@@ -365,7 +365,7 @@ byte identical on both hosts.
 Bring the admin tunnel up on your laptop or phone, then open:
 
 ```
-http://10.98.0.2:8080
+http://10.98.0.2:8088
 ```
 
 Log in with the password step 4 printed, then change it immediately in

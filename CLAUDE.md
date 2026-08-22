@@ -1518,7 +1518,7 @@ CIDR somebody has to go and look up is a CIDR that gets typed wrong.
 
 Ports in use: probe `51999/udp`, control `51998/tcp`, tunnels
 `51820`/`51821`/`51822` (distinct so pfSense can policy-route by source port),
-admin tunnel `51830/udp`, portal `10.98.0.2:8080`.
+admin tunnel `51830/udp`, portal `10.98.0.2:8088`.
 
 ---
 

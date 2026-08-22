@@ -358,10 +358,10 @@ func TestEveryDetectionPresetSurvivesValidate(t *testing.T) {
 }
 
 // A DNAT rule with no interface to scope it to matches its port on every
-// interface the frontend has, the admin tunnel included. The shipped wings row
-// is 8080/tcp - the portal's own port - so publishing it unscoped would hand
-// the operator's portal connections to the backend and remove the only way to
-// undo that. Enabling a service therefore needs a public interface.
+// interface the frontend has, the admin tunnel included - and that is the
+// tunnel the portal is reached over. A row naming the portal's own port would
+// hand the operator's portal connections to the backend and remove the only
+// way to undo that. Enabling a service therefore needs a public interface.
 func TestValidateRejectsPublishingWithoutAPublicInterface(t *testing.T) {
 	cfg := model.Defaults()
 	cfg.Frontend.PublicIface = ""
