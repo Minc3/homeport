@@ -65,6 +65,11 @@ header h1 {
   white-space: nowrap;
 }
 
+/* Click-to-copy text: the pointer says it does something, the dotted rule on
+   hover says what, without turning a status line into a button. */
+.copy { cursor: pointer; }
+.copy:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
+
 .badge {
   display: inline-flex;
   align-items: center;

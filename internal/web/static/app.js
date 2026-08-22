@@ -277,17 +277,20 @@ function pathCard(p, pinned, shared) {
     // CGNAT - so this is observed, not declared, which is what makes it worth
     // showing: it is the WAN that tunnel really rode.
     el('p', {
-      class: 'hint' + (shares ? ' bad-text' : ''),
+      class: 'hint' + (shares ? ' bad-text' : '') + (p.peer_endpoint ? ' copy' : ''),
       // The port is the carrier's NAT source port. It carries no information
       // about which service this is - two tunnels on one WAN get different
       // ports, which is why the comparison ignores it - so it stays out of the
       // line and into the hover, where somebody chasing a NAT rebind can find it.
-      title: p.peer_endpoint || '',
+      title: p.peer_endpoint ? `${p.peer_endpoint}. Click to copy the address` : '',
       text: p.peer_endpoint
         ? (shares
           ? `WAN ${endpointHost(p.peer_endpoint)}, same as ${shares.join(' and ')}`
           : `WAN ${endpointHost(p.peer_endpoint)}`)
         : 'WAN unknown: no handshake on this tunnel yet',
+      // The address alone, as on the WAN badge: the port is the carrier's and
+      // changes under the tunnel, so it is never what anybody wants pasted.
+      ...(p.peer_endpoint ? { onclick: () => copyText(endpointHost(p.peer_endpoint)) } : {}),
     }),
     el('div', { class: 'row' }, actions),
   );
@@ -377,7 +380,9 @@ async function refreshStatus() {
   const versions = document.getElementById('versions');
   const beVer = st.backend_version || 'unknown';
   versions.textContent = `frontend ${st.frontend_version || 'unknown'} · backend ${beVer}`;
-  versions.title = st.backend_host ? `backend host: ${st.backend_host}` : '';
+  versions.title = (st.backend_host ? `backend host: ${st.backend_host}. ` : '') + 'Click to copy';
+  versions.classList.add('copy');
+  versions.onclick = () => copyText(versions.textContent);
 
   const backend = document.getElementById('backend-badge');
   backend.textContent = st.backend_up ? 'backend connected' : 'backend unreachable';
@@ -391,7 +396,11 @@ async function refreshStatus() {
   wan.classList.toggle('hidden', !st.public_address);
   if (st.public_address) {
     wan.textContent = `WAN ${st.public_address}`;
-    wan.title = 'The public address published services are reachable at. Configured in Settings, or read from the public interface when no public IP is set.';
+    wan.title = 'The public address published services are reachable at. Configured in Settings, or read from the public interface when no public IP is set. Click to copy the address.';
+    wan.classList.add('copy');
+    // The address alone, not the "WAN" label: what gets pasted is a server
+    // browser entry or a config line, and neither wants the word.
+    wan.onclick = () => copyText(st.public_address);
   }
 
   const held = document.getElementById('held');

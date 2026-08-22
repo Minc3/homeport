@@ -44,11 +44,12 @@
     <h3>Observe mode</h3>
     <p>Decisions are being computed and logged, but nothing that carries published traffic
        is installed: no nftables table is loaded on either host, the frontend has no route to
-       the backend and the backend has no reply-path default route. What is installed is the
-       measurement plumbing &mdash; the overlay address, a routing table and two policy rules
-       per tunnel for the probes, the backend&rsquo;s route to the frontend overlay so it can
-       report in, and <code>rp_filter</code> off on the tunnels &mdash; because observing
-       requires measuring. Watch this for a while, then arm it when the picture looks right.</p>
+       the backend, and the backend has no reply-path default route.</p>
+    <p>What is installed is the measurement plumbing, because observing requires measuring:
+       the overlay address, a routing table and two policy rules per tunnel for the probes,
+       the backend&rsquo;s route to the frontend overlay so it can report in, and
+       <code>rp_filter</code> off on the tunnels.
+       Watch this for a while, then arm it when the picture looks right.</p>
     <div class="row"><button class="btn primary" id="arm">Arm it</button></div>
   </div>
 
