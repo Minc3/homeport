@@ -160,7 +160,7 @@ func RemoveEgressRuleset(ctx context.Context, r Runner) {
 // the return mark (0x200).
 const EgressMark = 0x300
 
-// NonInternetDestinations is every IPv4 range that cannot be reached through
+// nonInternetDestinations is every IPv4 range that cannot be reached through
 // the frontend's public address: private, carrier-grade NAT, loopback,
 // link-local, "this network", and multicast plus the reserved block above it.
 //
@@ -175,7 +175,7 @@ const EgressMark = 0x300
 // resolve a name or reach its own panel the moment its network was ticked.
 // The frontend's NAT is an internet address; only internet traffic should
 // seek it out.
-var NonInternetDestinations = []string{
+var nonInternetDestinations = []string{
 	"0.0.0.0/8",
 	"10.0.0.0/8",
 	"100.64.0.0/10",
@@ -186,11 +186,9 @@ var NonInternetDestinations = []string{
 	"224.0.0.0/3",
 }
 
-// internetOnly renders the destination match that keeps the egress mark off
+// internetOnly is the destination match that keeps the egress mark off
 // traffic the frontend could not carry.
-func internetOnly() string {
-	return "ip daddr != { " + strings.Join(NonInternetDestinations, ", ") + " }"
-}
+var internetOnly = "ip daddr != { " + strings.Join(nonInternetDestinations, ", ") + " }"
 
 // BuildBackendEgressRuleset renders the backend half of the egress feature, or
 // "" when no source networks are configured.
@@ -203,7 +201,7 @@ func internetOnly() string {
 // `ip rule fwmark 0x300 lookup 100` send them down the active tunnel instead of
 // out to pfSense. Table 100 is the return table, which already tracks the
 // frontend's choice, so this follows failover with nothing extra to maintain.
-// Only internet destinations are marked - see NonInternetDestinations for why
+// Only internet destinations are marked - see nonInternetDestinations for why
 // the LAN, the other bridges and the resolver have to keep their normal route.
 //
 // The postrouting SNAT rewrites the source to the overlay address, because that
@@ -239,7 +237,7 @@ func BuildBackendEgressRuleset(cidrs, ifaces []string, overlayIP string) string 
 	b.WriteString("\tchain prerouting {\n")
 	b.WriteString("\t\ttype filter hook prerouting priority mangle; policy accept;\n")
 	for _, c := range cidrs {
-		fmt.Fprintf(&b, "\t\tip saddr %s %s meta mark set %#x\n", c, internetOnly(), EgressMark)
+		fmt.Fprintf(&b, "\t\tip saddr %s %s meta mark set %#x\n", c, internetOnly, EgressMark)
 	}
 	b.WriteString("\t}\n")
 

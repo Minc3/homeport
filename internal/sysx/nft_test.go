@@ -321,18 +321,28 @@ func TestBackendEgressLeavesPrivateDestinationsOnTheirNormalRoute(t *testing.T) 
 	if markLine == "" {
 		t.Fatalf("no mark rule:\n%s", rs)
 	}
-	for _, private := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8"} {
-		if !strings.Contains(markLine, private) {
-			t.Errorf("a packet to %s would be marked and sent down the tunnel: %q", private, markLine)
+	assertInternetOnly(t, "mark", markLine)
+}
+
+// assertInternetOnly checks that a rule carries the whole exclusion, negated,
+// as rendered - not a hand-typed subset of it, which a rule rendering the
+// inverse set (private destinations only) would also satisfy.
+func assertInternetOnly(t *testing.T, name, line string) {
+	t.Helper()
+	if !strings.Contains(line, internetOnly) {
+		t.Errorf("the %s rule does not carry the exact exclusion %q: %q", name, internetOnly, line)
+	}
+	for _, want := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+		"169.254.0.0/16", "127.0.0.0/8", "100.64.0.0/10", "0.0.0.0/8", "224.0.0.0/3"} {
+		found := false
+		for _, have := range nonInternetDestinations {
+			if have == want {
+				found = true
+			}
 		}
-	}
-	if !strings.Contains(markLine, "ip daddr != {") {
-		t.Errorf("the destination set must be an exclusion: %q", markLine)
-	}
-	// A multicast or reserved destination has no business on the tunnel
-	// either; both ranges sit under 224.0.0.0/3.
-	if !strings.Contains(markLine, "224.0.0.0/3") {
-		t.Errorf("multicast and reserved destinations are not excluded: %q", markLine)
+		if !found {
+			t.Errorf("nonInternetDestinations no longer excludes %s", want)
+		}
 	}
 }
 

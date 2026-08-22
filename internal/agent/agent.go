@@ -320,10 +320,7 @@ func (a *Agent) applyPlumbing(ctx context.Context, cfg proto.BackendConfig) {
 	// ip rule beside it stays plumbing: a rule into an empty table is the
 	// same nothing as the probe rules, and it is what makes arming take
 	// effect with a single reload rather than a rule add that can fail.
-	a.mu.RLock()
-	gated := a.runner
-	a.mu.RUnlock()
-	if _, err := sysx.ApplyReturnRuleset(ctx, gated, a.stateDir, sysx.BuildReturnRuleset(ifaces)); err != nil {
+	if _, err := sysx.ApplyReturnRuleset(ctx, a.gatedRunner(), a.stateDir, sysx.BuildReturnRuleset(ifaces)); err != nil {
 		a.log.Warn("return path marking not installed; containerised services will not reply through the tunnel",
 			"err", err)
 	}
@@ -361,9 +358,7 @@ func (a *Agent) applyPlumbing(ctx context.Context, cfg proto.BackendConfig) {
 // Mode-gated, like the egress rules: it decides what gets dropped and when, and
 // observe mode's promise is that nothing the agent does can be felt.
 func (a *Agent) applyShaping(ctx context.Context, cfg proto.BackendConfig) {
-	a.mu.RLock()
-	gated := a.runner
-	a.mu.RUnlock()
+	gated := a.gatedRunner()
 
 	for _, p := range cfg.Paths {
 		if !a.ifaceExists(p.Iface) {
@@ -397,9 +392,7 @@ func (a *Agent) applyShaping(ctx context.Context, cfg proto.BackendConfig) {
 // an empty list is both "the feature is off" and "the far end is not ready",
 // and either way the right thing is to take the rules down.
 func (a *Agent) applyEgress(ctx context.Context, cfg proto.BackendConfig, ifaces []string) {
-	a.mu.RLock()
-	gated := a.runner
-	a.mu.RUnlock()
+	gated := a.gatedRunner()
 
 	ruleset := sysx.BuildBackendEgressRuleset(cfg.EgressCIDRs, ifaces, cfg.Overlay.BackendIP)
 	if ruleset == "" {
@@ -427,6 +420,14 @@ func (a *Agent) applyEgress(ctx context.Context, cfg proto.BackendConfig, ifaces
 // realRunner always acts on the system, regardless of mode. It backs the
 // measurement and control plumbing, which observe mode must not suppress.
 func (a *Agent) realRunner() sysx.Runner { return a.real }
+
+// gatedRunner is the mode-following runner, read under the state lock because
+// ApplyConfig swaps it. Everything that moves traffic goes through this one.
+func (a *Agent) gatedRunner() sysx.Runner {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.runner
+}
 
 func runnerFor(mode string, log *slog.Logger) sysx.Runner {
 	if mode == model.ModeArmed {

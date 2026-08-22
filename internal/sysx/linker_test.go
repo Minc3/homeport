@@ -270,7 +270,8 @@ func TestLinkerMarkRuleClearsARuleLeftInAnotherTable(t *testing.T) {
 // host issues nothing but the two listings.
 func TestLinkerMarkRuleLeavesAnIntactRuleAlone(t *testing.T) {
 	pinned := strconv.Itoa(LinkerRulePrefBase + 2)
-	listing := pinned + ":\tfrom all fwmark 0x301 lookup 200\n"
+	listing := pinned + ":\tfrom all fwmark 0x301 lookup 200\n" +
+		strconv.Itoa(LinkerEgressDenyRulePref) + ":\tfrom all fwmark 0x301 unreachable\n"
 	f := &fakeRunner{replies: map[string]string{
 		"ip rule show table 200": listing,
 		"ip rule show":           listing,
@@ -292,9 +293,12 @@ func TestLinkerMarkRuleLeavesAnIntactRuleAlone(t *testing.T) {
 // address as its source, and the reply went to the LAN's default gateway
 // instead of back to this host.
 func TestLinkerEgressLeavesPrivateDestinationsAlone(t *testing.T) {
-	rs := BuildLinkerEgressRuleset([]string{"172.18.0.0/16"}, "eth0", "10.99.0.3")
+	rs := BuildLinkerEgressRuleset([]string{"172.18.0.0/16"}, "eth0", "10.99.0.3", "10.99.0.0/24")
 	var mark, snat string
 	for _, line := range strings.Split(rs, "\n") {
+		if strings.Contains(line, "ip daddr 10.99.0.0/24") {
+			continue // the overlay rules, checked below
+		}
 		switch {
 		case strings.Contains(line, "meta mark set"):
 			mark = line
@@ -302,18 +306,35 @@ func TestLinkerEgressLeavesPrivateDestinationsAlone(t *testing.T) {
 			snat = line
 		}
 	}
-	for name, line := range map[string]string{"mark": mark, "snat": snat} {
-		if line == "" {
-			t.Fatalf("no %s rule:\n%s", name, rs)
+	for _, rule := range []struct{ name, line string }{{"mark", mark}, {"snat", snat}} {
+		if rule.line == "" {
+			t.Fatalf("no %s rule:\n%s", rule.name, rs)
 		}
-		for _, private := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
-			if !strings.Contains(line, private) {
-				t.Errorf("the %s rule would fire on a packet to %s: %q", name, private, line)
-			}
-		}
+		assertInternetOnly(t, rule.name, rule.line)
 	}
 	if !strings.Contains(snat, `oifname "eth0"`) {
 		t.Errorf("the translation must stay scoped to the LAN interface: %q", snat)
+	}
+}
+
+// The overlay is inside 10.0.0.0/8, and a linker's main table has no route to
+// it - only its own table does, selected by the overlay source or by this
+// mark. So a container here talking to a service bound to the backend's
+// overlay address has no normal route to be left on; it rode the mark before
+// the internet-only qualifier existed and must keep doing so.
+func TestLinkerEgressStillCarriesContainersToTheOverlay(t *testing.T) {
+	rs := BuildLinkerEgressRuleset([]string{"172.18.0.0/16"}, "eth0", "10.99.0.3", "10.99.0.0/24")
+	for _, want := range []string{
+		"ip saddr 172.18.0.0/16 ip daddr 10.99.0.0/24 meta mark set 0x301",
+		`ip saddr 172.18.0.0/16 ip daddr 10.99.0.0/24 oifname "eth0" snat to 10.99.0.3`,
+	} {
+		if !strings.Contains(rs, want) {
+			t.Errorf("missing %q:\n%s", want, rs)
+		}
+	}
+	// And a site that has not configured one renders no overlay rule at all.
+	if rs := BuildLinkerEgressRuleset([]string{"172.18.0.0/16"}, "eth0", "10.99.0.3", ""); strings.Contains(rs, "ip daddr 10.99") {
+		t.Errorf("an overlay rule was rendered with no subnet configured:\n%s", rs)
 	}
 }
 
@@ -343,6 +364,36 @@ func TestRemoveLinkerRulesetsDeleteByPriority(t *testing.T) {
 		if !f.ran(want) {
 			t.Errorf("revert left %q behind: %v", want, f.calls)
 		}
+	}
+}
+
+// The linker's egress lookup carries a refusal behind it, for the same reason
+// the probe rules do: with the route to the backend gone, a marked packet
+// falling through to main leaves by this host's own internet - on a dual-ISP
+// box the second ISP - and Docker's masquerade binds the flow to that address
+// for good. Installed with the lookup, removed with it.
+func TestLinkerEgressRuleFailsClosed(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show": "32402:\tfrom all fwmark 0x301 lookup 200\n",
+	}}
+	if err := EnsureLinkerEgressRule(context.Background(), f, "192.168.1.2", 200); err != nil {
+		t.Fatalf("EnsureLinkerEgressRule: %v", err)
+	}
+	want := "ip rule add fwmark 0x301 unreachable pref " + strconv.Itoa(LinkerEgressDenyRulePref)
+	if !f.ran(want) {
+		t.Errorf("no refusal behind the lookup; calls were %v", f.calls)
+	}
+	if LinkerEgressDenyRulePref <= LinkerRulePrefBase+2 || LinkerEgressDenyRulePref >= 32766 {
+		t.Errorf("refusal at %d is not between the lookup and main", LinkerEgressDenyRulePref)
+	}
+
+	g := &fakeRunner{replies: map[string]string{
+		"ip rule show": "32402:\tfrom all fwmark 0x301 lookup 200\n" +
+			strconv.Itoa(LinkerEgressDenyRulePref) + ":\tfrom all fwmark 0x301 unreachable\n",
+	}}
+	RemoveLinkerEgressRuleset(context.Background(), g, "192.168.1.2", 200)
+	if !g.ran("ip rule del fwmark 0x301 unreachable pref " + strconv.Itoa(LinkerEgressDenyRulePref)) {
+		t.Errorf("the refusal outlived the lookup: %v", g.calls)
 	}
 }
 

@@ -290,6 +290,14 @@ func validate(cfg *model.Config) error {
 		if p.ID <= 0 {
 			return errors.New("every path needs a positive id")
 		}
+		// Two rule priorities are derived from the id: the lookup at
+		// ProbeRulePrefBase+id and the refusal at ProbeDenyRulePrefBase+id.
+		// An id of 100 lands the lookup on the egress rule's priority, and a
+		// large one carries the refusal past the source rules, where a probe
+		// would be routed by table 100 before it was refused.
+		if p.ID >= sysx.ProbeDenyBandSize {
+			return fmt.Errorf("path id %d is too large; ids must be below %d", p.ID, sysx.ProbeDenyBandSize)
+		}
 		if seenID[p.ID] {
 			return fmt.Errorf("duplicate path id %d", p.ID)
 		}
@@ -460,6 +468,14 @@ func validate(cfg *model.Config) error {
 		}
 		if sv.Port < 1 || sv.Port > 65535 {
 			return fmt.Errorf("service %s has an invalid port", sv.Name)
+		}
+		// Without an interface to scope it to, a DNAT rule matches the port
+		// on every interface this host has - the admin tunnel included. The
+		// shipped wings row is 8080/tcp, which is also the portal's port, so
+		// an unscoped rule for it would hand the operator's own portal
+		// connections to the backend and take away the only way to undo it.
+		if sv.Enabled && trimmed(cfg.Frontend.PublicIface) == "" {
+			return fmt.Errorf("service %s cannot be published without a public interface to scope it to", sv.Name)
 		}
 		if sv.PortEnd != 0 && (sv.PortEnd < sv.Port || sv.PortEnd > 65535) {
 			return fmt.Errorf("service %s has an invalid port range", sv.Name)

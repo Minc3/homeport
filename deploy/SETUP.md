@@ -388,8 +388,10 @@ sudo failoverctl passwd
 
 ## 7. Publish your services
 
-**Settings, Published services** ships four example rows, 27015/udp, 27020/udp,
-80/tcp and 443/tcp, and every one of them is **disabled**.
+**Settings, Published services** ships six example rows - http 80/tcp, https
+443/tcp, pterodactyl-sftp 2022/tcp, pterodactyl-wings 8080/tcp, source
+27015-27030/udp and minecraft 25565/tcp - and every one of them is
+**disabled**.
 
 1. Tick the rows this site actually serves, or add your own.
 2. Delete the examples you do not want.

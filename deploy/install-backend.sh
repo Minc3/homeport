@@ -195,8 +195,8 @@ fi
 
 # Checked before anything is installed, so a missing tool cannot leave a
 # half-installed system behind. The backend shells out to nft as well as ip:
-# it installs the return-marking table, and the egress table when egress
-# networks are configured.
+# armed, it installs the return-marking table, and the egress table when
+# egress networks are configured.
 missing=""
 for c in ip nft sysctl systemctl; do
 	command -v "$c" >/dev/null 2>&1 || missing="$missing $c"

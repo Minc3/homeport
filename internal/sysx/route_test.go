@@ -408,8 +408,9 @@ func TestProbeRuleIsNotReinstalledWhenAlreadyCorrect(t *testing.T) {
 // restarted. The unreachable rule behind the lookup is what makes the probe
 // fail instead, which is the behaviour the prober's hold path was written for.
 func TestProbeMarkIsRefusedRatherThanFallingThroughToMain(t *testing.T) {
-	if ProbeDenyRulePrefBase <= ProbeRulePrefBase+100 {
-		t.Fatalf("deny band %d is not behind the lookup band at %d", ProbeDenyRulePrefBase, ProbeRulePrefBase)
+	if ProbeDenyRulePrefBase <= EgressRulePref {
+		t.Fatalf("deny band %d is not behind the lookup band at %d and the egress rule at %d",
+			ProbeDenyRulePrefBase, ProbeRulePrefBase, EgressRulePref)
 	}
 	if ProbeDenyRulePrefBase >= OverlayLocalRulePref || ProbeDenyRulePrefBase >= ReturnRulePrefBase {
 		t.Fatalf("deny band %d sits behind the source rules, which would route a marked packet first",
@@ -440,21 +441,101 @@ func TestProbeMarkIsRefusedRatherThanFallingThroughToMain(t *testing.T) {
 	}
 }
 
-// And the revert takes the refusal down with the rest, at whatever priority it
-// was found. Left behind it would blackhole every packet carrying the mark on
-// a host that had just uninstalled this system.
-func TestRemoveProbeRoutesTakesTheUnreachableRuleDown(t *testing.T) {
+// A refusal at the wrong priority inside the band - a path renumbered from id
+// 3 to id 1 - is swept like every other pinned rule here. The pinned one goes
+// in before the stray comes out, so there is no moment with no refusal.
+func TestProbeUnreachableRuleIsMovedToItsPinnedPriority(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show": "30001:\tfrom all fwmark 0x101 lookup 101\n" +
+			"31003:\tfrom all fwmark 0x101 unreachable\n" +
+			"32766:\tfrom all lookup main\n",
+	}}
+	p := model.PathConfig{ID: 1, Name: "main", Iface: "lo", Table: 101, Mark: 0x101}
+	if err := EnsureProbeRoute(context.Background(), f, p, "10.99.0.1", "10.99.0.2"); err != nil {
+		t.Fatalf("EnsureProbeRoute: %v", err)
+	}
+	add := f.index("ip rule add fwmark 0x101 unreachable pref 31001")
+	del := f.index("ip rule del fwmark 0x101 unreachable pref 31003")
+	if add < 0 || del < 0 {
+		t.Fatalf("stray refusal not moved; calls were %v", f.calls)
+	}
+	if add > del {
+		t.Errorf("the stray was removed before its replacement existed; calls were %v", f.calls)
+	}
+	if f.ran("ip rule del fwmark 0x101 lookup 101") {
+		t.Errorf("the lookup rule was correct and must not be touched: %v", f.calls)
+	}
+}
+
+// A refusal is keyed to a mark, and a mark can change: edited in the portal,
+// or the shipped defaults a backend runs on until its first push. Unlike an
+// orphaned lookup rule, which selects an empty table and does nothing, an
+// orphaned refusal blackholes that mark for good - so anything in the band
+// whose mark no path carries is swept on every apply.
+func TestProbeRefusalForAMarkNoPathCarriesIsSwept(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show": "30001:\tfrom all fwmark 0x111 lookup 101\n" +
+			"31001:\tfrom all fwmark 0x101 unreachable\n" + // the mark before the edit
+			"31001:\tfrom all fwmark 0x111 unreachable\n" +
+			"32766:\tfrom all lookup main\n",
+	}}
+	paths := []model.PathConfig{{ID: 1, Name: "main", Iface: "wg-none-such", Table: 101, Mark: 0x111}}
+	_ = EnsureProbeRoutes(context.Background(), f, paths, "10.99.0.2", "10.99.0.1")
+	if !f.ran("ip rule del fwmark 0x101 unreachable pref 31001") {
+		t.Errorf("the refusal for the old mark was left behind: %v", f.calls)
+	}
+	if f.ran("ip rule del fwmark 0x111") || f.ran("ip rule add fwmark 0x111 unreachable") {
+		t.Errorf("the current mark's refusal was correct and must not be touched: %v", f.calls)
+	}
+}
+
+// The band is the ownership line. A fwmark is only a number, and a host that
+// already policy-routes may refuse on the same value for its own reasons, so a
+// `fwmark ... unreachable` outside the band is neither "already installed" nor
+// a stray: ensure still installs its own, and revert leaves the host's alone.
+func TestAHostsOwnRefusalOutsideTheBandIsNeverTouched(t *testing.T) {
+	listing := "5000:\tfrom all fwmark 0x101 unreachable\n" + // the host's
+		"30001:\tfrom all fwmark 0x101 lookup 101\n" +
+		"32766:\tfrom all lookup main\n"
+	f := &fakeRunner{replies: map[string]string{"ip rule show": listing}}
+	p := model.PathConfig{ID: 1, Name: "main", Iface: "lo", Table: 101, Mark: 0x101}
+	if err := EnsureProbeRoute(context.Background(), f, p, "10.99.0.1", "10.99.0.2"); err != nil {
+		t.Fatalf("EnsureProbeRoute: %v", err)
+	}
+	if !f.ran("ip rule add fwmark 0x101 unreachable pref 31001") {
+		t.Errorf("the host's rule was mistaken for ours; calls were %v", f.calls)
+	}
+	if f.ran("pref 5000") {
+		t.Errorf("a rule outside the band was touched: %v", f.calls)
+	}
+
+	g := &fakeRunner{replies: map[string]string{"ip rule show": listing +
+		"31001:\tfrom all fwmark 0x101 unreachable\n"}}
+	RemoveProbeRoutes(context.Background(), g, []model.PathConfig{p}, "10.99.0.2/32", "10.99.0.0/24")
+	if !g.ran("ip rule del fwmark 0x101 unreachable pref 31001") {
+		t.Errorf("revert left our refusal behind: %v", g.calls)
+	}
+	if g.ran("pref 5000") {
+		t.Errorf("revert removed a rule the agent never installed: %v", g.calls)
+	}
+}
+
+// And the revert clears the whole band, not only the configured marks: a mark
+// changed while the agent was stopped has had no apply to sweep it, and every
+// rule in the band is this system's. Left behind, a refusal blackholes every
+// packet carrying its mark on a host that has just uninstalled this system.
+func TestRemoveProbeRoutesClearsTheDenyBand(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		"ip rule show": "30001:\tfrom all fwmark 0x101 lookup 101\n" +
 			"31001:\tfrom all fwmark 0x101 unreachable\n" +
-			"31777:\tfrom all fwmark 0x101 unreachable\n",
+			"31002:\tfrom all fwmark 0x102 unreachable\n", // a path no longer configured
 	}}
 	RemoveProbeRoutes(context.Background(), f,
 		[]model.PathConfig{{ID: 1, Name: "main", Iface: "wg-main", Table: 101, Mark: 0x101}},
 		"10.99.0.2/32", "10.99.0.0/24")
 	for _, want := range []string{
 		"ip rule del fwmark 0x101 unreachable pref 31001",
-		"ip rule del fwmark 0x101 unreachable pref 31777",
+		"ip rule del fwmark 0x102 unreachable pref 31002",
 	} {
 		if !f.ran(want) {
 			t.Errorf("revert left %q behind: %v", want, f.calls)
@@ -708,5 +789,60 @@ func TestRemoveProbeRoutesUsesTheProbePrefixInTheProbeTable(t *testing.T) {
 	}
 	if !f.ran("ip route del 10.99.0.2/32 table 101") {
 		t.Errorf("the probe route was not removed by name: %v", f.calls)
+	}
+}
+
+// The egress lookup fails open exactly as the probe lookups did, with a worse
+// consequence: with the active tunnel deleted, table 100 has no default and a
+// marked container packet goes out the LAN to pfSense, where Docker's
+// masquerade gives it the house's address - and that binding follows the flow
+// down the tunnel once it is back, where the frontend's NAT does not match it.
+// A heartbeat sent in the gap also lists the server at the house's address,
+// the one thing the feature exists to prevent. So the lookup carries a refusal
+// behind it, pinned, owned by its priority alone, and removed with the lookup.
+func TestEgressRuleFailsClosed(t *testing.T) {
+	if EgressDenyRulePref <= EgressRulePref || EgressDenyRulePref >= OverlayLocalRulePref {
+		t.Fatalf("egress refusal at %d is not between its lookup at %d and the source rules at %d",
+			EgressDenyRulePref, EgressRulePref, OverlayLocalRulePref)
+	}
+	if inProbeDenyBand(EgressDenyRulePref) {
+		t.Fatalf("egress refusal at %d sits inside the per-path band and would be swept as an orphan",
+			EgressDenyRulePref)
+	}
+	f := &fakeRunner{replies: map[string]string{
+		"ip rule show": "30100:\tfrom all fwmark 0x300 lookup 100\n" +
+			"5000:\tfrom all fwmark 0x300 unreachable\n", // the host's own
+	}}
+	if err := EnsureEgressRule(context.Background(), f); err != nil {
+		t.Fatalf("EnsureEgressRule: %v", err)
+	}
+	if !f.ran("ip rule add fwmark 0x300 unreachable pref " + strconv.Itoa(EgressDenyRulePref)) {
+		t.Errorf("no refusal behind the egress lookup; calls were %v", f.calls)
+	}
+	if f.ran("pref 5000") {
+		t.Errorf("a refusal the host installed was touched: %v", f.calls)
+	}
+
+	intact := "30100:\tfrom all fwmark 0x300 lookup 100\n" +
+		strconv.Itoa(EgressDenyRulePref) + ":\tfrom all fwmark 0x300 unreachable\n"
+	g := &fakeRunner{replies: map[string]string{"ip rule show": intact}}
+	if err := EnsureEgressRule(context.Background(), g); err != nil {
+		t.Fatalf("EnsureEgressRule: %v", err)
+	}
+	for _, c := range g.calls {
+		if strings.Contains(c, " add ") || strings.Contains(c, " del ") {
+			t.Errorf("an intact rule set was rewritten: %s", c)
+		}
+	}
+
+	h := &fakeRunner{replies: map[string]string{"ip rule show": intact}}
+	RemoveEgressRule(context.Background(), h)
+	for _, want := range []string{
+		"ip rule del fwmark 0x300 lookup 100 pref 30100",
+		"ip rule del fwmark 0x300 unreachable pref " + strconv.Itoa(EgressDenyRulePref),
+	} {
+		if !h.ran(want) {
+			t.Errorf("%q left behind: %v", want, h.calls)
+		}
 	}
 }

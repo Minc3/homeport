@@ -356,3 +356,36 @@ func TestEveryDetectionPresetSurvivesValidate(t *testing.T) {
 		}
 	}
 }
+
+// A DNAT rule with no interface to scope it to matches its port on every
+// interface the frontend has, the admin tunnel included. The shipped wings row
+// is 8080/tcp - the portal's own port - so publishing it unscoped would hand
+// the operator's portal connections to the backend and remove the only way to
+// undo that. Enabling a service therefore needs a public interface.
+func TestValidateRejectsPublishingWithoutAPublicInterface(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Frontend.PublicIface = ""
+	if err := validate(&cfg); err != nil {
+		t.Fatalf("nothing is published, so no interface is needed yet: %v", err)
+	}
+	cfg.Services[0].Enabled = true
+	if err := validate(&cfg); err == nil {
+		t.Fatal("a published service with no public interface must be refused")
+	}
+}
+
+// Both rule priorities a path owns are derived from its id, so the id has a
+// ceiling: at 100 the lookup lands on the egress rule's priority, and a large
+// one carries the refusal past the source rules, where a probe would be routed
+// by the return table before it was refused.
+func TestValidateBoundsPathIDs(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Paths[0].ID = sysx.ProbeDenyBandSize
+	if err := validate(&cfg); err == nil {
+		t.Fatalf("path id %d must be refused", sysx.ProbeDenyBandSize)
+	}
+	cfg.Paths[0].ID = sysx.ProbeDenyBandSize - 1
+	if err := validate(&cfg); err != nil {
+		t.Fatalf("path id %d is inside the band and must be accepted: %v", sysx.ProbeDenyBandSize-1, err)
+	}
+}

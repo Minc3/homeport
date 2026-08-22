@@ -398,7 +398,7 @@ through the host, so there is no local socket to inspect. What is left is the
 bridge network's address range, which is what `Egress.Sources` configures.
 
 **And only the internet-bound part of it.** Both egress rulesets qualify the
-source match with `ip daddr != { … }` over `sysx.NonInternetDestinations` —
+source match with `ip daddr != { … }` over `sysx.nonInternetDestinations` —
 RFC 1918, CGNAT, loopback, link-local, `0.0.0.0/8` and `224.0.0.0/3`. Matched on
 source alone the mark stamped everything a container sent: its DNS queries to
 the LAN resolver, its traffic to the host's own LAN address, to a database on
@@ -408,7 +408,13 @@ the containers going offline the moment their network was ticked — unable to
 resolve a name or reach their panel, while their internet traffic was fine. The
 frontend's NAT is an internet address; only internet traffic should seek it out.
 On the linker the same set qualifies the SNAT too, because its one interface is
-both its way to the backend and its way to everything else on the LAN.
+both its way to the backend and its way to everything else on the LAN — and the
+linker additionally marks and translates traffic to the overlay subnet, because
+its main table has no route there (only its own table does, selected by the
+overlay source or by this mark), so a container on a linker talking to a
+service bound to the backend's overlay address has no normal route to be left
+on. The backend needs no such rule: its main table carries the route to the
+frontend overlay and a host route to every linker.
 
 Two rules on the backend, doing two jobs (`BuildBackendEgressRuleset`). The
 prerouting `meta mark` diverts the traffic — a forwarded packet is routed after
@@ -754,7 +760,7 @@ Breaking any of these is a correctness bug even if the tests pass.
    which is the one time these run, but during it a marked packet matches
    nothing and falls through to main: a probe then measures whichever tunnel is
    active instead of its own, and in observe mode the control channel has no
-   route at all. `ensureProbeRoute`, `EnsureControlRoute`, `EnsureEgressRule`
+   route at all. `ensureProbeRules`, `EnsureControlRoute`, `EnsureEgressRule`
    and `EnsureReturnMarkRule` all install the pinned rule first and clear the
    strays afterwards.
 
@@ -786,8 +792,38 @@ Breaking any of these is a correctness bug even if the tests pass.
    reconciler when the tunnel appears. It is a rule rather than an
    `unreachable default` inside the table so the table carries only the one
    route this system installs — the number belongs to the host (invariant 8).
-   `RemoveProbeRoutes` takes the deny rules down with the rest; left behind they
-   would blackhole every packet carrying the mark.
+
+   **The band is the ownership line, in both directions.** A fwmark is only a
+   number, and a host that already policy-routes may refuse on the same value
+   for its own reasons, so a `fwmark … unreachable` outside 31001–31099 is
+   neither "already installed" nor a stray and is never touched. Inside it,
+   everything is this system's: `EnsureProbeRoutes` sweeps any refusal whose
+   mark no path carries — a mark edited in the portal, or the shipped defaults
+   a backend runs on until its first push — because unlike an orphaned lookup
+   rule, which selects an empty table and does nothing, an orphaned refusal
+   blackholes that mark for good. `RemoveProbeRoutes` clears the whole band,
+   not just the configured marks, for the mark changed while the agent was
+   stopped. `web.validate` bounds path ids below `sysx.ProbeDenyBandSize`
+   (100), because both bands are derived from the id: at 100 the lookup lands
+   on the egress rule's priority, and a large one carries the refusal past
+   the source rules, where a probe would be routed before it was refused.
+
+   **The two egress lookups carry the same backstop, for a worse version of
+   the same reason.** `fwmark 0x300 lookup 100` on the backend and `fwmark
+   0x301 lookup <table>` on a linker fail open the moment the table loses its
+   default — the active tunnel deleted, the LAN route bounced — and a marked
+   container packet then leaves by the host's own internet, where Docker's
+   masquerade gives it that address. The binding belongs to the connection, so
+   once the route is back the same flow is sent to the frontend carrying an
+   address its NAT does not match, dead until the entry expires — never, for
+   a UDP flow that keeps sending — and a heartbeat sent in the gap lists the
+   server at the house's address, which is the one thing the feature exists to
+   prevent. `EgressDenyRulePref` (31100) and `LinkerEgressDenyRulePref`
+   (32403) sit behind their lookups; each is owned by its pinned priority
+   alone, installed by `EnsureEgressRule` / `EnsureLinkerEgressRule` and
+   removed by their counterparts. The source rules, the control rule and the
+   return-mark rule deliberately get none: observe mode depends on the
+   backend's control dial falling through table 100 to the seeded main route.
 4. Probe results reach the tracker in sequence order. Out-of-order delivery
    scrambles the consecutive-loss counts that condemn a path.
 5. Every probe and control frame is HMAC-authenticated. Nobody outside can
@@ -1252,7 +1288,7 @@ kernel to filter by number - the alias changes how a rule is *printed*, never ho
 it is *selected*.
 
 Every readback in this package now does. That took two passes: the first
-converted the return rules and the linker's, and left `ensureProbeRoute`,
+converted the return rules and the linker's, and left `ensureProbeRules`,
 `EnsureControlRoute`, `EnsureEgressRule` and `RemoveProbeRoutes` still grepping
 the full listing for a number. On the probe rules that was the worst of them -
 a failed `ip rule add` is fatal for the whole batch, so one named table meant
@@ -1470,9 +1506,12 @@ where a subtle regression would be invisible in production until an outage:
   rp_filter is off rather than loose, the path rules are pinned ahead of the
   return rule, and a purged table reads back as no interface rather than an
   error. Also that a path's rules go in without its interface and the
-  unreachable backstop lands behind the lookup, that the backstop is refused
-  rather than falling through to main, and that revert removes it at whatever
-  priority it is found.
+  unreachable backstop lands behind the lookup, that a backstop at the wrong
+  priority is moved with the add before the delete, that a refusal for a mark
+  no path carries is swept while a host's own refusal outside the band is
+  left alone, that revert clears the band, and that the egress lookup carries
+  its own refusal, owned by its priority alone and removed with the lookup
+  (`sysx/linker_test.go` holds the same for a linker's).
 - `engine/reconcile_test.go`, `agent/reconcile_test.go` — what a tunnel restart
   leaves behind gets repaired, an intact system is left completely alone, a
   tunnel that has not come back is skipped, and observe mode repairs

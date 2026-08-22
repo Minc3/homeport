@@ -186,7 +186,7 @@ func (l *Linker) installEgress(ctx context.Context, cidrs []string) error {
 			l.boot.Linker.BackendLAN)
 	}
 
-	ruleset := sysx.BuildLinkerEgressRuleset(cidrs, iface, l.boot.Linker.OverlayIP)
+	ruleset := sysx.BuildLinkerEgressRuleset(cidrs, iface, l.boot.Linker.OverlayIP, l.boot.Overlay.Subnet)
 	if _, err := sysx.ApplyLinkerEgressRuleset(ctx, l.runner, l.boot.StateDir, ruleset); err != nil {
 		return fmt.Errorf("load the egress source NAT: %w", err)
 	}

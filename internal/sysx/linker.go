@@ -156,7 +156,7 @@ func tableTokens(listing string) map[string]bool {
 // Added before the stray is withdrawn. In the gap a matching packet falls
 // through to main, which sends it out the LAN default route instead of to the
 // backend: a dropped answer to a real client rather than a slow one. Same
-// ordering, and the same reason, as ensureProbeRoute.
+// ordering, and the same reason, as ensureProbeRules.
 //
 // A stray pointing at another table marks that table as one this system
 // stopped using, and it may still hold our default route. backendLAN is what
@@ -587,7 +587,14 @@ const NFTLinkerEgressTable = "failover_linker_egress"
 // The SNAT sits at priority -10, ahead of srcnat where Docker installs its
 // masquerade. Allowed to run first, Docker would rewrite the source to this
 // host's LAN address and the packet would leave as ordinary local traffic.
-func BuildLinkerEgressRuleset(cidrs []string, lanIface, overlayIP string) string {
+//
+// overlaySubnet, when set, is marked and translated as well as the internet:
+// a linker's main table has no route to the overlay range - only its table
+// does, selected by the overlay source or by this mark - so a container here
+// talking to a service bound to the backend's overlay address has no "normal
+// route" to be left on. That traffic rode the mark before the internet-only
+// qualifier existed and keeps doing so.
+func BuildLinkerEgressRuleset(cidrs []string, lanIface, overlayIP, overlaySubnet string) string {
 	if len(cidrs) == 0 || lanIface == "" || overlayIP == "" {
 		return ""
 	}
@@ -602,9 +609,13 @@ func BuildLinkerEgressRuleset(cidrs []string, lanIface, overlayIP string) string
 
 	b.WriteString("\tchain prerouting {\n")
 	b.WriteString("\t\ttype filter hook prerouting priority mangle; policy accept;\n")
-	// Internet destinations only, as on the backend - see NonInternetDestinations.
+	// Internet destinations only, as on the backend - see nonInternetDestinations
+	// - plus the overlay, which this host can reach no other way.
 	for _, c := range cidrs {
-		fmt.Fprintf(&b, "\t\tip saddr %s %s meta mark set %#x\n", c, internetOnly(), LinkerEgressMark)
+		if overlaySubnet != "" {
+			fmt.Fprintf(&b, "\t\tip saddr %s ip daddr %s meta mark set %#x\n", c, overlaySubnet, LinkerEgressMark)
+		}
+		fmt.Fprintf(&b, "\t\tip saddr %s %s meta mark set %#x\n", c, internetOnly, LinkerEgressMark)
 	}
 	b.WriteString("\t}\n")
 
@@ -618,7 +629,10 @@ func BuildLinkerEgressRuleset(cidrs []string, lanIface, overlayIP string) string
 	b.WriteString("\tchain postrouting {\n")
 	b.WriteString("\t\ttype nat hook postrouting priority -10; policy accept;\n")
 	for _, c := range cidrs {
-		fmt.Fprintf(&b, "\t\tip saddr %s %s oifname %q snat to %s\n", c, internetOnly(), lanIface, overlayIP)
+		if overlaySubnet != "" {
+			fmt.Fprintf(&b, "\t\tip saddr %s ip daddr %s oifname %q snat to %s\n", c, overlaySubnet, lanIface, overlayIP)
+		}
+		fmt.Fprintf(&b, "\t\tip saddr %s %s oifname %q snat to %s\n", c, internetOnly, lanIface, overlayIP)
 	}
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")
@@ -635,13 +649,30 @@ func ApplyLinkerEgressRuleset(ctx context.Context, r Runner, stateDir, ruleset s
 func RemoveLinkerEgressRuleset(ctx context.Context, r Runner, backendLAN string, tbl int) {
 	removePinnedRule(ctx, r, tbl, "fwmark",
 		fmt.Sprintf("0x%x", LinkerEgressMark), LinkerRulePrefBase+2, false, backendLAN)
+	removeUnreachableRule(ctx, r, fmt.Sprintf("0x%x", LinkerEgressMark), LinkerEgressDenyRulePref)
 	_, _ = r.Run(ctx, "nft", "delete", "table", "ip", NFTLinkerEgressTable)
 }
 
-// EnsureLinkerEgressRule routes marked egress traffic to the linker's table.
+// LinkerEgressDenyRulePref is where the linker's egress refusal sits, behind
+// the lookup it backs.
+const LinkerEgressDenyRulePref = LinkerRulePrefBase + 3
+
+// EnsureLinkerEgressRule routes marked egress traffic to the linker's table,
+// and refuses it when the table cannot. The refusal matters more here than on
+// the backend: on the dual-ISP host this agent was first deployed to, a
+// marked packet falling through to main leaves by the second ISP, Docker
+// masquerades it to that address, and the binding follows the flow to the
+// backend once the LAN route is back, where nothing can answer it.
 func EnsureLinkerEgressRule(ctx context.Context, r Runner, backendLAN string, tbl int) error {
-	return ensurePinnedRule(ctx, r, tbl, "fwmark",
-		fmt.Sprintf("0x%x", LinkerEgressMark), LinkerRulePrefBase+2, false, backendLAN)
+	mark := fmt.Sprintf("0x%x", LinkerEgressMark)
+	if err := ensurePinnedRule(ctx, r, tbl, "fwmark", mark, LinkerRulePrefBase+2, false, backendLAN); err != nil {
+		return err
+	}
+	all, err := listRules(ctx, r)
+	if err != nil {
+		return err
+	}
+	return ensureUnreachableRule(ctx, r, mark, LinkerEgressDenyRulePref, all)
 }
 
 // LanIfaceTo reports which interface this host reaches an address through.
