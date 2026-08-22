@@ -451,8 +451,17 @@ func (a *Agent) SetActivePath(ctx context.Context, pathID int, decisionSeq uint6
 	// applied the abandoned path a second time, and replies kept leaving by
 	// the tunnel the frontend had just moved off until the next regular probe.
 	// The frontend's burst on a switch made that interleaving the common one.
+	//
+	// Equal is admitted, as applyDecision admits it, because an equal sequence
+	// on a different path is a real decision and not a straggler: the
+	// frontend seeds its sequence from the clock, and a process that switched
+	// once and was restarted quickly enough hands its successor a first switch
+	// numbered the same as its own. Refused here, that decision was never
+	// queued, the frontend routed down one tunnel while replies left by
+	// another, and nothing corrected it until a later switch moved the
+	// number on. A straggler is always strictly lower, so it is still kept out.
 	a.pendingMu.Lock()
-	if decisionSeq > a.pending.seq {
+	if decisionSeq >= a.pending.seq {
 		a.pending = pathDecision{pathID: pathID, seq: decisionSeq}
 	}
 	a.pendingMu.Unlock()

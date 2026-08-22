@@ -136,7 +136,29 @@ func (p *Prober) Run(ctx context.Context) {
 			p.reportUnreachable(ctx)
 			continue
 		}
-		p.loop(ctx)
+		if err := p.loop(ctx); err != nil {
+			// The send failed synchronously, and the failed probe has already
+			// been booked as a loss. Hold one interval before the socket is
+			// rebuilt: see loop for what happens without the wait.
+			p.hold(ctx)
+		}
+	}
+}
+
+// hold pauses for one interval, or until the context ends, and reports which.
+//
+// It is the throttle on the two synchronous failures, a socket that will not
+// open and a send the kernel refuses. Either fails again at once if retried at
+// once, and one attempt per interval is the cadence the path would have been
+// measured at anyway.
+func (p *Prober) hold(ctx context.Context) bool {
+	t := time.NewTimer(p.interval())
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -166,27 +188,26 @@ func (p *Prober) dial(ctx context.Context) error {
 }
 
 func (p *Prober) reportUnreachable(ctx context.Context) {
-	t := time.NewTimer(p.interval())
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
-		p.mu.Lock()
-		p.seq++
-		seq := p.seq
-		p.resolved[seq] = Result{PathID: p.path.ID, Seq: seq, Lost: true, At: time.Now()}
-		p.mu.Unlock()
-		p.flush(ctx)
+	if !p.hold(ctx) {
+		return
 	}
+	p.mu.Lock()
+	p.seq++
+	seq := p.seq
+	p.resolved[seq] = Result{PathID: p.path.ID, Seq: seq, Lost: true, At: time.Now()}
+	p.mu.Unlock()
+	p.flush(ctx)
 }
 
-func (p *Prober) loop(ctx context.Context) {
+// loop probes on one socket until the context ends or a send fails. It returns
+// the send error, nil otherwise, so Run can hold before opening another socket.
+func (p *Prober) loop(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	conn := p.currentConn()
 	if conn == nil {
-		return
+		return nil
 	}
 	defer func() {
 		_ = conn.Close()
@@ -228,6 +249,31 @@ func (p *Prober) loop(ctx context.Context) {
 		wg.Wait()
 	}
 
+	// A send the kernel refuses outright - ENETUNREACH while the tunnel's
+	// table is empty, a prohibit route covering the overlay range, an output
+	// firewall - ends this socket, and Run opens another. That cycle used to
+	// be throttled by accident: the first send waited a full interval on the
+	// ticker, so it ran at one attempt per interval, and the sweeps in between
+	// expired each failed probe into the loss that condemned the path. The
+	// entry nudge below took away that wait, and with it the only delay in
+	// the cycle: dial, nudge, fail, return, dial, a core spinning, the sweep
+	// never reached, no loss ever delivered so the path was never condemned
+	// by this route, and pending growing without bound until the sends came
+	// back and the whole backlog was expired at once as a streak of losses
+	// against a path that by then was working. So the failed probe is booked
+	// as lost here, deterministically rather than by a sweep that may not
+	// run, and the error is returned so Run holds one interval first.
+	sendFailed := func(seq uint64, err error) error {
+		p.log.Debug("probe send failed", "err", err)
+		p.mu.Lock()
+		delete(p.pending, seq)
+		p.resolved[seq] = Result{PathID: p.path.ID, Seq: seq, Lost: true, At: time.Now()}
+		p.mu.Unlock()
+		p.flush(ctx) // before stop: flush gives up on a cancelled context
+		stop()
+		return err
+	}
+
 	send := time.NewTicker(p.interval())
 	defer send.Stop()
 	sweep := time.NewTicker(50 * time.Millisecond)
@@ -244,22 +290,18 @@ func (p *Prober) loop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			stop()
-			return
+			return nil
 		case <-send.C:
-			if err := p.send(conn); err != nil {
-				p.log.Debug("probe send failed", "err", err)
-				stop()
-				return
+			if seq, err := p.send(conn); err != nil {
+				return sendFailed(seq, err)
 			}
 			if iv := p.interval(); iv != current {
 				current = iv
 				send.Reset(iv)
 			}
 		case <-p.nudge:
-			if err := p.send(conn); err != nil {
-				p.log.Debug("probe send failed", "err", err)
-				stop()
-				return
+			if seq, err := p.send(conn); err != nil {
+				return sendFailed(seq, err)
 			}
 			// Restart the cadence from this send, at whatever interval the
 			// decision that prompted it has left us on. A path that has just
@@ -279,7 +321,9 @@ func (p *Prober) currentConn() *net.UDPConn {
 	return p.conn
 }
 
-func (p *Prober) send(conn *net.UDPConn) error {
+// send transmits one probe and returns its sequence number, which is already
+// outstanding in pending whether or not the write succeeded.
+func (p *Prober) send(conn *net.UDPConn) (uint64, error) {
 	activePath, decisionSeq := p.decision()
 
 	p.mu.Lock()
@@ -300,7 +344,7 @@ func (p *Prober) send(conn *net.UDPConn) error {
 
 	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
 	_, err := conn.WriteToUDP(pkt, p.remote)
-	return err
+	return seq, err
 }
 
 func (p *Prober) readLoop(ctx context.Context, conn *net.UDPConn) {

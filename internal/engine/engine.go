@@ -111,13 +111,17 @@ type Engine struct {
 
 	// wake asks Run to evaluate now rather than on its next 500ms tick. It is
 	// raised whenever an input to selectPath changes outside the tick: a
-	// tracker condemning a path, where the tick is the only thing between a
-	// known-dead route and the switch away from it, and the operator's own
-	// actions (pin, approve, revoke, clear quarantine), which exist to change
-	// the decision and should not then wait on a timer to see it. Buffered one
-	// deep and written without blocking: two changes in one tick are one
-	// evaluation, and nothing ever waits on it. The tick remains for the
-	// purely time-based inputs: hold-down, quarantine and grant expiry.
+	// tracker changing a path's eligibility either way - condemning it, where
+	// the tick is the only thing between a known-dead route and the switch
+	// away from it, or recovering it, where in the held state the tick is the
+	// only thing between a working tunnel and the traffic still blackholed on
+	// a dead one - the operator's own actions (pin, approve, revoke, clear
+	// quarantine), which exist to change the decision and should not then
+	// wait on a timer to see it, and a settings save, which can retire the
+	// active path. Buffered one deep and written without blocking: two
+	// changes in one tick are one evaluation, and nothing ever waits on it.
+	// The tick remains for the purely time-based inputs: hold-down, quarantine
+	// and grant expiry.
 	wake chan struct{}
 
 	// beatenSince is when the active path started being out-scored by the
@@ -237,7 +241,16 @@ func New(log *slog.Logger, st *store.Store, notifier *notify.Notifier, cfg model
 		// backend, which remembers the highest sequence it has seen, would
 		// ignore every decision from a freshly restarted frontend until it had
 		// been out-switched - leaving reply traffic on the wrong tunnel.
-		decisionSeq: uint64(time.Now().Unix()) << 16,
+		//
+		// Milliseconds, not seconds. Seeded to the second, a process that
+		// started, switched once and was restarted inside that same second
+		// handed its successor the same seed, and the successor's first switch
+		// the same sequence number as the one it replaced, on a different
+		// path. That is reachable: Restart=always brings a crashed process
+		// back within the second, a fresh tracker is usable after one reply,
+		// and every prober sends on entry. The backend keeps the two apart
+		// only by the number.
+		decisionSeq: uint64(time.Now().UnixMilli()) << 16,
 
 		real:        &sysx.ExecRunner{Log: log},
 		ifaceExists: sysx.IfaceExists,
@@ -458,12 +471,21 @@ func (e *Engine) onResult(ctx context.Context, r Result) {
 	if !tn.Changed {
 		return
 	}
+	// Decide now if the transition changed whether the selector may choose
+	// this path. Down is the obvious case: the streak that condemned it took
+	// DetectMs to build, and the tick would add up to another 500ms on top for
+	// no reason other than that it is periodic. Recovery is the one that was
+	// missed: with every path down the route is left on a dead tunnel, and the
+	// first path to come back is switched to with no hold-down at all - so the
+	// tick was the whole of the delay, with players blackholed for its length.
+	// Up to suspect changes nothing the selector reads, and a loss that changes
+	// nothing never gets here; evaluate on every lost probe would be a busy
+	// loop on a flapping link.
+	if usableHealth(tn.To) != usableHealth(tn.From) {
+		e.wakeDecision()
+	}
 	switch tn.To {
 	case model.HealthDown:
-		// Decide now. The streak that condemned this path took DetectSeconds
-		// to build; the decision tick would add up to another 500ms on top,
-		// for no reason other than that it is periodic.
-		e.wakeDecision()
 		_ = e.st.AddEvent(store.EventPathDown, r.PathID, "%s went down (%d consecutive probe losses)", name, failThreshold)
 		e.log.Warn("path down", "path", name)
 		e.notifier.Send(ctx, notify.KindPathDown, "down:"+name,
@@ -1868,6 +1890,10 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 	e.applySystemConfig(ctx)
 	e.startProbers(ctx)
 	e.refreshQuota(time.Now())
+	// A save changes selectPath's inputs as surely as the operator's other
+	// actions do - a path disabled, priorities reordered, a quota changed -
+	// and disabling the active path then waited on the tick for the switch.
+	e.wakeDecision()
 
 	_ = e.st.AddEvent(store.EventConfig, 0, "configuration updated (mode: %s)", cfg.Mode)
 	e.log.Info("configuration reloaded", "mode", cfg.Mode)

@@ -181,7 +181,13 @@ func (t *Tracker) Health() model.Health { return t.health }
 // losses condemn the path outright, and the loss and latency thresholds block
 // it as degraded.
 func (t *Tracker) Usable() bool {
-	return t.health == model.HealthUp || t.health == model.HealthSuspect
+	return usableHealth(t.health)
+}
+
+// usableHealth is Usable on a bare health value, so a transition can be asked
+// whether it changed the selector's answer.
+func usableHealth(h model.Health) bool {
+	return h == model.HealthUp || h == model.HealthSuspect
 }
 
 // Degraded reports whether the path is reachable but too poor to carry

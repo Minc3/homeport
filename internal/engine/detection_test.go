@@ -163,3 +163,134 @@ func TestOperatorActionsWakeTheDecisionLoop(t *testing.T) {
 		}
 	}
 }
+
+// A send the kernel refuses must not spin. The entry nudge removed the one
+// delay in the dial/loop cycle, so a synchronous send failure became: dial,
+// nudge, fail, return, dial - a core spinning, the 50ms sweep never reached,
+// no loss delivered so the path was never condemned through this route, and
+// pending growing without bound. Each failed probe is now booked as a loss on
+// the spot and the prober holds one interval before rebuilding the socket.
+//
+// The failure here is a udp4 socket asked to write to an IPv6 address, which
+// Go's net package refuses before any syscall, so it is the same on every
+// platform and needs no routing to set up.
+func TestASendFailureIsBookedAsALossAndHeldForOneInterval(t *testing.T) {
+	cfg := model.Defaults()
+	requireMarkedSocket(t, cfg.Paths[0].Mark)
+
+	cfg.Overlay.FrontendIP = "127.0.0.1"
+	cfg.Overlay.BackendIP = "::1"
+	cfg.Probe.ActiveIntervalMs = 200
+	cfg.Probe.StandbyIntervalMs = 200
+
+	results := make(chan Result, 4096)
+	pr, err := NewProber(cfg.Paths[0], cfg.Probe, cfg.Overlay, []byte("secret"), results,
+		func() (uint16, uint64) { return 1, 1 }, quietLogger())
+	if err != nil {
+		t.Fatalf("new prober: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	pr.Run(ctx)
+
+	// One second at a 200ms hold is five or six attempts. Anything in the
+	// hundreds is the spin.
+	const most = 12
+	var losses int
+	for done := false; !done; {
+		select {
+		case r := <-results:
+			if !r.Lost {
+				t.Fatalf("a probe that could not be sent was delivered as a reply: %+v", r)
+			}
+			losses++
+		default:
+			done = true
+		}
+	}
+	if losses == 0 {
+		t.Fatal("no loss delivered for a probe that could not be sent; the path would never be condemned")
+	}
+	if losses > most {
+		t.Fatalf("%d losses in one second at a 200ms interval; the prober is spinning on the send failure", losses)
+	}
+
+	pr.mu.Lock()
+	seq, pending := pr.seq, len(pr.pending)
+	pr.mu.Unlock()
+	if seq > most {
+		t.Fatalf("%d probes attempted in one second at a 200ms interval; the prober is spinning on the send failure", seq)
+	}
+	if pending != 0 {
+		t.Fatalf("%d probes still pending after their sends failed; they must be resolved as lost, not left for a sweep that never runs", pending)
+	}
+}
+
+// Recovery is the transition the first pass missed. With every path down the
+// route stays on a dead tunnel and the first path back is switched to with no
+// hold-down, so the tick was the whole of that delay. A transition into a
+// usable state wakes the loop exactly as a transition out of one does; a
+// reply that changes nothing does not.
+func TestPathRecoveryWakesTheDecisionLoopOnce(t *testing.T) {
+	e, _ := engineForApply(t, map[int]model.Health{1: model.HealthDown, 2: model.HealthUp, 3: model.HealthUp})
+	ctx := context.Background()
+	cfg := e.cfg
+
+	reply := func(seq uint64) Result {
+		return Result{PathID: 1, Seq: seq, RTT: 20 * time.Millisecond, At: time.Now()}
+	}
+
+	var seq uint64
+	for i := 0; i < cfg.Probe.RecoverThreshold-1; i++ {
+		seq++
+		e.onResult(ctx, reply(seq))
+		if drainWake(e) {
+			t.Fatalf("reply %d of %d did not recover the path but woke the decision loop", i+1, cfg.Probe.RecoverThreshold)
+		}
+	}
+
+	seq++
+	e.onResult(ctx, reply(seq))
+	if !drainWake(e) {
+		t.Fatal("path recovered but the decision loop was not woken; in the held state that is the whole of the delay before traffic moves")
+	}
+
+	seq++
+	e.onResult(ctx, reply(seq))
+	if drainWake(e) {
+		t.Fatal("a reply on a path already up woke the decision loop")
+	}
+
+	// Up to suspect changes nothing the selector reads: both are eligible.
+	seq++
+	e.onResult(ctx, Result{PathID: 1, Seq: seq, Lost: true, At: time.Now()})
+	if drainWake(e) {
+		t.Fatal("a single loss demoting up to suspect woke the decision loop; suspect is still selectable")
+	}
+
+	// A fresh tracker's first reply is the other entrance to eligibility.
+	e.trackers[2] = NewTracker(cfg.Paths[1], cfg.Probe, cfg.Failover)
+	e.onResult(ctx, Result{PathID: 2, Seq: 1, RTT: 20 * time.Millisecond, At: time.Now()})
+	if !drainWake(e) {
+		t.Fatal("a fresh tracker's first reply made the path selectable but did not wake the decision loop")
+	}
+}
+
+// A settings save changes the selector's inputs as surely as the operator's
+// other actions do - a path disabled, priorities reordered, a quota changed -
+// and was the one writer not wired to the wake. Disabling the active path
+// then waited on the tick for the switch.
+func TestReconfigureWakesTheDecisionLoop(t *testing.T) {
+	e := engineForProbers(t)
+	defer e.stopProbers()
+	drainWake(e)
+
+	cfg := e.Config()
+	cfg.Paths[0].Enabled = false
+	if err := e.Reconfigure(cfg); err != nil {
+		t.Fatalf("reconfigure: %v", err)
+	}
+	if !drainWake(e) {
+		t.Fatal("a settings save did not wake the decision loop")
+	}
+}

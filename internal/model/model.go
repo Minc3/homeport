@@ -374,11 +374,6 @@ func (p ProbeConfig) DetectMs() int {
 	return (n-1)*p.ActiveIntervalMs + p.TimeoutMs
 }
 
-// DetectSeconds is DetectMs as a float, for prose.
-func (p ProbeConfig) DetectSeconds() float64 {
-	return float64(p.DetectMs()) / 1000
-}
-
 // DetectionPreset is a named tuning of the four settings that decide how fast a
 // failing active path is condemned. The presets are portal convenience and
 // nothing more: choosing one writes these numbers into ProbeConfig, the stored

@@ -304,9 +304,24 @@ overwrote the newer decision and the abandoned path was applied a second time.
 
 Anything that changes an input to `selectPath` outside the tick wakes the
 decision loop (`Engine.wakeDecision`) rather than waiting up to 500ms: a path
-being condemned, and the operator's pin, approve, revoke and clear-quarantine
-actions. The tick remains for the purely time-based inputs: hold-down,
+changing eligibility in either direction, the operator's pin, approve, revoke
+and clear-quarantine actions, and a settings save. Recovery matters as much
+as condemnation: with every path down the route is left on a dead tunnel and
+the first path back is switched to with no hold-down, so the tick was the
+whole of that delay. `Tracker.Usable` is the test, so up to suspect wakes
+nothing. The tick remains for the purely time-based inputs: hold-down,
 quarantine and grant expiry.
+
+The entry nudge took away a delay that was doing a job. A send the kernel
+refuses outright ends the socket and `Prober.Run` opens another, and that
+cycle was throttled only by the first send waiting a full interval on the
+ticker. Nudging on entry removed the wait and left the cycle with no delay at
+all: a core spinning on dial-fail-redial, the sweep never reached, no loss
+ever delivered, and `pending` growing until the sends came back and the
+backlog was expired as one streak against a path that by then worked.
+`sendFailed` books the failed probe as lost on the spot and `Prober.hold`
+waits one interval before the next socket, which is what the dial-failure
+path (`reportUnreachable`) always did.
 
 ### A usage delta
 
@@ -827,6 +842,18 @@ Breaking any of these is a correctness bug even if the tests pass.
 11. **`decisionSeq` must increase across a frontend restart.** The backend
     remembers the highest sequence it has seen and ignores anything lower. It is
     seeded from the wall clock in `New`; do not reset it to zero.
+
+    **Seeded in milliseconds, and the backend admits an equal sequence.** To
+    the second, a process that switched once and was restarted within that
+    second handed its successor the same seed, and the successor's first
+    switch the same number as the one it replaced, on a different path. That
+    is reachable: `Restart=always` brings a crashed process back within the
+    second, a fresh tracker is usable after one reply, and every prober sends
+    on entry. `Agent.SetActivePath` refused to queue the equal number as a
+    straggler, so the frontend routed down one tunnel while the backend
+    replied down another, with no counter or log to show for it, until a
+    later switch moved the number on. The guard is `>=`, matching
+    `applyDecision`; a real straggler is always strictly lower.
 12. **Revert must also disarm.** The decision loop runs every 500ms. Removing
     the rules without dropping to observe means the very next tick sees no
     active path, picks one, and reinstalls the route — leaving the host half
@@ -1387,8 +1414,13 @@ where a subtle regression would be invisible in production until an outage:
   proved from outside by watching a loopback socket; a nudge with no loop to
   receive it never blocks; a path being condemned wakes the decision loop
   exactly once while a loss that changes nothing does not wake it at all, with
-  the channel drained between checks so the negative assertions can fail; and
-  pin, approve, revoke and clear-quarantine each wake it.
+  the channel drained between checks so the negative assertions can fail; a
+  path recovering wakes it once too, as does a fresh tracker's first reply,
+  while a reply on a path already up and a single loss demoting up to suspect
+  do not; pin, approve, revoke, clear-quarantine and a settings save each wake
+  it; and a send the kernel refuses is booked as a loss and held for one
+  interval rather than spun on, proved with a udp4 socket pointed at an IPv6
+  address so it needs no routing and fails the same way on every platform.
 - `model/presets_test.go`: the standard preset applied to the defaults changes
   nothing, the presets are ordered by detection time and each note quotes the
   time `DetectMs` gives for its numbers, applying a preset lifts a standby
@@ -1398,7 +1430,10 @@ where a subtle regression would be invisible in production until an outage:
   shipped configuration and on one with a short standby interval, because a
   copy of the bounds would keep passing after the real rule moved.
 - `agent/decision_test.go`: a stale decision arriving after a newer one is
-  queued cannot replace it, while a newer one still can.
+  queued cannot replace it, while a newer one still can; an equal sequence on
+  another path, which is a restarted frontend's first switch, is still queued;
+  and, with the worker actually running, the newest decision is applied, a
+  straggler never reaches the kernel, and the equal-sequence decision lands.
 - `engine/prober_lifecycle_test.go` — one generation of probers, always: a
   replaced generation is cancelled rather than orphaned, `stopProbers` returns
   only once the old goroutines are gone, and eight concurrent `Reconfigure`

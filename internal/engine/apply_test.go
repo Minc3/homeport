@@ -147,8 +147,11 @@ func TestDecisionSequenceSurvivesARestart(t *testing.T) {
 	if e.decisionSeq == 0 {
 		t.Fatal("decision sequence starts at zero; a restart would rewind it")
 	}
-	if e.decisionSeq < uint64(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Unix())<<16 {
-		t.Errorf("decision sequence %d is not seeded from the clock", e.decisionSeq)
+	// Milliseconds, not seconds: two processes seeded inside the same second
+	// would number different decisions the same, and the backend tells them
+	// apart by nothing else.
+	if e.decisionSeq < uint64(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())<<16 {
+		t.Errorf("decision sequence %d is not seeded from the clock in milliseconds", e.decisionSeq)
 	}
 }
 
