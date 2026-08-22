@@ -109,6 +109,13 @@ type Engine struct {
 	decisionSeq uint64
 	lastSwitch  time.Time
 
+	// wake asks Run to evaluate now rather than on its next 500ms tick. It is
+	// raised when a tracker condemns a path, because at that moment the tick
+	// is the only thing between a known-dead route and the switch away from
+	// it. Buffered one deep and written without blocking: two condemnations
+	// in one tick are one evaluation, and nothing ever waits on it.
+	wake chan struct{}
+
 	// beatenSince is when the active path started being out-scored by the
 	// margin, in quality selection mode. It is the hold-down for moving *down*
 	// to a less preferred path, and it is tracked against the active path
@@ -213,6 +220,7 @@ func New(log *slog.Logger, st *store.Store, notifier *notify.Notifier, cfg model
 		trackers: map[int]*Tracker{},
 		probers:  map[int]*Prober{},
 		quotaDec: map[int]quota.Decision{},
+		wake:     make(chan struct{}, 1),
 		blocks:   map[int]model.Block{},
 		linkers:  map[string]linkerConn{},
 		baseCtx:  context.Background(),
@@ -304,6 +312,9 @@ func (e *Engine) Run(ctx context.Context) error {
 			e.onResult(ctx, r)
 
 		case <-decide.C:
+			e.evaluate(ctx, time.Now())
+
+		case <-e.wake:
 			e.evaluate(ctx, time.Now())
 
 		case <-reconcile.C:
@@ -445,6 +456,10 @@ func (e *Engine) onResult(ctx context.Context, r Result) {
 	}
 	switch tn.To {
 	case model.HealthDown:
+		// Decide now. The streak that condemned this path took DetectSeconds
+		// to build; the decision tick would add up to another 500ms on top,
+		// for no reason other than that it is periodic.
+		e.wakeDecision()
 		_ = e.st.AddEvent(store.EventPathDown, r.PathID, "%s went down (%d consecutive probe losses)", name, failThreshold)
 		e.log.Warn("path down", "path", name)
 		e.notifier.Send(ctx, notify.KindPathDown, "down:"+name,
@@ -458,6 +473,16 @@ func (e *Engine) onResult(ctx context.Context, r Result) {
 	case model.HealthUp:
 		_ = e.st.AddEvent(store.EventPathUp, r.PathID, "%s recovered", name)
 		e.log.Info("path up", "path", name)
+	}
+}
+
+// wakeDecision asks Run for an evaluation now. Safe from any goroutine and
+// safe on an engine built without Run (the tests' literal), where the nil
+// channel simply never accepts.
+func (e *Engine) wakeDecision() {
+	select {
+	case e.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -864,6 +889,10 @@ func (e *Engine) commitSwitch(ctx context.Context, cfg model.Config, chosen, pre
 	e.lastSwitch = now
 	for id, pr := range e.probers {
 		pr.SetActive(id == chosen)
+		// Carry the decision to the backend now, on every tunnel, rather than
+		// on whichever standby ticker fires first. Until it lands the backend
+		// is still answering down the path that was just abandoned.
+		pr.Nudge()
 	}
 	seq := e.decisionSeq
 	applying := e.runner.Applying()

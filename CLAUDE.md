@@ -280,9 +280,19 @@ there is no second layer of encryption.
    `degraded → degraded`.
 2. `selectPath` returns a chosen path id, or `0` with `held=true`.
 3. If the choice changed, install the route, log an event, notify, bump
-   `decisionSeq`, and flip the probers' active/standby cadence.
-4. The new decision reaches the backend on the next probe, over whichever
-   tunnel is alive.
+   `decisionSeq`, flip the probers' active/standby cadence, and **nudge every
+   prober** (`Prober.Nudge`) so each sends a probe now instead of on its next
+   tick.
+4. The new decision reaches the backend on that probe, over whichever tunnel
+   is alive. The nudge is what makes this immediate: without it a standby
+   path's next probe was wherever its 5s ticker happened to be, and until one
+   landed the backend went on answering down the tunnel that had just died.
+   That was up to five seconds of frozen players on top of detection, and it
+   was not in any setting.
+
+A path being condemned also wakes the decision loop (`Engine.wakeDecision`)
+rather than waiting for the next 500ms tick. The tick is still there for
+everything else: quota, hold-down expiry, a degraded path improving.
 
 ### A usage delta
 
@@ -425,6 +435,28 @@ jitter × JitterWeight`. `LossWeight` defaults to 25 because for a game server a
 clean 60ms link genuinely beats a lossy 30ms one. A flawless path scores zero
 and cannot be displaced — the margin comparison is strict, so two idle tunnels
 never swap.
+
+**Detection speed is a portal preset, not a configuration field.** The
+"Detection speed" dropdown (`model.DetectionPresets`: fast, standard, relaxed)
+fills in four numbers, active interval, timeout, losses-before-down and window,
+and the stored configuration carries only the numbers. The engine has never
+heard of a preset, a site that never opens the dropdown is byte-identical, and
+the numbers stay editable, so nothing new had to be validated or pushed. The
+standard preset is pinned equal to `Defaults().Probe` so a fresh install reads
+"Standard" and not "Custom".
+
+Each preset carries its trade-off in `Note`, and the portal shows it beside the
+choice together with `ProbeConfig.DetectSeconds` computed from whatever is in
+the fields. That is the point of the feature, not decoration: a faster
+condemnation is bought with false failovers on any link that drops bursts of
+packets, and every false trip parks players on a metered path for the whole
+failback hold-down, costs a visible switch each way, and counts towards
+quarantine. The fast preset's 300ms timeout also has to stay above the worst
+round trip on the slowest link or late replies are booked as losses. Nothing
+else on the page says any of that, so the dropdown has to. The relaxed preset
+exists for the opposite problem: a link that is condemned and recovers on its
+own is one the standard tuning is too tight for, and the fix is a longer streak
+and a longer timeout, not a lower loss threshold.
 
 **No eligible path means keep the last route.** `selectPath` returns `0`, the
 caller leaves `e.active` alone, and the installed route stays. Withdrawing it
@@ -1328,6 +1360,15 @@ where a subtle regression would be invisible in production until an outage:
   leaves behind gets repaired, an intact system is left completely alone, a
   tunnel that has not come back is skipped, and observe mode repairs
   measurement without installing anything that moves traffic.
+- `engine/detection_test.go` — a decision change probes every path at once
+  rather than on the standby ticker, proved from outside by watching a
+  loopback socket; a nudge with no loop to receive it never blocks; and a path
+  being condemned wakes the decision loop exactly once, while a loss that
+  changes nothing does not wake it at all.
+- `model/presets_test.go` — the standard preset equals the shipped tuning, the
+  presets are ordered by detection time and each note quotes the time its own
+  numbers give, every preset is inside the bounds `web.validate` enforces, and
+  `DetectSeconds` counts the streak plus the last timeout.
 - `engine/prober_lifecycle_test.go` — one generation of probers, always: a
   replaced generation is cancelled rather than orphaned, `stopProbers` returns
   only once the old goroutines are gone, and eight concurrent `Reconfigure`

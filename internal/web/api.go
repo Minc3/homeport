@@ -29,6 +29,13 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.eng.Config())
 }
 
+// handlePresets serves the shipped detection tunings for the settings page's
+// dropdown. They live in model so a test can pin the standard one to the
+// shipped defaults; the portal is only a consumer.
+func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, model.DetectionPresets())
+}
+
 // handlePutConfig replaces the whole configuration. The portal is the single
 // source of truth, so this is the only way settings change; the backend picks
 // up its half over the control channel within a couple of seconds.

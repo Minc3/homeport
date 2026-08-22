@@ -53,6 +53,9 @@ type Prober struct {
 	resolved map[uint64]Result
 	deliver  uint64 // next sequence number to emit, keeps results in order
 	active   bool
+
+	// nudge asks the send loop for a probe now, outside its ticker. See Nudge.
+	nudge chan struct{}
 }
 
 // NewProber builds a prober for one path.
@@ -75,7 +78,28 @@ func NewProber(p model.PathConfig, probeCfg model.ProbeConfig, ov model.OverlayC
 		pending:  map[uint64]time.Time{},
 		resolved: map[uint64]Result{},
 		deliver:  1,
+		nudge:    make(chan struct{}, 1),
 	}, nil
+}
+
+// Nudge sends a probe at once and restarts the cadence from now.
+//
+// The routing decision travels on probes and nowhere else, so the backend
+// learns about a switch when the next probe reaches it, and a standby path's
+// next probe was wherever its 5s ticker happened to be. SetActive changed the
+// interval, but the loop only picks that up after the ticker it is already
+// waiting on fires. Until a probe lands the backend's replies still leave by
+// the tunnel that just died: the frontend had switched, and the players were
+// still frozen for up to five seconds more. That wait was the largest and
+// least visible part of a failover, and it was not in any setting.
+//
+// Non-blocking and coalescing: a nudge that arrives while one is already
+// queued is the same request.
+func (p *Prober) Nudge() {
+	select {
+	case p.nudge <- struct{}{}:
+	default:
+	}
 }
 
 // SetActive switches between the fast cadence used for the path currently
@@ -221,6 +245,17 @@ func (p *Prober) loop(ctx context.Context) {
 				current = iv
 				send.Reset(iv)
 			}
+		case <-p.nudge:
+			if err := p.send(conn); err != nil {
+				p.log.Debug("probe send failed", "err", err)
+				stop()
+				return
+			}
+			// Restart the cadence from this send, at whatever interval the
+			// decision that prompted it has left us on. A path that has just
+			// become active goes from a 5s ticker to 250ms here and now.
+			current = p.interval()
+			send.Reset(current)
 		case <-sweep.C:
 			p.expire()
 			p.flush(ctx)

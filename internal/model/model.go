@@ -359,6 +359,112 @@ type ProbeConfig struct {
 	MaxRTTMs          int     `json:"max_rtt_ms"`        // above this the path is degraded
 }
 
+// DetectSeconds is roughly how long a dead active path takes to be condemned
+// with this tuning: the first lost probe goes out, FailThreshold-1 more follow
+// at the active interval, and the last of them has to time out. It is the
+// floor under the lag spike a failover causes, and the number the portal shows
+// beside the tuning so the trade-off is visible where it is chosen.
+func (p ProbeConfig) DetectSeconds() float64 {
+	if p.FailThreshold < 1 {
+		return float64(p.TimeoutMs) / 1000
+	}
+	return float64((p.FailThreshold-1)*p.ActiveIntervalMs+p.TimeoutMs) / 1000
+}
+
+// DetectionPreset is a named tuning of the four settings that decide how fast a
+// failing active path is condemned. The presets are portal convenience and
+// nothing more: choosing one writes these numbers into ProbeConfig, the stored
+// configuration carries only the numbers, and the engine has never heard of a
+// preset. A site that never opens the dropdown is untouched.
+//
+// Note carries the trade-off. A faster condemnation is not free, it is bought
+// with false failovers on links that drop bursts of packets, and each one of
+// those parks players on a metered path for the length of the failback
+// hold-down. The portal shows the note beside the choice so nobody picks the
+// fast tuning thinking it is simply better.
+type DetectionPreset struct {
+	Name             string `json:"name"`
+	Label            string `json:"label"`
+	Note             string `json:"note"`
+	ActiveIntervalMs int    `json:"active_interval_ms"`
+	TimeoutMs        int    `json:"timeout_ms"`
+	FailThreshold    int    `json:"fail_threshold"`
+	WindowSize       int    `json:"window_size"`
+}
+
+// Apply writes the preset's numbers into a ProbeConfig, leaving everything the
+// preset does not name (standby cadence, recovery, degraded thresholds) alone.
+func (d DetectionPreset) Apply(p *ProbeConfig) {
+	p.ActiveIntervalMs = d.ActiveIntervalMs
+	p.TimeoutMs = d.TimeoutMs
+	p.FailThreshold = d.FailThreshold
+	p.WindowSize = d.WindowSize
+}
+
+// Matches reports whether a ProbeConfig carries exactly this preset's numbers.
+func (d DetectionPreset) Matches(p ProbeConfig) bool {
+	return p.ActiveIntervalMs == d.ActiveIntervalMs && p.TimeoutMs == d.TimeoutMs &&
+		p.FailThreshold == d.FailThreshold && p.WindowSize == d.WindowSize
+}
+
+// Names of the shipped presets. PresetStandard is the shipped tuning and must
+// stay equal to Defaults().Probe, which model/presets_test.go pins.
+const (
+	PresetStandard = "standard"
+	PresetFast     = "fast"
+	PresetRelaxed  = "relaxed"
+)
+
+// DetectionPresets lists the shipped tunings, fastest detection first.
+//
+// The detection figures quoted in the notes are DetectSeconds for each tuning,
+// which the test also pins, so the prose cannot drift from the numbers. The
+// probe data figure for the fast preset is 10 probes a second at roughly 130
+// bytes on the wire each way, which is about 3.4 GB a month, and it is only
+// billed while a metered path is the active one.
+func DetectionPresets() []DetectionPreset {
+	return []DetectionPreset{
+		{
+			Name:  PresetFast,
+			Label: "Fast",
+			Note: "Condemns a dead path in about 0.6s, so a failover is a stutter rather than a freeze. " +
+				"The trade: 400ms of silence is enough to move traffic, and LTE produces that on its own during a tower handover, " +
+				"so expect the occasional failover that nothing was wrong for. Every false trip parks players on a metered link " +
+				"until failback clears the hold-down (a couple of minutes), costs a visible switch each way, and counts towards quarantine. " +
+				"The 300ms timeout must stay above the worst round trip on your slowest link, or late replies are booked as losses and " +
+				"a loaded path reads as degraded. Probing at 100ms also costs about 3.4 GB a month of data while an LTE path is the active one.",
+			ActiveIntervalMs: 100,
+			TimeoutMs:        300,
+			FailThreshold:    4,
+			WindowSize:       150,
+		},
+		{
+			Name:  PresetStandard,
+			Label: "Standard (default)",
+			Note: "Condemns a dead path in about 2.6s. Tolerates the short bursts of loss LTE produces without moving traffic, " +
+				"and the 800ms timeout sits well above any round trip a working link should see. " +
+				"A real outage freezes the game for roughly three seconds before play resumes on the next path.",
+			ActiveIntervalMs: 250,
+			TimeoutMs:        800,
+			FailThreshold:    8,
+			WindowSize:       60,
+		},
+		{
+			Name:  PresetRelaxed,
+			Label: "Relaxed (for poor links)",
+			Note: "For links that drop packets in bursts or spike in latency. Condemns a dead path in about 7s, so a real outage " +
+				"freezes the game for longer, but a flaky link is not abandoned over a two second hiccup and then kept off traffic " +
+				"for the whole failback hold-down. The 1500ms timeout stops latency spikes being counted as loss, and the loss figure " +
+				"is averaged over 30 seconds rather than 15. Choose this when the dashboard shows the main link being condemned " +
+				"and recovering on its own, which is the fingerprint of a tuning that is too tight for the link.",
+			ActiveIntervalMs: 500,
+			TimeoutMs:        1500,
+			FailThreshold:    12,
+			WindowSize:       60,
+		},
+	}
+}
+
 // Selection is how the engine chooses between eligible paths.
 const (
 	// SelectionPriority is strict priority order: the lowest priority number

@@ -128,6 +128,7 @@ func (s *Server) Handler(trusted bool) http.Handler {
 	api("GET /api/status", s.handleStatus)
 	api("GET /api/psk", s.handlePSK)
 	api("GET /api/config", s.handleGetConfig)
+	api("GET /api/presets", s.handlePresets)
 	api("PUT /api/config", s.handlePutConfig)
 	api("GET /api/events", s.handleEvents)
 	api("GET /api/history", s.handleHistory)
