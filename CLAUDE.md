@@ -659,6 +659,24 @@ Being able to shape the *download* direction at all is a property of owning both
 ends. An ordinary home router can only drop traffic that has already crossed the
 bottleneck; the frontend is upstream of it.
 
+**TCP MSS is clamped on every SYN that leaves by a tunnel, on both hosts.**
+The tunnels run at WireGuard's 1420 and everything either side of them at
+1500, so a *forwarded* TCP connection — a player to a containerised server, a
+container to the internet through the frontend — depended on path MTU
+discovery: the host in front of the tunnel sending ICMP "fragmentation
+needed" and the far end acting on it. Plenty of far ends never see that ICMP,
+and Valve's servers are the canonical case: steamcmd from a container routed
+out through the frontend completed its handshake and sat at "Retrying…"
+forever, the first full-size segment from Steam dropped at the tunnel and
+nothing telling Steam to send smaller ones, while the same container was fine
+by the house's 1500-byte path. `writeMSSClamp` puts a forward chain in the
+frontend's `failover` table and the backend's `failover_return` table:
+`oifname { tunnels } tcp flags syn tcp option maxseg size set rt mtu`. `rt
+mtu` is the leaving route's MTU, so the number tracks the tunnel rather than
+being written here. Forwarded packets only — a connection a host originates on
+its own address already sizes itself from the route — and it rides in the two
+mode-gated tables, so observe mode touches nothing.
+
 **Protection is a separate nftables table, and everything in it is off.** Same
 reasoning as `failover_egress`: `NFTTable` carries the published services and is
 asserted to contain no translation, this can be removed on its own, and a reader
@@ -784,9 +802,10 @@ Breaking any of these is a correctness bug even if the tests pass.
    prober keeps one socket for as long as sends succeed — so once the tunnels
    came up every probe from that socket still carried the public address, the
    backend answered to the public address from an ephemeral port that matched
-   no conntrack entry, and nothing was listening there. Three dead paths for
-   the life of the process; a restart, with the tunnels now present before
-   the sockets opened, fixed it instantly. The rules go in for every path
+   no conntrack entry, and nothing was listening there. (That was the second
+   fault in the boot report; the first was the reconciler never installing the
+   route at all, see the never-created-table trap in §8. Either alone was
+   enough to keep a path dead for the life of the process.) The rules go in for every path
    whether or not its interface exists yet (`EnsureProbeRoutes`), because the
    interface-less case is the one they are for, and the route follows from the
    reconciler when the tunnel appears. It is a rule rather than an
@@ -1218,6 +1237,20 @@ loss, because the packets have nowhere to go. The reconcilers exist for this;
 see invariant 18. To confirm it by hand: `ip route show table 101` should name
 the tunnel, and an empty result is the bug.
 
+**A tunnel that was absent at startup is a different case, and it was not
+repaired.** A table that has never held a route does not exist to the kernel,
+and `ip route show … table 101` answers with `Error: ipv4: FIB table does not
+exist` (exit 2) rather than an empty listing. A table emptied by a restart
+still exists and lists as empty. `RouteVia` and `DefaultVia` used to pass that
+error up, and both reconcilers skip a path on error — so a frontend rebooted
+ahead of `wg-quick` never created the tables for the tunnels that came up
+after it and never repaired them, every tick, for the life of the process. The
+fingerprint: `wg show` with one tunnel carrying kilobytes and the others at 92
+bytes sent — one handshake response and not a single probe — and a service
+restart fixing it instantly, because by then every interface existed before
+the routes were installed. Both readbacks now report a nonexistent table as
+no route (`sysx.tableDoesNotExist`); any other failure is still a failure.
+
 **`Table = off` in every `wg-quick` config.** Otherwise wg-quick installs its
 own route for the peer's AllowedIPs and the three tunnels fight over the same
 destination.
@@ -1460,6 +1493,8 @@ where a subtle regression would be invisible in production until an outage:
 - `proto/proto_test.go` — round trip, and rejection of wrong keys, tampering,
   wrong sizes and replayed challenges.
 - `sysx/nft_test.go` — the published ruleset never masquerades; atomic replace;
+  both mode-gated tables clamp the TCP MSS on SYNs leaving by a tunnel, scoped
+  to the tunnels, and render no clamp with no tunnels;
   the egress mark leaves private, link-local and multicast destinations on
   their normal route (and `sysx/linker_test.go` holds the same for a linker's
   mark and its SNAT);
@@ -1504,8 +1539,9 @@ where a subtle regression would be invisible in production until an outage:
   explicit priority ahead of the probe band, that moving a rule to its pinned
   priority adds before it deletes, the control rule selects on mark not addresses,
   rp_filter is off rather than loose, the path rules are pinned ahead of the
-  return rule, and a purged table reads back as no interface rather than an
-  error. Also that a path's rules go in without its interface and the
+  return rule, a purged table reads back as no interface rather than an
+  error, and so does a table that never existed while any other `ip` failure
+  is still one. Also that a path's rules go in without its interface and the
   unreachable backstop lands behind the lookup, that a backstop at the wrong
   priority is moved with the add before the delete, that a refusal for a mark
   no path carries is swept while a host's own refusal outside the band is
@@ -1513,7 +1549,9 @@ where a subtle regression would be invisible in production until an outage:
   its own refusal, owned by its priority alone and removed with the lookup
   (`sysx/linker_test.go` holds the same for a linker's).
 - `engine/reconcile_test.go`, `agent/reconcile_test.go` — what a tunnel restart
-  leaves behind gets repaired, an intact system is left completely alone, a
+  leaves behind gets repaired, a probe table that was never created (the
+  tunnel absent at startup, which the kernel reports as an error rather than
+  an empty table) is repaired too, an intact system is left completely alone, a
   tunnel that has not come back is skipped, and observe mode repairs
   measurement without installing anything that moves traffic.
 - `engine/detection_test.go`: a new prober generation sends at once and a

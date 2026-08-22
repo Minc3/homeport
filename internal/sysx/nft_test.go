@@ -456,3 +456,38 @@ func TestOverlayForwardExceptionsSkipWhenNoDockerChain(t *testing.T) {
 		}
 	}
 }
+
+// The tunnels run at 1420 and everything either side of them at 1500, so a
+// forwarded TCP connection depended on path MTU discovery - on the far end
+// acting on an ICMP it frequently never sees. Valve's servers are the
+// canonical case: steamcmd from a container routed out through the frontend
+// completed its handshake and then sat at "Retrying..." forever, because the
+// first full-size segment from Steam was dropped at the tunnel and nothing
+// told Steam to send smaller ones. Clamping the MSS on every SYN that leaves by
+// a tunnel tells the far end the size up front, on both hosts, and needs no
+// cooperation from anybody.
+func TestBothRulesetsClampTCPMSSIntoTheTunnels(t *testing.T) {
+	cfg := defaultsPublishing()
+	front := BuildRuleset(cfg)
+	back := BuildReturnRuleset([]string{"wg-main", "wg-lte1", "wg-lte2"})
+	want := `oifname { "wg-main", "wg-lte1", "wg-lte2" } tcp flags syn tcp option maxseg size set rt mtu`
+	for name, rs := range map[string]string{"frontend": front, "backend": back} {
+		if !strings.Contains(rs, want) {
+			t.Errorf("%s ruleset does not clamp the MSS into the tunnels:\n%s", name, rs)
+		}
+		if !strings.Contains(rs, "type filter hook forward priority mangle") {
+			t.Errorf("%s clamp is not on the forward hook, where the tunnel-bound SYNs are:\n%s", name, rs)
+		}
+	}
+	// Scoped to the tunnels: a SYN leaving by the public interface or the
+	// LAN carries a full-size MSS as it always did.
+	for _, line := range strings.Split(front+back, "\n") {
+		if strings.Contains(line, "maxseg") && !strings.Contains(line, "oifname {") {
+			t.Errorf("an MSS clamp is not scoped to the tunnels: %q", line)
+		}
+	}
+	// And nowhere to leave by means nothing to clamp.
+	if rs := BuildReturnRuleset(nil); strings.Contains(rs, "maxseg") {
+		t.Errorf("a clamp was rendered with no tunnels:\n%s", rs)
+	}
+}

@@ -343,6 +343,38 @@ func TestRouteViaReportsAnEmptyTableAsNoInterface(t *testing.T) {
 	}
 }
 
+// A table that has never held a route does not exist to the kernel, and
+// `ip route show` reports that as an error rather than an empty listing. To
+// every reconciler that is the same answer as an empty table - no route - and
+// reading it as an error was the boot failure: a frontend started before
+// wg-quick had no interface to install a route on, so the probe table was
+// never created, and the reconciler skipped that path on the error every tick
+// from then on. The path whose tunnel happened to exist at startup measured
+// perfectly; the other two never sent a probe until the service was restarted
+// with every interface present. A tunnel restart, by contrast, empties a table
+// that still exists, which is why that case was always repaired.
+func TestRouteViaReportsATableThatNeverExistedAsNoRoute(t *testing.T) {
+	// Exactly what iproute2 prints, with ExecRunner's framing around it.
+	kernel := "Error: ipv4: FIB table does not exist.\nDump terminated"
+	f := &fakeRunner{fail: map[string]string{"ip route show": kernel}}
+
+	via, err := RouteVia(context.Background(), f, "10.99.0.2/32", 101)
+	if err != nil || via != "" {
+		t.Errorf("RouteVia(never-created table) = %q, %v; want no route and no error", via, err)
+	}
+	via, err = DefaultVia(context.Background(), f, 100)
+	if err != nil || via != "" {
+		t.Errorf("DefaultVia(never-created table) = %q, %v; want no route and no error", via, err)
+	}
+
+	// Any other failure is still a failure: a reconciler must not install a
+	// route on the strength of `ip` having crashed.
+	g := &fakeRunner{fail: map[string]string{"ip route show": "RTNETLINK answers: Operation not permitted"}}
+	if _, err := RouteVia(context.Background(), g, "10.99.0.2/32", 101); err == nil {
+		t.Error("an unrelated ip failure was read as an empty table")
+	}
+}
+
 // The per-path fwmark rules must outrank the backend's `from <overlay> lookup
 // 100` rule, which is a broader match on the same packets. `ip rule add` with
 // no preference puts each new rule ahead of the last, and the backend installs

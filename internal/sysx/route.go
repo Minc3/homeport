@@ -501,6 +501,19 @@ func ActiveIface(ctx context.Context, r Runner, backendIP string) (string, error
 // will not report a /24 when asked about a /32 within it - so a caller that
 // installs the overlay range and reads back a host address sees "no route" on
 // every tick and reinstalls a route that was already there.
+//
+// A table that has never held a route is reported by the kernel as not
+// existing at all, and `ip route show` turns that into an error ("FIB table
+// does not exist", exit 2) rather than an empty listing. That is the same
+// answer as an empty table for every caller here - there is no route - and
+// treating it as an error was the boot failure: a frontend that started
+// before wg-quick had no interface to install a route on, so the probe table
+// was never created, and the reconciler skipped the path on the error every
+// tick from then on. A tunnel restart empties a table, which reads back as
+// empty and was repaired; a tunnel that was absent at startup never got a
+// table, which read back as an error and was not. The service restart that
+// fixed it was simply one where every interface existed before the routes
+// were installed.
 func RouteVia(ctx context.Context, r Runner, dstPrefix string, table int) (string, error) {
 	args := []string{"route", "show", dstPrefix}
 	if table > 0 {
@@ -508,19 +521,31 @@ func RouteVia(ctx context.Context, r Runner, dstPrefix string, table int) (strin
 	}
 	out, err := r.Run(ctx, "ip", args...)
 	if err != nil {
+		if tableDoesNotExist(err) {
+			return "", nil
+		}
 		return "", err
 	}
 	return devFrom(out), nil
 }
 
 // DefaultVia reports which interface the default route in a table points at,
-// or "" when the table has no default route.
+// or "" when the table has no default route - or no table, see RouteVia.
 func DefaultVia(ctx context.Context, r Runner, table int) (string, error) {
 	out, err := r.Run(ctx, "ip", "route", "show", "default", "table", strconv.Itoa(table))
 	if err != nil {
+		if tableDoesNotExist(err) {
+			return "", nil
+		}
 		return "", err
 	}
 	return devFrom(out), nil
+}
+
+// tableDoesNotExist recognises the kernel's answer for a routing table nothing
+// has ever written to. ExecRunner carries the command's stderr in the error.
+func tableDoesNotExist(err error) bool {
+	return strings.Contains(err.Error(), "FIB table does not exist")
 }
 
 func devFrom(out string) string {

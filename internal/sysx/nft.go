@@ -98,8 +98,54 @@ func BuildRuleset(cfg model.Config) string {
 	}
 
 	b.WriteString("\t}\n")
+	writeMSSClamp(&b, pathIfaces(cfg))
 	b.WriteString("}\n")
 	return b.String()
+}
+
+func pathIfaces(cfg model.Config) []string {
+	ifaces := make([]string, 0, len(cfg.Paths))
+	for _, p := range cfg.Paths {
+		ifaces = append(ifaces, p.Iface)
+	}
+	return ifaces
+}
+
+// writeMSSClamp renders a forward chain that caps the TCP MSS of every SYN
+// leaving by a tunnel to what the tunnel can carry.
+//
+// The tunnels run at WireGuard's 1420, and everything either side of them is
+// 1500. A forwarded TCP connection - a player to a containerised server, a
+// container to the internet - therefore depends on path MTU discovery: the
+// host in front of the tunnel sends ICMP "fragmentation needed" to whichever
+// end is sending 1460-byte segments, and that end is supposed to shrink them.
+// Plenty of ends never see the ICMP, because something on their side drops
+// it, and Valve's are the canonical example. The handshake completes, the
+// first full-size segment from the server is dropped at the tunnel, and the
+// connection sits there retransmitting it: steamcmd "Connecting anonymously
+// to Steam Public... Retrying..." forever, from a container routed out
+// through the frontend, while the same container had no trouble by the
+// house's 1500-byte path.
+//
+// Rewriting the MSS on the SYN tells the far end the right size up front,
+// which needs no ICMP and no cooperation. `rt mtu` is the MTU of the route
+// the packet is leaving by, so the value tracks the tunnel's MTU rather than
+// a number written here. Forwarded packets only: a connection this host
+// originates on its own address already sizes itself from the route. Only
+// where there are tunnels to leave by, which is every site.
+func writeMSSClamp(b *strings.Builder, ifaces []string) {
+	if len(ifaces) == 0 {
+		return
+	}
+	quoted := make([]string, 0, len(ifaces))
+	for _, i := range ifaces {
+		quoted = append(quoted, fmt.Sprintf("%q", i))
+	}
+	b.WriteString("\tchain forward {\n")
+	b.WriteString("\t\ttype filter hook forward priority mangle; policy accept;\n")
+	fmt.Fprintf(b, "\t\toifname { %s } tcp flags syn tcp option maxseg size set rt mtu\n",
+		strings.Join(quoted, ", "))
+	b.WriteString("\t}\n")
 }
 
 // BuildEgressRuleset renders the frontend's source-NAT for backend-originated
@@ -293,6 +339,10 @@ func BuildReturnRuleset(ifaces []string) string {
 	fmt.Fprintf(&b, "\t\tct direction reply meta mark set ct mark\n")
 
 	b.WriteString("\t}\n")
+	// The backend's half of the clamp: a container's SYN on its way into the
+	// tunnel, and a containerised server's SYN-ACK to a player. See
+	// writeMSSClamp. A service on the host itself needs none of this.
+	writeMSSClamp(&b, ifaces)
 	b.WriteString("}\n")
 	return b.String()
 }

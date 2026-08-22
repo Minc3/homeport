@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,6 +20,9 @@ type queryRunner struct {
 	mu      sync.Mutex
 	calls   []string
 	replies map[string]string
+	// fails maps a command to the stderr it fails with, for the kernel
+	// answers that are errors rather than listings.
+	fails map[string]string
 }
 
 func (q *queryRunner) Run(_ context.Context, name string, args ...string) (string, error) {
@@ -26,6 +30,9 @@ func (q *queryRunner) Run(_ context.Context, name string, args ...string) (strin
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.calls = append(q.calls, line)
+	if msg, ok := q.fails[line]; ok {
+		return msg, fmt.Errorf("%s: exit status 2 (%s)", line, msg)
+	}
 	return q.replies[line], nil
 }
 
@@ -248,5 +255,46 @@ func TestRevertStopsTheReconcilerAndTheDecisionLoopUntilReconfigured(t *testing.
 	}
 	if !repaired {
 		t.Errorf("after a reconfigure the probe table was not repaired; writes were %v", q.writes()[before:])
+	}
+}
+
+// The boot case, which is not the restart case. A tunnel restart empties a
+// table that still exists, and the kernel lists it as empty. A tunnel that did
+// not exist when the frontend started never had a route installed, so its
+// table was never created, and the kernel answers `ip route show` for it with
+// an error instead. The reconciler skipped the path on that error on every
+// tick, so a frontend rebooted ahead of wg-quick never probed the tunnels that
+// came up after it - while the one that happened to exist at startup measured
+// perfectly - until the service was restarted with every interface present.
+func TestReconcileRepairsAProbeTableThatWasNeverCreated(t *testing.T) {
+	kernel := healthyKernel()
+	delete(kernel, "ip route show 10.99.0.2/32 table 101")
+	delete(kernel, "ip route show 10.99.0.2/32 table 102")
+
+	// lte2 was up at boot and took the traffic, so the active routes point at it.
+	kernel["ip route show 10.99.0.2/32 table 100"] = "10.99.0.2 dev wg-lte2 scope link src 10.99.0.1"
+	kernel["ip route show 10.99.0.2/32"] = "10.99.0.2 dev wg-lte2 scope link src 10.99.0.1"
+
+	e, q := engineForReconcile(t, kernel)
+	q.fails = map[string]string{
+		"ip route show 10.99.0.2/32 table 101": "Error: ipv4: FIB table does not exist.\nDump terminated",
+		"ip route show 10.99.0.2/32 table 102": "Error: ipv4: FIB table does not exist.\nDump terminated",
+	}
+	e.active = 3
+
+	e.reconcileRouting(context.Background())
+
+	for _, want := range []string{
+		"ip route replace 10.99.0.2/32 dev wg-main src 10.99.0.1 table 101",
+		"ip route replace 10.99.0.2/32 dev wg-lte1 src 10.99.0.1 table 102",
+	} {
+		if q.count(want) != 1 {
+			t.Errorf("a never-created probe table was not repaired; writes were %v", q.writes())
+		}
+	}
+	for _, w := range q.writes() {
+		if strings.Contains(w, "table 103") {
+			t.Errorf("the path that was fine was rewritten: %v", q.writes())
+		}
 	}
 }
