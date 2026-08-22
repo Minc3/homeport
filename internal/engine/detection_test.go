@@ -174,6 +174,15 @@ func TestOperatorActionsWakeTheDecisionLoop(t *testing.T) {
 // The failure here is a udp4 socket asked to write to an IPv6 address, which
 // Go's net package refuses before any syscall, so it is the same on every
 // platform and needs no routing to set up.
+//
+// It starts with one probe already outstanding, because that is how a link
+// dies: a probe sent fine and never answered, then the next send refused.
+// Results leave in sequence order, so that probe has to time out before any
+// of the booked losses behind it can be delivered, and only expire does
+// that. The first version of this fix ran expire only from the loop's sweep
+// ticker, which the failing entry nudge never let it reach: every loss was
+// booked, none was delivered, and this test passed because it began with an
+// empty queue.
 func TestASendFailureIsBookedAsALossAndHeldForOneInterval(t *testing.T) {
 	cfg := model.Defaults()
 	requireMarkedSocket(t, cfg.Paths[0].Mark)
@@ -182,6 +191,7 @@ func TestASendFailureIsBookedAsALossAndHeldForOneInterval(t *testing.T) {
 	cfg.Overlay.BackendIP = "::1"
 	cfg.Probe.ActiveIntervalMs = 200
 	cfg.Probe.StandbyIntervalMs = 200
+	cfg.Probe.TimeoutMs = 300
 
 	results := make(chan Result, 4096)
 	pr, err := NewProber(cfg.Paths[0], cfg.Probe, cfg.Overlay, []byte("secret"), results,
@@ -189,6 +199,8 @@ func TestASendFailureIsBookedAsALossAndHeldForOneInterval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new prober: %v", err)
 	}
+	pr.seq = 1
+	pr.pending[1] = time.Now() // sent on the socket before this one, never answered
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	pr.Run(ctx)
@@ -197,7 +209,8 @@ func TestASendFailureIsBookedAsALossAndHeldForOneInterval(t *testing.T) {
 	// hundreds is the spin.
 	const most = 12
 	var losses int
-	for done := false; !done; {
+drain:
+	for {
 		select {
 		case r := <-results:
 			if !r.Lost {
@@ -205,7 +218,7 @@ func TestASendFailureIsBookedAsALossAndHeldForOneInterval(t *testing.T) {
 			}
 			losses++
 		default:
-			done = true
+			break drain
 		}
 	}
 	if losses == 0 {

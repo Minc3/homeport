@@ -146,11 +146,21 @@ func (p *Prober) Run(ctx context.Context) {
 }
 
 // hold pauses for one interval, or until the context ends, and reports which.
+// Before returning it runs the sweep the loop is not there to run.
 //
 // It is the throttle on the two synchronous failures, a socket that will not
 // open and a send the kernel refuses. Either fails again at once if retried at
 // once, and one attempt per interval is the cadence the path would have been
 // measured at anyway.
+//
+// The sweep is not optional. Results leave in sequence order, and the common
+// way into this path is a link dying with a probe outstanding: sent fine,
+// never answered, still in pending when the next send is refused. Only expire
+// resolves it, and only the loop's sweep ticker called expire - a loop the
+// entry nudge now ends before its first tick. Without a sweep here every
+// later probe was booked as lost and none was ever delivered, because deliver
+// was parked behind a probe that could never time out. That is the symptom
+// the hold exists to prevent, reached a second way.
 func (p *Prober) hold(ctx context.Context) bool {
 	t := time.NewTimer(p.interval())
 	defer t.Stop()
@@ -158,6 +168,8 @@ func (p *Prober) hold(ctx context.Context) bool {
 	case <-ctx.Done():
 		return false
 	case <-t.C:
+		p.expire()
+		p.flush(ctx)
 		return true
 	}
 }
@@ -193,10 +205,16 @@ func (p *Prober) reportUnreachable(ctx context.Context) {
 	}
 	p.mu.Lock()
 	p.seq++
-	seq := p.seq
-	p.resolved[seq] = Result{PathID: p.path.ID, Seq: seq, Lost: true, At: time.Now()}
+	p.markLost(p.seq)
 	p.mu.Unlock()
 	p.flush(ctx)
+}
+
+// markLost resolves one probe as lost, whether or not it was ever pending.
+// Called with p.mu held.
+func (p *Prober) markLost(seq uint64) {
+	delete(p.pending, seq)
+	p.resolved[seq] = Result{PathID: p.path.ID, Seq: seq, Lost: true, At: time.Now()}
 }
 
 // loop probes on one socket until the context ends or a send fails. It returns
@@ -266,8 +284,7 @@ func (p *Prober) loop(ctx context.Context) error {
 	sendFailed := func(seq uint64, err error) error {
 		p.log.Debug("probe send failed", "err", err)
 		p.mu.Lock()
-		delete(p.pending, seq)
-		p.resolved[seq] = Result{PathID: p.path.ID, Seq: seq, Lost: true, At: time.Now()}
+		p.markLost(seq)
 		p.mu.Unlock()
 		p.flush(ctx) // before stop: flush gives up on a cancelled context
 		stop()
@@ -386,8 +403,7 @@ func (p *Prober) expire() {
 	defer p.mu.Unlock()
 	for seq, sent := range p.pending {
 		if sent.Before(cutoff) {
-			delete(p.pending, seq)
-			p.resolved[seq] = Result{PathID: p.path.ID, Seq: seq, Lost: true, At: time.Now()}
+			p.markLost(seq)
 		}
 	}
 }

@@ -321,7 +321,11 @@ ever delivered, and `pending` growing until the sends came back and the
 backlog was expired as one streak against a path that by then worked.
 `sendFailed` books the failed probe as lost on the spot and `Prober.hold`
 waits one interval before the next socket, which is what the dial-failure
-path (`reportUnreachable`) always did.
+path (`reportUnreachable`) always did. `hold` also runs the sweep before it
+returns, and that is not tidiness: results leave in sequence order, a link
+usually dies with a probe sent and unanswered, and only `expire` can resolve
+that one. With no loop alive to tick the sweep, every later loss was booked
+behind it and none was delivered.
 
 ### A usage delta
 
