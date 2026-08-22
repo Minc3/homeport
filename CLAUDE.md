@@ -1315,6 +1315,50 @@ ip route get 10.99.0.3 from 10.99.0.1 iif wg-main
 
 Answering with the tunnel rather than the LAN is the bug.
 
+**An overlay address must exist on exactly one host, and a revert deliberately
+leaves it behind.** Swapping two hosts' roles - the box that was the linker
+becoming the backend, the old backend becoming the linker - leaves each one
+holding the address it used to have. Neither `Revert` nor `uninstall.sh` removes
+it without `--overlay`, and that default is right for the case it was written
+for: something may be bound to the address, and on the backend binding to it is
+the entire egress selector, so dropping it would take a running game server's
+socket with it. The result of the swap is a new backend carrying `10.99.0.3` on
+`dummy0` beside its own `10.99.0.2`, answering for a host it is supposed to be
+routing to.
+
+The displaced host then reaches nothing, and the error is a first-hop one:
+`connect: no route to host` from the control channel, `ip neigh` showing the
+backend's LAN address `FAILED`, and a tcpdump on the backend showing the ARP
+requests arriving and never being answered. That is not a firewall. Linux
+route-checks an ARP request before replying to it - `arp_process` calls
+`ip_route_input`, which calls `__fib_validate_source` - and a request whose
+*sender* address is one of the receiver's own resolves to `RTN_LOCAL`, which is
+`e_inval` unless `accept_local` is set. That branch runs ahead of the rp_filter
+branch, so `rp_filter = 0` does not rescue it as it does elsewhere in this
+system: the backend will simply not answer ARP for a peer claiming an address it
+holds itself.
+
+Everything else reads healthy, which is what makes it expensive. The frontend
+pings the linker and gets a reply - from the backend. Traffic published to the
+linker is answered by the backend, because `local` is rule 0 and shadows the
+`10.99.0.3 via <lan>` route the agent installed. All three paths measure
+perfectly throughout. The only number that gives it away is the round trip: the
+backend pinging the "linker" answers in about 0.02ms, which is not a LAN hop.
+
+Two commands on the backend, and both are worth running after any role change:
+
+```sh
+ip -br addr show dummy0
+ip route get 10.99.0.3
+```
+
+`dummy0` must carry this host's own overlay address and nothing else, and the
+route must name the LAN neighbour rather than `local`. A `dummy0` address does
+not survive a reboot, so this clears on its own and comes back the moment
+somebody re-adds it by hand - which is not a reason to leave it. When a host is
+changing role rather than leaving the deployment, `uninstall.sh --overlay` is
+what takes the old address with it.
+
 **`ip rule show` prints table *names*, and a readback that greps for the number
 goes blind.** Wherever `/etc/iproute2/rt_tables` gives a table a name, the
 kernel prints that name instead: a host that calls table 200 `isp2` - an
