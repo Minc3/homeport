@@ -1248,11 +1248,14 @@ after it and never repaired them, every tick, for the life of the process. The
 fingerprint: `wg show` with one tunnel carrying kilobytes and the others at 92
 bytes sent — one handshake response and not a single probe — and a service
 restart fixing it instantly, because by then every interface existed before
-the routes were installed. Both readbacks now report a nonexistent table as
-no route (`sysx.tableDoesNotExist`); any other failure is still a failure.
-`LinkerRouteVia` had the same hole — a linker whose LAN interface was down at
-agent start failed its first install, never created its table, and its
-reconciler returned on the error every tick — and takes the same answer.
+the routes were installed. Every route readback now goes through
+`sysx.showRoutes`, which reports a nonexistent table as the empty listing it
+is; any other failure is still a failure. It is one helper rather than a check
+at each site because the answer was first missed in three: `RouteVia`,
+`DefaultVia`, `LinkerRouteVia` (a linker whose LAN was down at agent start
+never created its table and its reconciler returned on the error every tick)
+and `cleanAbandonedTable`, where the error kept a stray rule into a table that
+never existed as a "retry marker" forever, through the revert included.
 
 **`Table = off` in every `wg-quick` config.** Otherwise wg-quick installs its
 own route for the peer's AllowedIPs and the three tunnels fight over the same
@@ -1498,6 +1501,10 @@ where a subtle regression would be invisible in production until an outage:
 - `sysx/nft_test.go` — the published ruleset never masquerades; atomic replace;
   both mode-gated tables clamp the TCP MSS on SYNs leaving by a tunnel, scoped
   to the tunnels, and render no clamp with no tunnels;
+- `linker/linker_test.go` also holds that the egress rules go in before the
+  ruleset that starts marking packets, because the backend does it that way
+  round for a reason: a marked packet with no lookup and no refusal leaves by
+  the host's own internet and Docker's masquerade binds the flow there.
   the egress mark leaves private, link-local and multicast destinations on
   their normal route (and `sysx/linker_test.go` holds the same for a linker's
   mark and its SNAT);

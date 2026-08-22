@@ -385,18 +385,16 @@ func ensureUnreachableRule(ctx context.Context, r Runner, mark string, pref int,
 }
 
 // removeUnreachableRule takes one back out, by its pinned priority only.
+//
+// Unconditionally, without reading the listing first: the selector and the
+// priority together name exactly one rule, so there is nothing a listing
+// could add except a way to give up. A revert that skipped this because
+// `ip rule show` failed would leave a refusal standing on a host that had just
+// been told it was clean, and a delete of a rule that is not there is a
+// failed command nobody reads.
 func removeUnreachableRule(ctx context.Context, r Runner, mark string, pref int) {
-	all, err := listRules(ctx, r)
-	if err != nil {
-		return
-	}
-	for _, d := range unreachableRules(all) {
-		if d.mark == mark && d.pref == pref {
-			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "unreachable",
-				"pref", strconv.Itoa(pref))
-			return
-		}
-	}
+	_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "unreachable",
+		"pref", strconv.Itoa(pref))
 }
 
 // denyRulePrefs returns the priorities of this system's unreachable rules
@@ -515,15 +513,12 @@ func ActiveIface(ctx context.Context, r Runner, backendIP string) (string, error
 // fixed it was simply one where every interface existed before the routes
 // were installed.
 func RouteVia(ctx context.Context, r Runner, dstPrefix string, table int) (string, error) {
-	args := []string{"route", "show", dstPrefix}
+	args := []string{dstPrefix}
 	if table > 0 {
 		args = append(args, "table", strconv.Itoa(table))
 	}
-	out, err := r.Run(ctx, "ip", args...)
+	out, err := showRoutes(ctx, r, args...)
 	if err != nil {
-		if tableDoesNotExist(err) {
-			return "", nil
-		}
 		return "", err
 	}
 	return devFrom(out), nil
@@ -532,14 +527,26 @@ func RouteVia(ctx context.Context, r Runner, dstPrefix string, table int) (strin
 // DefaultVia reports which interface the default route in a table points at,
 // or "" when the table has no default route - or no table, see RouteVia.
 func DefaultVia(ctx context.Context, r Runner, table int) (string, error) {
-	out, err := r.Run(ctx, "ip", "route", "show", "default", "table", strconv.Itoa(table))
+	out, err := showRoutes(ctx, r, "default", "table", strconv.Itoa(table))
+	if err != nil {
+		return "", err
+	}
+	return devFrom(out), nil
+}
+
+// showRoutes runs `ip route show ...` and reads a table that has never been
+// written to as the empty listing it is to every caller. Every route readback
+// in this package goes through it, so the answer cannot be learned in one
+// place and missed in the next - which is how it was first missed in three.
+func showRoutes(ctx context.Context, r Runner, args ...string) (string, error) {
+	out, err := r.Run(ctx, "ip", append([]string{"route", "show"}, args...)...)
 	if err != nil {
 		if tableDoesNotExist(err) {
 			return "", nil
 		}
 		return "", err
 	}
-	return devFrom(out), nil
+	return out, nil
 }
 
 // tableDoesNotExist recognises the kernel's answer for a routing table nothing
@@ -1058,17 +1065,8 @@ func RemoveProbeRoutes(ctx context.Context, r Runner, paths []model.PathConfig, 
 			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "lookup", table,
 				"pref", strconv.Itoa(pref))
 		}
-		// The backstop behind it. Left in place it would refuse every packet
-		// carrying this mark, and a host that selects on the same value for
-		// its own policy routing would find that traffic blackholed by a
-		// system it had just uninstalled. By band, not by the marks in the
-		// configuration: a mark that was changed while the agent ran has
-		// already been swept, but one changed while it was stopped has not,
-		// and every rule in the band is this system's to remove.
-		for _, pref := range denyRulePrefs(all, mark) {
-			_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", mark, "unreachable",
-				"pref", strconv.Itoa(pref))
-		}
+		// The refusal behind it comes out with the band sweep below, which
+		// covers this mark along with every other.
 		// The one route this installed, by name, never a flush of the table.
 		// 101 to 103 are numbers this system picked, not property it owns: a
 		// host that already policy-routes may keep its own entries in them, and
@@ -1077,6 +1075,12 @@ func RemoveProbeRoutes(ctx context.Context, r Runner, paths []model.PathConfig, 
 		// RemoveReturnRoutes were already written to.
 		_, _ = r.Run(ctx, "ip", "route", "del", probeDst, "table", table)
 	}
+	// The refusals, by band rather than by the marks in the configuration.
+	// Left in place one would refuse every packet carrying its mark, and a
+	// host that selects on the same value for its own policy routing would
+	// find that traffic blackholed by a system it had just uninstalled. A mark
+	// changed while the agent ran has already been swept; one changed while
+	// it was stopped has not, and every rule in the band is this system's.
 	for _, d := range denyRulesInBand(all) {
 		_, _ = r.Run(ctx, "ip", "rule", "del", "fwmark", d.mark, "unreachable",
 			"pref", strconv.Itoa(d.pref))

@@ -186,12 +186,18 @@ func (l *Linker) installEgress(ctx context.Context, cidrs []string) error {
 			l.boot.Linker.BackendLAN)
 	}
 
+	// Rules first, ruleset second, as the backend does it. The ruleset is what
+	// starts marking packets, and a marked packet with no lookup rule and no
+	// refusal behind it falls through to main and leaves by this host's own
+	// internet, where Docker's masquerade binds the flow to that address for
+	// good. Loading the ruleset first reopened that window on every boot and
+	// every retry, for exactly as long as the two rule adds took.
+	if err := sysx.EnsureLinkerEgressRule(ctx, l.runner, l.boot.Linker.BackendLAN, l.table()); err != nil {
+		return fmt.Errorf("install the egress mark rule: %w", err)
+	}
 	ruleset := sysx.BuildLinkerEgressRuleset(cidrs, iface, l.boot.Linker.OverlayIP, l.boot.Overlay.Subnet)
 	if _, err := sysx.ApplyLinkerEgressRuleset(ctx, l.runner, l.boot.StateDir, ruleset); err != nil {
 		return fmt.Errorf("load the egress source NAT: %w", err)
-	}
-	if err := sysx.EnsureLinkerEgressRule(ctx, l.runner, l.boot.Linker.BackendLAN, l.table()); err != nil {
-		return fmt.Errorf("install the egress mark rule: %w", err)
 	}
 	return nil
 }

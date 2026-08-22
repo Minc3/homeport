@@ -292,7 +292,13 @@ func cleanAbandonedTable(ctx context.Context, r Runner, backendLAN, table string
 	if backendLAN == "" {
 		return true
 	}
-	out, err := r.Run(ctx, "ip", "route", "show", "default", "table", table)
+	// A table that has never been written to does not exist to the kernel
+	// and reads as empty here - see showRoutes. That is not the "cannot be
+	// read" case below: an absent table cannot be holding our route, so the
+	// marker has nothing left to protect. Left standing it would outlive
+	// every reconcile tick and the revert, a rule nothing maintains
+	// steering this host's overlay traffic into a table with no route.
+	out, err := showRoutes(ctx, r, "default", "table", table)
 	if err != nil {
 		return false
 	}
@@ -328,11 +334,8 @@ func EnsureLinkerRoute(ctx context.Context, r Runner, backendLAN string, tbl int
 // first install failed, the table was never created, and the reconciler would
 // have skipped the repair on the error every tick from then on.
 func LinkerRouteVia(ctx context.Context, r Runner, tbl int) (string, error) {
-	out, err := r.Run(ctx, "ip", "route", "show", "default", "table", strconv.Itoa(tbl))
+	out, err := showRoutes(ctx, r, "default", "table", strconv.Itoa(tbl))
 	if err != nil {
-		if tableDoesNotExist(err) {
-			return "", nil
-		}
 		return "", err
 	}
 	return gatewayFrom(out), nil

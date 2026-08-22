@@ -28,6 +28,16 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 
 func (f *fakeRunner) Applying() bool { return true }
 
+// index reports the position of the first call containing substr, or -1.
+func (f *fakeRunner) index(substr string) int {
+	for i, c := range f.calls {
+		if strings.Contains(c, substr) {
+			return i
+		}
+	}
+	return -1
+}
+
 func (f *fakeRunner) ran(substr string) bool {
 	for _, c := range f.calls {
 		if strings.Contains(c, substr) {
@@ -397,6 +407,16 @@ func TestAFailedEgressInstallIsRetriedRatherThanRemembered(t *testing.T) {
 	}
 	if !l.egressOK {
 		t.Error("a successful retry was not recorded, so it will run again every tick")
+	}
+
+	// Rules before the ruleset, as on the backend. The ruleset is what starts
+	// marking packets, and a marked packet with no lookup rule and no refusal
+	// behind it leaves by this host's own internet, where Docker's masquerade
+	// binds the flow to that address for good. Loading the ruleset first
+	// reopened that window on every boot and every retry.
+	lookup, refusal, ruleset := f.index("ip rule add fwmark 0x301 lookup"), f.index("ip rule add fwmark 0x301 unreachable"), f.index("nft -f")
+	if lookup < 0 || refusal < 0 || ruleset < 0 || lookup > ruleset || refusal > ruleset {
+		t.Errorf("the ruleset was loaded before the rules that route what it marks; calls were %v", f.calls)
 	}
 }
 

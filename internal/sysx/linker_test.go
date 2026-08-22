@@ -527,7 +527,7 @@ func TestAStrayIsKeptWhileItsTableCannotBeRead(t *testing.T) {
 				pinned + ":\tfrom 10.99.0.3 lookup 200\n",
 		},
 		fail: map[string]string{
-			"ip route show default table 200": "Error: ipv4: FIB table does not exist.",
+			"ip route show default table 200": "RTNETLINK answers: Operation not permitted",
 		},
 	}
 	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", "192.168.1.2", 220); err != nil {
@@ -535,6 +535,36 @@ func TestAStrayIsKeptWhileItsTableCannotBeRead(t *testing.T) {
 	}
 	if f.ran("ip rule del from 10.99.0.3 lookup 200") {
 		t.Errorf("the marker rule was deleted although its table could not be read: %v", f.calls)
+	}
+}
+
+// A table that does not exist is not one that cannot be read. The kernel says
+// "FIB table does not exist" for a table nothing has ever written to - a
+// linker bootstrapped with one table number while its LAN was down, then
+// moved to another - and such a table cannot be holding our route, so the
+// marker has nothing left to protect. Kept, it outlived every reconcile tick
+// and the revert: a rule nothing maintained, steering this host's overlay
+// traffic into a table with no route in it.
+func TestAStrayIsSweptWhenItsTableNeverExisted(t *testing.T) {
+	pinned := strconv.Itoa(LinkerRulePrefBase)
+	f := &fakeRunner{
+		replies: map[string]string{
+			"ip rule show table 220": pinned + ":\tfrom 10.99.0.3 lookup 220\n",
+			"ip rule show": pinned + ":\tfrom 10.99.0.3 lookup 220\n" +
+				pinned + ":\tfrom 10.99.0.3 lookup 300\n",
+		},
+		fail: map[string]string{
+			"ip route show default table 300": "Error: ipv4: FIB table does not exist.\nDump terminated",
+		},
+	}
+	if err := EnsureLinkerRule(context.Background(), f, "10.99.0.3", "192.168.1.2", 220); err != nil {
+		t.Fatalf("EnsureLinkerRule: %v", err)
+	}
+	if !f.ran("ip rule del from 10.99.0.3 lookup 300 pref " + pinned) {
+		t.Errorf("the stray into a table that never existed was kept: %v", f.calls)
+	}
+	if f.ran("ip route del default") {
+		t.Errorf("a route was deleted from a table that does not exist: %v", f.calls)
 	}
 }
 
