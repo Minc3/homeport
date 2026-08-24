@@ -2,7 +2,7 @@
 #
 # Install a failover linker on this host.
 #
-#   git clone <repo> && cd homeport
+#   git clone https://github.com/Minc3/homeport.git && cd homeport
 #   sudo ./deploy/install-linker.sh --psk <the frontend's psk> \
 #        --overlay-ip 10.99.0.3 --backend-lan 192.168.1.2
 #

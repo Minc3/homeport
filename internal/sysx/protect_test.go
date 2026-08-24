@@ -233,12 +233,16 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 			"elem": [{"elem": {"val": "198.51.100.7", "expires": 421}}, "203.0.113.9"]}},
 		{"set": {"name": "geo_lockdown_udp", "table": "failover_protect",
 			"elem": [{"elem": {"val": 27015, "expires": 42}}]}},
+		{"set": {"name": "geo_lockdown_eu", "table": "failover_protect",
+			"elem": [25565]}},
 		{"rule": {"chain": "filter", "comment": "packet-rate",
 			"expr": [{"match": {}}, {"counter": {"packets": 1200, "bytes": 96000}}, {"drop": null}]}},
 		{"rule": {"chain": "raw", "comment": "bogus-tcp",
 			"expr": [{"counter": {"packets": 3, "bytes": 180}}, {"drop": null}]}},
 		{"rule": {"chain": "raw", "comment": "bogus-tcp",
 			"expr": [{"counter": {"packets": 5, "bytes": 300}}, {"drop": null}]}},
+		{"rule": {"chain": "raw", "comment": "geo-trip:minecraft",
+			"expr": [{"counter": {"packets": 7, "bytes": 420}}]}},
 		{"rule": {"chain": "raw", "comment": "blocked",
 			"expr": [{"counter": {"packets": 4, "bytes": 240}}, {"drop": null}]}}
 	]}`
@@ -249,25 +253,38 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 	}
 	// An engaged region lock looks exactly like the service being down to
 	// everyone outside the region, so it has to read back out of the kernel
-	// with the counters - the set is where the truth lives.
+	// with the counters - the set is where the truth lives. Matched on the
+	// two exact names the generator emits: geo_lockdown_eu above is what a
+	// region named "lockdown_eu" renders to, an operator's set in the same
+	// namespace, and reading it as lock state would surface phantom locks for
+	// a protocol called "eu".
 	if len(locked) != 1 || locked[0].Proto != "udp" || locked[0].Port != 27015 || locked[0].ExpiresSec != 42 {
 		t.Errorf("engaged locks read as %+v, want udp/27015 releasing in 42s", locked)
 	}
 	// One limit is often several rules - the bogus-TCP filter alone is seven -
 	// and they must come back as one figure per limit, not a card per rule:
 	// seven identical zero tiles is what this looked like before.
-	if len(counters) != 3 {
-		t.Fatalf("read %d counters, want 3 (one per distinct comment): %+v", len(counters), counters)
+	if len(counters) != 4 {
+		t.Fatalf("read %d counters, want 4 (one per distinct comment): %+v", len(counters), counters)
 	}
-	byName := map[string]int64{}
+	byName := map[string]model.ProtectCounter{}
 	for _, c := range counters {
-		byName[c.Name] = c.Packets
+		byName[c.Name] = c
 	}
-	if byName["packet-rate"] != 1200 {
-		t.Errorf("packet-rate counter read as %d", byName["packet-rate"])
+	if byName["packet-rate"].Packets != 1200 {
+		t.Errorf("packet-rate counter read as %d", byName["packet-rate"].Packets)
 	}
-	if byName["bogus-tcp"] != 8 {
-		t.Errorf("two bogus-tcp rules summed to %d packets, want 8", byName["bogus-tcp"])
+	if byName["bogus-tcp"].Packets != 8 {
+		t.Errorf("two bogus-tcp rules summed to %d packets, want 8", byName["bogus-tcp"].Packets)
+	}
+	// The trip counter observes the auto-lock threshold and drops nothing;
+	// the portal's "packets dropped" total reads this flag rather than
+	// sniffing the counter's name, so it has to be right here.
+	if byName["geo-trip:minecraft"].Drops {
+		t.Errorf("the auto-lock trip counter reads as a drop counter")
+	}
+	if !byName["packet-rate"].Drops || !byName["bogus-tcp"].Drops || !byName["blocked"].Drops {
+		t.Errorf("a drop counter reads as observing only: %+v", counters)
 	}
 	if len(blocked) != 2 {
 		t.Fatalf("read %d blocked sources, want 2: %+v", len(blocked), blocked)
@@ -472,6 +489,65 @@ func TestADanglingRegionReferenceLocksNothing(t *testing.T) {
 	}
 	if got := BuildProtectRuleset(ProtectSpecFrom(cfg)); got != "" {
 		t.Errorf("a dangling region reference generated rules:\n%s", got)
+	}
+}
+
+// The fail-open rule holds per reference, not per service. An allow lock is
+// one rule ANDing negated lookups, so emitting it for just the references
+// that resolve would silently narrow the allowlist - fail closed for exactly
+// the players the missing region was meant to admit. Any dangling reference
+// on an allow lock therefore means no rule for that service. The block
+// direction is the opposite shape, a rule per region, so dropping only what
+// resolves is the fail-open answer there: the resolved regions keep their
+// rules and the dangling one simply drops nothing.
+func TestAPartlyDanglingAllowLockLocksNothing(t *testing.T) {
+	cfg := geoCfg()
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoRegions = []string{"oceania", "atlantis"}
+		}
+	}
+	if got := BuildProtectRuleset(ProtectSpecFrom(cfg)); got != "" {
+		t.Errorf("a partly dangling allow lock generated rules, which can only be stricter than what was configured:\n%s", got)
+	}
+
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoBlock = true
+		}
+	}
+	got := BuildProtectRuleset(ProtectSpecFrom(cfg))
+	want := `tcp dport 25565 ip saddr @geo_oceania counter drop comment "geo:minecraft"`
+	if !strings.Contains(got, want) {
+		t.Errorf("a partly dangling block lock lost its resolved region; want %q in:\n%s", want, got)
+	}
+}
+
+// Region sets share the geo_ namespace with the per-protocol lockdown sets,
+// so a region named "lockdown-tcp" folds onto the set the automatic lock
+// writes to - two definitions of one name with two different types, and nft
+// rejects the whole table over it, every other limit included. web.validate
+// refuses the name at save; an older blob carrying one has its region set
+// shifted out of the way instead, so both the lock and the region still work.
+func TestARegionNamedLikeTheLockdownSetCannotCollide(t *testing.T) {
+	cfg := geoCfg()
+	cfg.Protect.Regions[0].Name = "lockdown-tcp"
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoRegions = []string{"lockdown-tcp"}
+			cfg.Services[i].GeoAutoPPS = 50000
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	if n := strings.Count(ruleset, "set geo_lockdown_tcp {"); n != 1 {
+		t.Errorf("the lockdown set is defined %d times, which nft refuses to load:\n%s", n, ruleset)
+	}
+	if !strings.Contains(ruleset, "set geo_lockdown_tcp_ {") {
+		t.Errorf("the colliding region's set was not shifted aside:\n%s", ruleset)
+	}
+	if !strings.Contains(ruleset, "ip saddr != @geo_lockdown_tcp_ ") {
+		t.Errorf("the lock rule does not reference the shifted set:\n%s", ruleset)
 	}
 }
 

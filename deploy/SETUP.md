@@ -295,7 +295,7 @@ restart to correct afterwards.
 ### 4.2 Run the installer
 
 ```sh
-git clone <repo> homeport && cd homeport
+git clone https://github.com/Minc3/homeport.git && cd homeport
 sudo ./deploy/install-frontend.sh
 ```
 
@@ -346,7 +346,7 @@ bootstrap file is never rewritten without `--force-config`.
 Run this on the box at the house, with the secret step 4 printed.
 
 ```sh
-git clone <repo> homeport && cd homeport
+git clone https://github.com/Minc3/homeport.git && cd homeport
 sudo ./deploy/install-backend.sh --psk <the value the frontend printed>
 ```
 
@@ -620,7 +620,9 @@ must be enabled for any of this to exist.
    about a minute after it stops (**Auto-lock release** tunes that). Set the
    threshold above the busiest legitimate moment you have measured, because
    in-region traffic counts towards it too. Engaged locks are announced on the
-   dashboard.
+   dashboard. Saving the configuration reloads the rules, which releases an
+   engaged lock until the flood trips it again - like the counters resetting,
+   a property of the reload - so hold off saving mid-attack.
 
 It matches where an address is allocated, not where a player is: a VPN
 endpoint inside the region walks straight through. It keeps a server regional

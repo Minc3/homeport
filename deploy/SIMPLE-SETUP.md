@@ -77,7 +77,7 @@ Check `wg show` on the backend: three recent handshakes.
 Frontend (admin tunnel up first: `ip -4 addr show wg-admin`):
 
 ```sh
-git clone <repo> homeport && cd homeport
+git clone https://github.com/Minc3/homeport.git && cd homeport
 sudo ./deploy/install-frontend.sh
 ```
 
@@ -86,7 +86,7 @@ Keep the three things it prints: shared secret, portal address, password.
 Backend:
 
 ```sh
-git clone <repo> homeport && cd homeport
+git clone https://github.com/Minc3/homeport.git && cd homeport
 sudo ./deploy/install-backend.sh --psk <the secret>
 ```
 

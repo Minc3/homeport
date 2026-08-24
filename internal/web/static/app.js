@@ -478,10 +478,12 @@ function renderProtect(p) {
   if (!counters.length) {
     body.append(el('p', { class: 'hint', text: 'Rules are loaded and nothing has been dropped yet.' }));
   } else {
-    // geo-trip counts packets over an auto-lock threshold, which are not
-    // themselves dropped (the drop is the geo counter beside it), so it is
-    // shown but kept out of a total labelled "dropped".
-    const total = counters.reduce((n, c) => n + (c.name.startsWith('geo-trip') ? 0 : c.packets), 0);
+    // The trip counter counts packets over an auto-lock threshold, which are
+    // not themselves dropped (the drop is the geo counter beside it), so it
+    // is shown but kept out of a total labelled "dropped". Which counters
+    // drop is the API's `drops` flag, decided where the rules are generated,
+    // not sniffed off the counter's name here.
+    const total = counters.reduce((n, c) => n + (c.drops ? c.packets : 0), 0);
     body.append(el('div', { class: 'metrics' }, ...counters.map((c) => {
       const [label, tip] = counterInfo(c.name);
       return el('div', { class: 'metric', title: tip },
@@ -502,7 +504,8 @@ function renderProtect(p) {
   for (const l of locked) {
     body.append(el('div', { class: 'alert info' },
       el('p', { text: `Region lock engaged on ${l.proto}/${l.port}: traffic to it exceeded the auto-lock threshold, and the sources its lock bars are being dropped. `
-        + (l.expires_sec ? `Releases in ${l.expires_sec}s unless the flood is still refreshing it.` : 'Releasing shortly.') }),
+        + (l.expires_sec ? `Releases in ${l.expires_sec}s unless the flood is still refreshing it.` : 'Releasing shortly.')
+        + ' Saving the configuration reloads the rules and releases the lock too, until the flood trips it again; best not to save mid-attack.' }),
     ));
   }
 
@@ -668,11 +671,25 @@ function updateGeoWarn() {
 }
 
 // 'input' catches typing, 'change' the dropdowns and checkboxes, 'click' the
-// Add and Remove buttons.
-for (const evt of ['input', 'change', 'click']) {
+// Add and Remove buttons. Typing is debounced: a fetched country list puts
+// tens of thousands of networks in the config, and sameConfig walks all of
+// them, so running it on every keystroke made the whole settings form pay a
+// per-key cost proportional to region size. 'change' and 'click' stay
+// immediate - they are single actions, and 'change' fires on blur, so the
+// badge is always right by the time a Save can be clicked. The geo warning
+// only reads dropdowns, enable boxes and the Protection switch, all of which
+// speak through 'change' and 'click', so it skips typing entirely.
+{
   const form = document.getElementById('settings-form');
-  form.addEventListener(evt, updateDirty);
-  form.addEventListener(evt, updateGeoWarn);
+  let dirtyTimer = 0;
+  form.addEventListener('input', () => {
+    clearTimeout(dirtyTimer);
+    dirtyTimer = setTimeout(updateDirty, 250);
+  });
+  for (const evt of ['change', 'click']) {
+    form.addEventListener(evt, updateDirty);
+    form.addEventListener(evt, updateGeoWarn);
+  }
 }
 
 // Closing or reloading the page with edits pending gets the browser's own
@@ -817,30 +834,38 @@ function serviceRow(s, c, onRemove) {
 function regionSelect(s, c, onChange) {
   // Each region offers both directions: "only x" admits that region and drops
   // the rest of the world, "block x" drops that region and admits the rest.
-  // A leading ! on the option value carries the direction; the stored config
-  // keeps them apart as geo_regions plus geo_block.
-  const names = (s.geo_regions || []).join(', ');
-  const value = s.geo_block && names ? '!' + names : names;
+  // The option value is a JSON pair [direction, names] rather than a
+  // delimited string: validate forbids '!' and ',' in region names, but a
+  // hand-edited blob is not bound by validate, and a name carrying either
+  // would make a character-based encoding parse back as the wrong direction
+  // or the wrong regions - and the next save would write that misreading into
+  // the config. JSON round-trips whatever is stored, and building both sides
+  // through the one encoder keeps the string comparison exact.
+  const enc = (block, names) => JSON.stringify([block ? 1 : 0, names]);
+  const names = s.geo_regions || [];
+  const value = enc(s.geo_block && names.length > 0, names);
+  const anywhere = enc(false, []);
   const sel = el('select', {});
-  sel.append(el('option', { value: '', text: 'anywhere' }));
-  const known = new Set(['']);
+  sel.append(el('option', { value: anywhere, text: 'anywhere' }));
+  const known = new Set([anywhere]);
   for (const r of (c.protect && c.protect.regions) || []) {
-    if (!r.name || known.has(r.name)) continue;
-    known.add(r.name);
-    known.add('!' + r.name);
-    sel.append(el('option', { value: r.name, text: `only ${r.name}` }));
-    sel.append(el('option', { value: '!' + r.name, text: `block ${r.name}` }));
+    if (!r.name || known.has(enc(false, [r.name]))) continue;
+    known.add(enc(false, [r.name]));
+    known.add(enc(true, [r.name]));
+    sel.append(el('option', { value: enc(false, [r.name]), text: `only ${r.name}` }));
+    sel.append(el('option', { value: enc(true, [r.name]), text: `block ${r.name}` }));
   }
-  if (value && !known.has(value)) {
-    const prefix = s.geo_block ? 'block' : 'only';
-    const label = names.includes(',') ? `${prefix} ${names} (several regions)` : `${prefix} ${names} (no such region)`;
+  if (!known.has(value)) {
+    const prefix = s.geo_block && names.length ? 'block' : 'only';
+    const joined = names.join(', ');
+    const label = names.length > 1 ? `${prefix} ${joined} (several regions)` : `${prefix} ${joined} (no such region)`;
     sel.append(el('option', { value, text: label }));
   }
   sel.value = value;
   sel.addEventListener('change', () => {
-    const block = sel.value.startsWith('!');
-    const list = sel.value.replace(/^!/, '').split(',').map((t) => t.trim()).filter(Boolean);
-    onChange(list, block && list.length > 0);
+    const [block, list] = JSON.parse(sel.value);
+    const clean = list.filter(Boolean);
+    onChange(clean, !!block && clean.length > 0);
   });
   return sel;
 }
@@ -856,18 +881,33 @@ function regionSelect(s, c, onChange) {
 function regionRow(r, onRemove, onChange) {
   const ta = el('textarea', { rows: 4, placeholder: '1.128.0.0/11\n101.160.0.0/11\n…' });
   ta.value = (r.cidrs || []).join('\n');
-  ta.addEventListener('input', () => {
+  // A fetched country list is tens of thousands of lines, and re-splitting
+  // the whole textarea on every keystroke made hand-editing one entry lag on
+  // exactly the field built for huge pastes. Debounced while typing; 'change'
+  // fires on blur, which is always before a Save can be clicked, so the
+  // parsed list can never be behind the screen at the moment it is read.
+  const parseTA = () => {
     r.cidrs = ta.value.split(/[\s,]+/).map((t) => t.trim()).filter(Boolean);
+  };
+  let taTimer = 0;
+  ta.addEventListener('input', () => {
+    clearTimeout(taTimer);
+    taTimer = setTimeout(() => { parseTA(); updateDirty(); }, 400);
   });
+  ta.addEventListener('change', () => { clearTimeout(taTimer); parseTA(); });
 
+  // One recipe for reading the codes field, shared by the remembering
+  // listener and the Fetch click, so what the button sends can never drift
+  // from what is stored and validated on save.
+  const parseCodes = (v) => v.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
   const codes = el('input', { type: 'text', placeholder: 'au, nz', value: (r.countries || []).join(', ') });
   codes.addEventListener('input', () => {
-    r.countries = codes.value.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
+    r.countries = parseCodes(codes.value);
   });
   const fetchBtn = el('button', {
     class: 'btn', type: 'button',
     onclick: async () => {
-      const countries = codes.value.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
+      const countries = parseCodes(codes.value);
       if (!countries.length) { toast('Name the country codes to fetch, e.g. au, nz', true); return; }
       fetchBtn.disabled = true;
       fetchBtn.textContent = 'Fetching…';

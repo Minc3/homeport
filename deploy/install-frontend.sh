@@ -2,7 +2,7 @@
 #
 # Install the failover frontend on this host (the datacentre box).
 #
-#   git clone <repo> && cd homeport
+#   git clone https://github.com/Minc3/homeport.git && cd homeport
 #   sudo ./deploy/install-frontend.sh
 #
 # Re-running is safe: binaries and the unit file are replaced, an existing

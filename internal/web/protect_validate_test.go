@@ -177,6 +177,51 @@ func TestABadRegionNetworkIsRefused(t *testing.T) {
 	}
 }
 
+// An IPv4-mapped IPv6 network passes a bare To4 test, but String() renders it
+// with a 128-bit mask length ("1.128.0.0/120") - a value the generator skips
+// in silence, so the lock saves and does not exist, and a later ParseCIDR
+// refuses outright, so validate then rejects a string it wrote itself and
+// blocks every unrelated save until the region is hand-edited. Refused whole.
+func TestAnIPv4MappedRegionNetworkIsRefused(t *testing.T) {
+	cfg := geoBase()
+	cfg.Protect.Regions[0].CIDRs = []string{"::ffff:1.128.0.0/120"}
+	if err := validate(&cfg); err == nil {
+		t.Fatal("an IPv4-mapped IPv6 network was accepted into an ip-family table")
+	}
+	// The same hole existed in the egress source check, which feeds the same
+	// family of generated rulesets and shares the helper.
+	cfg = geoBase()
+	cfg.Egress.Sources[0].CIDR = "::ffff:172.18.0.0/112"
+	if err := validate(&cfg); err == nil {
+		t.Fatal("an IPv4-mapped IPv6 network was accepted as an egress source")
+	}
+}
+
+// The per-protocol lockdown sets live in the same namespace as the region
+// sets, so a region name that folds onto one of theirs would define the set
+// twice with two different types - and nft rejects the whole table, every
+// other limit included. The generator shifts a stale blob's set aside; here,
+// where the operator can still pick another name, the name is refused.
+func TestARegionNameReservedByTheLockdownSetsIsRefused(t *testing.T) {
+	for _, name := range []string{"lockdown_tcp", "lockdown-tcp", "lockdown_udp", "lockdown-udp"} {
+		cfg := geoBase()
+		cfg.Protect.Regions[0].Name = name
+		for i := range cfg.Services {
+			if cfg.Services[i].Name == "minecraft" {
+				cfg.Services[i].GeoRegions = []string{name}
+			}
+		}
+		err := validate(&cfg)
+		if err == nil {
+			t.Errorf("reserved region name %q was accepted", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("the error does not say the name is reserved: %v", err)
+		}
+	}
+}
+
 // Region names become nftables set names, where a hyphen folds to an
 // underscore - so two names the fold makes identical are one set defined
 // twice, and nft refuses the table.

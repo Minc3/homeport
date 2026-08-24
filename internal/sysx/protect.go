@@ -89,7 +89,14 @@ func (s ProtectSpec) geoLockSeconds() int {
 // active reports whether anything at all would be generated. A spec with the
 // switch on but every threshold at zero is a table with no rules in it, and
 // loading that is a worse answer than loading nothing.
-func (s ProtectSpec) active() bool {
+//
+// It takes the resolved geo services rather than computing them, because its
+// one caller needs them again to render the rules: merging every region's
+// list is the expensive part of a build (a fetched country is tens of
+// thousands of networks, parsed and sorted), it runs under the engine's apply
+// lock, and two independent computations of "a live geo service" would be two
+// definitions a future edit can move apart.
+func (s ProtectSpec) active(geoSvcs []ProtectService) bool {
 	if s.PublicIface == "" {
 		return false
 	}
@@ -107,10 +114,7 @@ func (s ProtectSpec) active() bool {
 			return true
 		}
 	}
-	if len(s.geoServices(s.geoRegionElems())) > 0 {
-		return true
-	}
-	return false
+	return len(geoSvcs) > 0
 }
 
 // geoRegionElems merges each region's networks into the elements its set will
@@ -127,31 +131,68 @@ func (s ProtectSpec) geoRegionElems() map[string][]string {
 	return out
 }
 
-// geoServices lists the services whose lock resolves to at least one real
-// set. A service whose every region reference dangles - a name no region
-// carries, or one whose list is empty - gets no rule at all rather than a
-// drop-everything: web.validate refuses both states at save time, so meeting
-// one here means an older or hand-edited blob, and inventing a total drop for
-// it would take a published service down in silence.
+// geoServices lists the services whose lock resolves to real sets. A dangling
+// reference - a name no region carries, or one whose list is empty - means an
+// older or hand-edited blob, because web.validate refuses both states at save
+// time, and the fail-open answer differs by direction. An allow lock is one
+// rule ANDing negated lookups, so dropping just the dangling reference would
+// silently narrow the allowlist and bar every player the missing region was
+// meant to admit: any dangling reference therefore takes the whole lock with
+// it, no rule rather than a stricter one. A block lock is a rule per region,
+// so a dangling reference simply drops less: the resolved regions keep their
+// rules. Either way no drop is invented that the operator did not configure.
 func (s ProtectSpec) geoServices(elems map[string][]string) []ProtectService {
 	var out []ProtectService
 	for _, sv := range s.Services {
+		if len(sv.GeoRegions) == 0 {
+			continue
+		}
+		resolved := 0
 		for _, name := range sv.GeoRegions {
 			if len(elems[name]) > 0 {
-				out = append(out, sv)
-				break
+				resolved++
 			}
+		}
+		if sv.GeoBlock && resolved > 0 {
+			out = append(out, sv)
+		} else if !sv.GeoBlock && resolved == len(sv.GeoRegions) {
+			out = append(out, sv)
 		}
 	}
 	return out
 }
 
-// geoSetName is the nftables set a region renders to. Validation holds region
+// GeoSetName is the nftables set a region renders to. Validation holds region
 // names to characters nft accepts in an identifier, but the ruleset must stay
 // loadable whatever an older or hand-edited blob carries, so anything else is
 // folded to an underscore here rather than handed to nft to refuse - which
 // would reject the whole table, every other limit included.
-func geoSetName(name string) string {
+//
+// Exported because web.validate keys its collision check on it: two names are
+// one set exactly when this says so, and a second copy of the fold in another
+// package is the two definitions drifting apart waiting to happen.
+//
+// The lockdown sets live in the same geo_ namespace, so a region that folds
+// onto one of their names ("lockdown-tcp", "lockdown_udp") would define the
+// set twice with two different types, and nft rejects the whole table over
+// it. GeoNameReserved lets validate refuse the name at save; here, where the
+// blob may predate that check, the region's set is shifted out of the way
+// instead, so the lock sets stay theirs and the region still renders.
+func GeoSetName(name string) string {
+	if folded := foldGeoName(name); !geoNameFoldsToLockSet(folded) {
+		return folded
+	}
+	return foldGeoName(name) + "_"
+}
+
+// GeoNameReserved reports whether a region name folds onto a set name the
+// generator writes for itself, which validate refuses with a message rather
+// than letting GeoSetName silently shift it.
+func GeoNameReserved(name string) bool {
+	return geoNameFoldsToLockSet(foldGeoName(name))
+}
+
+func foldGeoName(name string) string {
 	var sb strings.Builder
 	sb.WriteString("geo_")
 	for _, r := range strings.ToLower(name) {
@@ -162,6 +203,10 @@ func geoSetName(name string) string {
 		}
 	}
 	return sb.String()
+}
+
+func geoNameFoldsToLockSet(folded string) bool {
+	return folded == geoLockSetName("tcp") || folded == geoLockSetName("udp")
 }
 
 // geoLockSetName is the dynamic set holding the ports whose automatic region
@@ -372,7 +417,11 @@ const (
 // BuildProtectRuleset renders the edge filtering table, or "" when there is
 // nothing switched on.
 func BuildProtectRuleset(spec ProtectSpec) string {
-	if !spec.active() {
+	// Resolved once, shared by the emptiness check and the rule emission
+	// below; see active for why this is not computed twice.
+	geoElems := spec.geoRegionElems()
+	geoSvcs := spec.geoServices(geoElems)
+	if !spec.active(geoSvcs) {
 		return ""
 	}
 	iface := spec.PublicIface
@@ -430,8 +479,6 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	// become sets: an unreferenced region is a draft in the portal, not a
 	// rule, and a set nothing consults is dead weight the kernel still has to
 	// hold. Order follows the services so the output is stable across saves.
-	geoElems := spec.geoRegionElems()
-	geoSvcs := spec.geoServices(geoElems)
 	var geoOrder []string
 	seenGeo := map[string]bool{}
 	for _, sv := range geoSvcs {
@@ -444,14 +491,14 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 			// twice rejects the whole table - the exact failure the folding
 			// exists to prevent. validate refuses the collision at save; an
 			// older blob carrying one gets the first region's list.
-			if set := geoSetName(name); !seenGeo[set] {
+			if set := GeoSetName(name); !seenGeo[set] {
 				seenGeo[set] = true
 				geoOrder = append(geoOrder, name)
 			}
 		}
 	}
 	for _, name := range geoOrder {
-		fmt.Fprintf(&b, "\tset %s {\n", geoSetName(name))
+		fmt.Fprintf(&b, "\tset %s {\n", GeoSetName(name))
 		b.WriteString("\t\ttype ipv4_addr\n")
 		// interval, because the elements are networks; without the flag a
 		// CIDR element is refused and the whole table with it.
@@ -545,7 +592,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 					}
 					fmt.Fprintf(&b, "\t\t%s dport %s %sip saddr @%s counter drop comment %q\n",
 						sv.Proto, portSpec(sv.Port, sv.PortEnd), lockCond,
-						geoSetName(name), CounterGeo+":"+sv.Name)
+						GeoSetName(name), CounterGeo+":"+sv.Name)
 				}
 				continue
 			}
@@ -554,7 +601,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 			var matches strings.Builder
 			for _, name := range sv.GeoRegions {
 				if len(geoElems[name]) > 0 {
-					fmt.Fprintf(&matches, "ip saddr != @%s ", geoSetName(name))
+					fmt.Fprintf(&matches, "ip saddr != @%s ", GeoSetName(name))
 				}
 			}
 			fmt.Fprintf(&b, "\t\t%s dport %s %s%scounter drop comment %q\n",
@@ -715,7 +762,15 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 					continue
 				}
 				counterIdx[rule.Comment] = len(counters)
-				counters = append(counters, model.ProtectCounter{Name: rule.Comment, Packets: c.Packets, Bytes: c.Bytes})
+				// The trip counter observes the auto-lock threshold being
+				// crossed and drops nothing; every other counter here sits on
+				// a drop rule. Decided by the exact kind before the colon,
+				// because "geo" is itself a prefix of "geo-trip".
+				kind, _, _ := strings.Cut(rule.Comment, ":")
+				counters = append(counters, model.ProtectCounter{
+					Name: rule.Comment, Packets: c.Packets, Bytes: c.Bytes,
+					Drops: kind != CounterGeoTrip,
+				})
 			}
 		}
 		if set := item.Set; set != nil {
@@ -726,7 +781,14 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 					}
 				}
 			}
-			if proto, ok := strings.CutPrefix(set.Name, "geo_lockdown_"); ok {
+			// Matched on the two exact names the generator emits, never on the
+			// prefix: region sets share the geo_ namespace, so a region named
+			// "lockdown_eu" would otherwise be scanned as lock state for a
+			// protocol called "eu".
+			for _, proto := range []string{"tcp", "udp"} {
+				if set.Name != geoLockSetName(proto) {
+					continue
+				}
 				for _, raw := range set.Elem {
 					if p, ok := parseLockedElem(raw); ok {
 						p.Proto = proto

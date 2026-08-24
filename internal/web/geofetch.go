@@ -1,12 +1,13 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -44,6 +45,11 @@ const geoFetchMaxBytes = 4 << 20
 // outbound request.
 const geoFetchMaxCountries = 24
 
+// geoFetchParallel is how many of those requests are in flight at once:
+// enough that a worst-case fetch is bounded by a few timeouts rather than
+// one per code, small enough to be polite to a host serving static files.
+const geoFetchParallel = 4
+
 type geoFetchRequest struct {
 	Countries []string `json:"countries"`
 }
@@ -71,8 +77,12 @@ func (s *Server) handleGeoFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var cidrs []string
-	var counts []geoFetchCount
+	// Every code is checked before anything goes near a URL - a whole first
+	// pass, not a check inside the fetch loop, so a bad code in any position
+	// is refused with zero requests sent rather than after the codes ahead of
+	// it were already fetched. Everything that is not a country code is
+	// refused, not escaped.
+	codes := make([]string, 0, len(req.Countries))
 	seen := map[string]bool{}
 	for _, cc := range req.Countries {
 		cc = strings.ToLower(trimmed(cc))
@@ -80,34 +90,88 @@ func (s *Server) handleGeoFetch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[cc] = true
-		// Two lowercase letters and nothing else, checked before the code goes
-		// anywhere near a URL. Everything that is not a country code is
-		// refused, not escaped.
 		if bad := badCountryCode(cc); bad != "" {
 			clientErr(w, fmt.Errorf("%q is not an ISO country code: %s", cc, bad))
 			return
 		}
-		list, err := s.fetchCountry(cc)
-		if err != nil {
-			// 502 rather than 400: the operator's input was fine, the world
-			// was not, and the fix is to retry or to paste by hand.
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
-			return
-		}
-		cidrs = append(cidrs, list...)
-		counts = append(counts, geoFetchCount{Country: cc, Networks: len(list)})
+		codes = append(codes, cc)
 	}
-	if len(cidrs) == 0 {
+	if len(codes) == 0 {
 		clientErr(w, fmt.Errorf("no country codes left after trimming"))
 		return
+	}
+
+	// The fetches are independent, so they run together rather than in
+	// series: serial, an unreachable host cost 10 seconds per code before the
+	// first error surfaced, minutes for a generous region. Bounded, because
+	// two dozen sockets at once buys nothing from one static host. Tied to
+	// the request context so an operator who gives up and closes the tab
+	// cancels the downloads instead of leaving them running for a reply
+	// nobody will read; the first failure cancels the rest the same way.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	lists := make([][]string, len(codes))
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		fetchErr error
+	)
+	sem := make(chan struct{}, geoFetchParallel)
+	for i, cc := range codes {
+		wg.Add(1)
+		go func(i int, cc string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
+			list, err := s.fetchCountry(ctx, cc)
+			if err != nil {
+				mu.Lock()
+				// The first error is the root cause; anything after it is
+				// mostly the cancellation it triggered.
+				if fetchErr == nil {
+					fetchErr = err
+				}
+				mu.Unlock()
+				cancel()
+				return
+			}
+			lists[i] = list
+		}(i, cc)
+	}
+	wg.Wait()
+	if fetchErr != nil {
+		// 502 rather than 400: the operator's input was fine, the world
+		// was not, and the fix is to retry or to paste by hand.
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fetchErr.Error()})
+		return
+	}
+	if ctx.Err() != nil {
+		// The client is gone; nobody is listening for a body.
+		return
+	}
+
+	// Indexed by position above, so the merged list and the counts come back
+	// in request order whatever order the fetches finished in.
+	var cidrs []string
+	counts := make([]geoFetchCount, 0, len(codes))
+	for i, cc := range codes {
+		cidrs = append(cidrs, lists[i]...)
+		counts = append(counts, geoFetchCount{Country: cc, Networks: len(lists[i])})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"cidrs": cidrs, "counts": counts})
 }
 
 // fetchCountry downloads and checks one country's list.
-func (s *Server) fetchCountry(cc string) ([]string, error) {
+func (s *Server) fetchCountry(ctx context.Context, cc string) ([]string, error) {
 	url := s.geoBase + "/" + cc + "-aggregated.zone"
-	resp, err := s.geoClient.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not fetch the list for %q: %v", cc, err)
+	}
+	resp, err := s.geoClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("could not fetch the list for %q: %v", cc, err)
 	}
@@ -136,8 +200,9 @@ func (s *Server) fetchCountry(cc string) ([]string, error) {
 		}
 		// Every line must be an IPv4 network or the whole fetch fails: an
 		// error page with a 200 on it is the classic shape of this going
-		// wrong, and it must not become an allowlist.
-		if _, netw, err := net.ParseCIDR(line); err != nil || netw.IP.To4() == nil {
+		// wrong, and it must not become an allowlist. The same test validate
+		// applies on save, so a list this accepts cannot be refused there.
+		if _, err := parseIPv4Network(line); err != nil {
 			return nil, fmt.Errorf("the list for %q contains %q, which is not an IPv4 network; refusing the whole list", cc, line)
 		}
 		out = append(out, line)

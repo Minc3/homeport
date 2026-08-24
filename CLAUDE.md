@@ -730,13 +730,28 @@ replace a working allowlist with nobody watching, while staleness only costs
 a few newly allocated networks. It is also whole-or-nothing (`fetchCountry`):
 a truncated download is valid CIDRs all the way to the cut, so any bad line,
 an empty list, or a response over the size cap fails the entire request
-rather than becoming a plausible fragment of an allowlist. Country codes are
-checked against two-lowercase-letters before they go near the URL, and
-validation refuses anything nft would choke on. Region names are folded to nft
-identifiers at generation and each folded set name is emitted once, because
+rather than becoming a plausible fragment of an allowlist - and
+`deploy/geo-zones.sh` buffers for the same reason, printing nothing unless
+every country fetched, because a redirect holding half a region is that same
+fragment made by hand. Country codes are
+checked against two-lowercase-letters before they go near the URL - every
+code, in a first pass, so a bad one behind a good one is refused with zero
+requests sent - and the fetches then run concurrently (bounded, and tied to
+the request context so a closed tab cancels them) rather than eating a
+timeout per code in series. Validation refuses anything nft would choke on;
+what IPv4 means is defined once (`web.parseIPv4Network`, mask width included,
+because a bare `To4` test admits an IPv4-mapped IPv6 network that saves,
+generates nothing, and then blocks every later save when its stored form
+fails to re-parse). Region names are folded to nft
+identifiers at generation (`sysx.GeoSetName`, which validate also keys its
+collision check on, so the two cannot disagree about which names are one set)
+and each folded set name is emitted once, because
 two names the fold makes identical are one set to nft and defining it twice
 rejects the whole table; validate refuses that collision at save, the build
-survives it in an older blob. The rules are stateless
+survives it in an older blob. The lockdown sets share that namespace, so a
+region name folding onto `geo_lockdown_tcp/udp` is refused as reserved at
+save, and the generator shifts a stale blob's region set aside rather than
+defining the lock set twice with two types. The rules are stateless
 and per-packet, deliberately: the set answer is fixed per address so an
 allowed player can never be newly caught, an out-of-region flood costs no
 conntrack entry, and a lock engaging also ends flows already in progress. The
@@ -748,10 +763,16 @@ admitting only the named regions (the default, negated lookups ANDed into one
 rule) and dropping exactly them (one positive-match rule per region, because
 "inside any of them" is an OR and a single rule ANDs its matches - two blocked
 regions on one rule would drop only their intersection and silently admit
-both). A reference that resolves to nothing generates no rule rather than a
-drop-everything: `web.validate` refuses the dangling reference at save, and
-the build must not take a published service off the air over an older or
-hand-edited blob.
+both). A reference that resolves to nothing fails open, and the open answer
+differs by direction: `web.validate` refuses the dangling reference at save,
+so meeting one means an older or hand-edited blob, and the build must not
+take a published service off the air over it. On an allow lock any dangling
+reference means no rule for that service - the rule is one AND of negated
+lookups, so emitting it for just the references that resolve would silently
+bar every player the missing region was meant to admit, a stricter lock than
+was configured. On a block lock the resolved regions keep their rules and the
+dangling one simply drops nothing, because there each region is its own rule
+and dropping less is the open direction.
 
 **The automatic region lock lives entirely in the kernel, like the parking
 blocklist it copies.** `Service.GeoAutoPPS` makes the lock conditional: a
@@ -774,7 +795,14 @@ players cannot connect" and "that threshold is too tight" look identical from
 outside. Every drop rule carries a `counter` and a comment; `sysx.ProtectState`
 reads them back out of the kernel with `nft -j`, because the numbers live in the
 rules and reloading the table resets them. The portal shows them beside the
-parked sources.
+parked sources. Whether a counter's packets were dropped is the API's
+`ProtectCounter.Drops` flag, decided where the rules are generated - the
+auto-lock trip counter observes a threshold and drops nothing - so the portal
+never infers semantics from a counter's name, where "geo" being a prefix of
+"geo-trip" is a trap waiting for a `startsWith`. The lockdown sets are read
+back by their two exact names, never by the `geo_lockdown_` prefix, because
+region sets share that namespace and an operator's `lockdown_eu` must not be
+scanned as engaged-lock state for a protocol called "eu".
 
 **WireGuard handshake age never influences a decision.** It is collected and
 displayed for context only. A WireGuard interface stays up long after the link
@@ -1641,23 +1669,35 @@ where a subtle regression would be invisible in production until an outage:
   its own rule, so several blocked regions drop their union rather than their
   intersection, with the auto variant conditional on the lockdown set like
   the allow one; a dangling region reference locks nothing rather than dropping
-  everything; the automatic lock's trigger precedes its drop so a locked flood
+  everything, and a partly dangling allow lock locks nothing too while a
+  partly dangling block lock keeps its resolved regions, because the open
+  direction differs by rule shape; the automatic lock's trigger precedes its
+  drop so a locked flood
   keeps refreshing the lock, its lockdown set is dynamic and per protocol, and
   the release lag is configurable with zero meaning the shipped minute; region
-  names are folded to loadable set names whatever the blob holds, and two
-  names that fold together emit one set rather than a rejected table; and
-  engaged locks parse back out of `nft -j` with the rest.
+  names are folded to loadable set names whatever the blob holds, two
+  names that fold together emit one set rather than a rejected table, and a
+  region folding onto a lockdown set's name is shifted aside rather than
+  defining that set twice; and engaged locks parse back out of `nft -j` with
+  the rest, matched by the two exact lockdown names so an operator's
+  `lockdown_eu` region is never read as lock state, with the trip counter
+  flagged as observing rather than dropping.
   `web/protect_validate_test.go` holds the fail-closed half: a lock on an
   undefined or empty region is refused, so is an auto threshold with no
   regions, a network that does not parse, an IPv6 network in an ip-family
-  table, a name outside the slug the set name needs, and two names that fold
-  to one set; while a valid lock saves with bare addresses widened to /32 and
-  host-part CIDRs masked to their network.
+  table, an IPv4-mapped one whose stored form would fail to re-parse (for a
+  region and for an egress source, which share the helper), a name outside
+  the slug the set name needs, a name reserved by the lockdown sets, and two
+  names that fold to one set - keyed on `sysx.GeoSetName` itself, so validate
+  and generation cannot drift; while a valid lock saves with bare addresses
+  widened to /32 and host-part CIDRs masked to their network.
   `web/geofetch_test.go` pins the fetch endpoint against a local fake host:
-  the merged lists and per-country counts come back in request order, a list
+  the merged lists and per-country counts come back in request order whatever
+  order the concurrent fetches finish in, a list
   with anything that is not an IPv4 network in it fails whole with no partial
   data, a missing or empty list is refused, a bad country code is refused
-  before any request leaves, an oversized response is a loud error rather
+  before any request leaves - in any position, because the codes are checked
+  as a whole first pass - an oversized response is a loud error rather
   than a silently shorter list, the endpoint requires a session, and a
   region's remembered country codes are validated to the same shape the
   endpoint demands.

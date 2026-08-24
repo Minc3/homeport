@@ -18,10 +18,21 @@ if [ $# -lt 1 ]; then
     exit 1
 fi
 
+# Buffered, printed only once every country fetched. Streamed as it arrived,
+# a failure on the second country left the first one's networks already on
+# stdout: a redirect then held a valid-looking partial list, every line a
+# CIDR the portal accepts, silently missing half the region. That is the
+# exact fragment the portal's whole-or-nothing fetch refuses, and the
+# offline route has to refuse it the same way.
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
 for cc in "$@"; do
     cc=$(printf '%s' "$cc" | tr '[:upper:]' '[:lower:]')
-    curl -fsS "https://www.ipdeny.com/ipblocks/data/aggregated/${cc}-aggregated.zone" || {
-        echo "could not fetch the list for '${cc}' - check the ISO country code" >&2
+    curl -fsS "https://www.ipdeny.com/ipblocks/data/aggregated/${cc}-aggregated.zone" >> "$tmp" || {
+        echo "could not fetch the list for '${cc}' - check the ISO country code; nothing printed" >&2
         exit 1
     }
 done
+
+cat "$tmp"

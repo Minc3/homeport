@@ -2,7 +2,7 @@
 #
 # Install the failover backend on this host (the box at the house).
 #
-#   git clone <repo> && cd homeport
+#   git clone https://github.com/Minc3/homeport.git && cd homeport
 #   sudo ./deploy/install-backend.sh --psk <the frontend's psk>
 #
 # The backend makes no decisions and has no web interface. It answers probes,

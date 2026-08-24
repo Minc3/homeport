@@ -241,14 +241,11 @@ func validate(cfg *model.Config) error {
 		// Parsed rather than passed through, because it ends up inside a
 		// generated nftables rule. A malformed value would fail the whole
 		// ruleset load, taking the backend's reply marking down with it.
-		ip, netw, err := net.ParseCIDR(s.CIDR)
+		netw, err := parseIPv4Network(s.CIDR)
 		if err != nil {
-			return fmt.Errorf("egress source %q is not a valid network: %v", s.CIDR, err)
+			return fmt.Errorf("egress source %v", err)
 		}
-		if ip.To4() == nil {
-			return fmt.Errorf("egress source %q is not IPv4; the ruleset is an ip table", s.CIDR)
-		}
-		s.CIDR = netw.String() // normalise 172.18.0.5/16 to 172.18.0.0/16
+		s.CIDR = netw // normalise 172.18.0.5/16 to 172.18.0.0/16
 
 		s.Host = trimmed(s.Host)
 		if s.Host != "" {
@@ -440,16 +437,25 @@ func validate(cfg *model.Config) error {
 			return errors.New("every protection region needs a name")
 		}
 		if len(rg.Name) > maxRegionName {
-			return fmt.Errorf("region name %q is %d bytes; keep it under %d", rg.Name, len(rg.Name), maxRegionName)
+			return fmt.Errorf("region name %q is %d bytes; the most a name can be is %d", rg.Name, len(rg.Name), maxRegionName)
 		}
 		if bad := firstBadRegionRune(rg.Name); bad != "" {
 			return fmt.Errorf("region name %q contains %q; use lowercase letters, digits, hyphens and underscores, "+
 				"because the name becomes an nftables set name", rg.Name, bad)
 		}
+		// The per-protocol lockdown sets live in the same namespace as the
+		// region sets, so a name that folds onto one of theirs would define
+		// the set twice with two types, and nft refuses the whole table.
+		if sysx.GeoNameReserved(rg.Name) {
+			return fmt.Errorf("region name %q is reserved: it becomes the nftables set the automatic lock "+
+				"writes engaged ports into; pick another name", rg.Name)
+		}
 		// Uniqueness is measured on the set the name renders to, where a
 		// hyphen folds to an underscore: "south-america" and "south_america"
 		// would otherwise be one set defined twice, and nft refuses the table.
-		key := strings.ReplaceAll(rg.Name, "-", "_")
+		// Keyed on the generator's own fold, so validate and generation cannot
+		// disagree about which names are one set.
+		key := sysx.GeoSetName(rg.Name)
 		if other, dup := seenRegionSet[key]; dup {
 			return fmt.Errorf("regions %q and %q are the same name to nftables; rename one", other, rg.Name)
 		}
@@ -468,14 +474,11 @@ func validate(cfg *model.Config) error {
 			if !strings.Contains(c, "/") {
 				c += "/32"
 			}
-			ip, netw, err := net.ParseCIDR(c)
+			netw, err := parseIPv4Network(c)
 			if err != nil {
-				return fmt.Errorf("region %s: %q is not a network in CIDR form: %v", rg.Name, c, err)
+				return fmt.Errorf("region %s: %v", rg.Name, err)
 			}
-			if ip.To4() == nil {
-				return fmt.Errorf("region %s: %q is not IPv4; the ruleset is an ip table", rg.Name, c)
-			}
-			cleaned = append(cleaned, netw.String())
+			cleaned = append(cleaned, netw)
 		}
 		rg.CIDRs = cleaned
 		if len(cleaned) > 0 {
@@ -530,7 +533,7 @@ func validate(cfg *model.Config) error {
 		// anything non-ASCII is in there, and the error has to name the same
 		// unit the bound is in or it reads as arithmetic nobody can follow.
 		if len(sv.Name) > maxServiceName {
-			return fmt.Errorf("service name %q is %d bytes; keep it under %d, "+
+			return fmt.Errorf("service name %q is %d bytes; the most a name can be is %d, "+
 				"because it becomes an nftables comment and the kernel bounds those in bytes",
 				sv.Name, len(sv.Name), maxServiceName)
 		}
@@ -625,6 +628,25 @@ func validate(cfg *model.Config) error {
 		}
 	}
 	return nil
+}
+
+// parseIPv4Network parses a CIDR that is destined for a generated nftables
+// ruleset and returns it normalised to its network address. Everything the
+// portal accepts into an ip-family table goes through here, so validation and
+// generation cannot disagree about what IPv4 means: To4 alone also admits an
+// IPv4-mapped IPv6 network ("::ffff:1.128.0.0/120"), which String() renders
+// with a 128-bit mask length that the generators skip in silence and a later
+// ParseCIDR refuses outright - a lock that saves, does not exist, and then
+// blocks every unrelated save. The mask width is the real test.
+func parseIPv4Network(c string) (string, error) {
+	ip, netw, err := net.ParseCIDR(c)
+	if err != nil {
+		return "", fmt.Errorf("%q is not a network in CIDR form: %v", c, err)
+	}
+	if _, bits := netw.Mask.Size(); ip.To4() == nil || bits != 32 {
+		return "", fmt.Errorf("%q is not IPv4; the ruleset is an ip table", c)
+	}
+	return netw.String(), nil
 }
 
 // maxRegionName bounds a protection region's name. It becomes an nftables set

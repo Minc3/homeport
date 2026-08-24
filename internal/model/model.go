@@ -815,6 +815,13 @@ type ProtectCounter struct {
 	Name    string `json:"name"`
 	Packets int64  `json:"packets"`
 	Bytes   int64  `json:"bytes"`
+
+	// Drops says whether the packets counted were discarded. The auto-lock
+	// trip counter observes a threshold being crossed and drops nothing, and
+	// the portal's "packets dropped" total must not include it. Carried here,
+	// where the rule was generated, rather than sniffed off the counter's
+	// name in the portal: a name is a label, not a semantic.
+	Drops bool `json:"drops"`
 }
 
 // BlockedSource is an address parked by a limit, and the seconds it has left.

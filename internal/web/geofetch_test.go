@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/quinlan102/homeport/internal/model"
@@ -20,8 +21,13 @@ import (
 func geoServer(t *testing.T, zones map[string]string) (*Server, *int) {
 	t.Helper()
 	hits := 0
+	// The handler runs concurrently now that the fetches do; the counter is
+	// only read back after the whole request has finished.
+	var mu sync.Mutex
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		hits++
+		mu.Unlock()
 		body, ok := zones[r.URL.Path]
 		if !ok {
 			http.NotFound(w, r)
@@ -132,6 +138,21 @@ func TestGeoFetchRefusesABadCountryCodeBeforeFetchingAnything(t *testing.T) {
 	}
 	if *hits != 0 {
 		t.Errorf("%d requests left for bad codes; want none", *hits)
+	}
+}
+
+// The check is a whole first pass, not a test inside the fetch loop: a bad
+// code behind a good one must be refused with zero requests sent, not after
+// the codes ahead of it were already fetched.
+func TestGeoFetchChecksEveryCodeBeforeFetchingAny(t *testing.T) {
+	s, hits := geoServer(t, map[string]string{"/au-aggregated.zone": "1.128.0.0/11\n"})
+	cookie := login(t, s, "admin", "first-run-password")
+
+	if w := geoFetch(t, s, geoFetchRequest{Countries: []string{"au", "../nz"}}, cookie); w.Code != http.StatusBadRequest {
+		t.Errorf("a bad code behind a good one came back as %d, want a refusal: %s", w.Code, w.Body.String())
+	}
+	if *hits != 0 {
+		t.Errorf("%d requests left before the bad code was met; want none", *hits)
 	}
 }
 
