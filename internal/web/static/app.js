@@ -627,9 +627,13 @@ function updateGeoWarn() {
   const show = locked.length > 0 && !(config.protect && config.protect.enabled);
   w.classList.toggle('hidden', !show);
   if (show) {
-    w.textContent = `Region lock${locked.length === 1 ? '' : 's'} on ${locked.join(', ')} will not exist: `
-      + 'Protection is disabled, and the locks live in its table. Nothing is being dropped for these rows. '
-      + 'Tick Enabled under Protection below to make them live, or set the row back to anywhere.';
+    w.textContent = '';
+    w.append(
+      el('h3', { text: `Region lock${locked.length === 1 ? '' : 's'} NOT active: ${locked.join(', ')}` }),
+      el('p', { text: 'Protection is disabled, and the locks live in its table, so nothing is being dropped for these rows: '
+        + 'they are open to the whole world right now. Tick Enabled under Protection below and save to make the locks live, '
+        + 'or set the row back to anywhere if that is what you meant.' }),
+    );
   }
 }
 
@@ -1262,6 +1266,11 @@ function renderSettings() {
   };
   renderServices();
   form.append(section('Published services',
+    // Filled by updateGeoWarn, which every form event runs: a region lock on a
+    // row does nothing while Protection is disabled, and a lock somebody
+    // believes exists is worse than none. First in the section, above the
+    // table, because the first real use scrolled past it at the bottom.
+    el('div', { class: 'alert warn hidden', id: 'geo-warn' }),
     el('div', { class: 'table-wrap' }, el('table', {},
       el('thead', {}, el('tr', {},
         th('Name', 'Label only: it appears as a comment in the generated ruleset and in this table. Examples: gmod, gmod-hltv, https.'),
@@ -1298,10 +1307,6 @@ function renderSettings() {
       onclick: () => { c.services.push({ name: 'new', proto: 'tcp', port: 5000, port_end: 0, enabled: true }); renderServices(); },
     }, 'Add service')),
     el('p', { class: 'hint', text: 'Destination NAT only. Source addresses are never rewritten, so the game server and the web server see real client IPs.' }),
-    // Filled by updateGeoWarn, which every form event runs: a region lock on a
-    // row does nothing while Protection is disabled, and a lock somebody
-    // believes exists is worse than none.
-    el('div', { class: 'alert warn hidden', id: 'geo-warn' }),
   ));
 
   if (!c.protect) c.protect = {};

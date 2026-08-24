@@ -144,9 +144,11 @@ main.wide fieldset > .alert { max-width: 1160px; }
 .alert.info h3 { color: var(--accent); }
 
 .alert.warn {
-  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
-  background: color-mix(in srgb, var(--warn) 8%, var(--card));
+  border: 2px solid color-mix(in srgb, var(--warn) 65%, transparent);
+  background: color-mix(in srgb, var(--warn) 14%, var(--card));
 }
+.alert.warn h3 { color: var(--warn); }
+.alert.warn p:last-child { margin-bottom: 0; }
 
 .cards {
   display: grid;
