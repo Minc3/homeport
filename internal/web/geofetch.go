@@ -45,6 +45,12 @@ const geoFetchMaxBytes = 4 << 20
 // outbound request.
 const geoFetchMaxCountries = 24
 
+// geoFetchMaxTotal caps the combined result of one fetch. What the button
+// fills in must fit back through a save, so this sits under maxRegionsBytes,
+// which in turn sits under the PUT body cap - see the caps in api.go for the
+// ordering and why it matters.
+const geoFetchMaxTotal = 8 << 20
+
 // geoFetchParallel is how many of those requests are in flight at once:
 // enough that a worst-case fetch is bounded by a few timeouts rather than
 // one per code, small enough to be polite to a host serving static files.
@@ -82,19 +88,10 @@ func (s *Server) handleGeoFetch(w http.ResponseWriter, r *http.Request) {
 	// is refused with zero requests sent rather than after the codes ahead of
 	// it were already fetched. Everything that is not a country code is
 	// refused, not escaped.
-	codes := make([]string, 0, len(req.Countries))
-	seen := map[string]bool{}
-	for _, cc := range req.Countries {
-		cc = strings.ToLower(trimmed(cc))
-		if cc == "" || seen[cc] {
-			continue
-		}
-		seen[cc] = true
-		if bad := badCountryCode(cc); bad != "" {
-			clientErr(w, fmt.Errorf("%q is not an ISO country code: %s", cc, bad))
-			return
-		}
-		codes = append(codes, cc)
+	codes, err := cleanCountryCodes(req.Countries)
+	if err != nil {
+		clientErr(w, err)
+		return
 	}
 	if len(codes) == 0 {
 		clientErr(w, fmt.Errorf("no country codes left after trimming"))
@@ -156,10 +153,24 @@ func (s *Server) handleGeoFetch(w http.ResponseWriter, r *http.Request) {
 	// Indexed by position above, so the merged list and the counts come back
 	// in request order whatever order the fetches finished in.
 	var cidrs []string
+	total := 0
 	counts := make([]geoFetchCount, 0, len(codes))
 	for i, cc := range codes {
 		cidrs = append(cidrs, lists[i]...)
+		for _, c := range lists[i] {
+			total += len(c) + 1
+		}
 		counts = append(counts, geoFetchCount{Country: cc, Networks: len(lists[i])})
+	}
+	// Bounded as a whole as well as per country, because the result's only
+	// destination is the configuration: a fetch that fills the form with more
+	// than a save can carry hands the operator work the Save button then
+	// refuses. Whole-or-nothing like every other failure here - a silently
+	// shortened region is the fragment this handler exists to prevent.
+	if total > geoFetchMaxTotal {
+		clientErr(w, fmt.Errorf("these %d countries hold %d MB of networks together; the most one region can carry is %d MB - "+
+			"split them across regions, or fetch fewer", len(codes), total>>20, geoFetchMaxTotal>>20))
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"cidrs": cidrs, "counts": counts})
 }
@@ -211,6 +222,29 @@ func (s *Server) fetchCountry(ctx context.Context, cc string) ([]string, error) 
 		return nil, fmt.Errorf("the list for %q is empty", cc)
 	}
 	return out, nil
+}
+
+// cleanCountryCodes normalises a list of would-be ISO codes: trimmed,
+// lowercased, blanks and repeats dropped, and every survivor checked before
+// anything is done with any of them. One function shared by this endpoint and
+// by validate's remembered-codes check, because validate promises the stored
+// codes are the shape the endpoint demands, and two hand-kept copies of the
+// recipe is that promise drifting apart waiting to happen.
+func cleanCountryCodes(countries []string) ([]string, error) {
+	codes := make([]string, 0, len(countries))
+	seen := map[string]bool{}
+	for _, cc := range countries {
+		cc = strings.ToLower(trimmed(cc))
+		if cc == "" || seen[cc] {
+			continue
+		}
+		seen[cc] = true
+		if bad := badCountryCode(cc); bad != "" {
+			return nil, fmt.Errorf("%q is not an ISO country code: %s", cc, bad)
+		}
+		codes = append(codes, cc)
+	}
+	return codes, nil
 }
 
 // badCountryCode says what is wrong with a would-be ISO code, or "".

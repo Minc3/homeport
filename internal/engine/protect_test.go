@@ -241,3 +241,75 @@ func TestTunnelsWithNoHandshakeAreNotTreatedAsSharing(t *testing.T) {
 		t.Errorf("tunnels with no handshake were reported as sharing an address: %+v", got)
 	}
 }
+
+// A reload is not free: it resets the counters, unparks every blocked source
+// and releases every engaged region lock. A save that did not change the
+// protection ruleset must therefore not reload it - an operator saving a
+// probe interval mid-flood would otherwise hand the flood a clean slate. A
+// save that does change it still reloads, which is the documented reset.
+func TestAnUnchangedSaveDoesNotReloadProtection(t *testing.T) {
+	cfg := protectedConfig()
+	e, q := engineForReconcile(t, healthyKernel())
+	e.cfg = cfg
+
+	e.applyProtect(context.Background(), cfg, e.runner, e.real)
+	e.applyProtect(context.Background(), cfg, e.runner, e.real)
+	if n := q.count("nft -f"); n != 1 {
+		t.Errorf("an unchanged configuration loaded the ruleset %d times, want 1", n)
+	}
+
+	changed := cfg
+	changed.Protect.DropSpoofed = true
+	e.applyProtect(context.Background(), changed, e.runner, e.real)
+	if n := q.count("nft -f"); n != 2 {
+		t.Errorf("a changed limit did not reload the ruleset (loads: %d, want 2)", n)
+	}
+}
+
+// Turning the feature off throws the last samples away with the table. Kept,
+// they would be served again the moment protection was re-armed, for up to
+// one sample tick - and a stale engaged-lock reading is an attack alert for
+// a lock that is not in the kernel.
+func TestDisablingProtectionClearsTheSamples(t *testing.T) {
+	e, _ := engineForReconcile(t, healthyKernel())
+	e.protectOn = true
+	e.protectApplied = "old ruleset"
+	e.protectCounters = []model.ProtectCounter{{Name: "geo:src", Packets: 4}}
+	e.protectBlocked = []model.BlockedSource{{Address: "198.51.100.7"}}
+	e.protectGeoLocked = []model.GeoLockedPort{{Proto: "udp", Port: 27015}}
+
+	off := model.Defaults()
+	off.Mode = model.ModeArmed
+	e.applyProtect(context.Background(), off, e.runner, e.real)
+
+	if e.protectCounters != nil || e.protectBlocked != nil || e.protectGeoLocked != nil {
+		t.Errorf("stale samples survived the feature being turned off: %+v %+v %+v",
+			e.protectCounters, e.protectBlocked, e.protectGeoLocked)
+	}
+	if e.protectApplied != "" {
+		t.Error("the reload latch survived the table being removed")
+	}
+}
+
+// Revert clears every protection sample, the engaged locks included. The
+// first build cleared two of the three, and the stale third resurfaced when
+// protection was next re-armed - as a "region lock engaged" alert for a lock
+// the revert had removed from the kernel days earlier.
+func TestRevertClearsTheEngagedLockSample(t *testing.T) {
+	e, _ := engineForReconcile(t, healthyKernel())
+	e.protectOn = true
+	e.protectApplied = "old ruleset"
+	e.protectCounters = []model.ProtectCounter{{Name: "geo:src", Packets: 4}}
+	e.protectBlocked = []model.BlockedSource{{Address: "198.51.100.7"}}
+	e.protectGeoLocked = []model.GeoLockedPort{{Proto: "udp", Port: 27015}}
+
+	e.Revert(context.Background())
+
+	if e.protectCounters != nil || e.protectBlocked != nil || e.protectGeoLocked != nil {
+		t.Errorf("stale samples survived the revert: %+v %+v %+v",
+			e.protectCounters, e.protectBlocked, e.protectGeoLocked)
+	}
+	if e.protectApplied != "" {
+		t.Error("the reload latch survived the revert")
+	}
+}

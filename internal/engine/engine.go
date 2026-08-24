@@ -177,6 +177,14 @@ type Engine struct {
 	protectCounters  []model.ProtectCounter
 	protectBlocked   []model.BlockedSource
 	protectGeoLocked []model.GeoLockedPort
+	// protectApplied is the ruleset text last really loaded, so a save that
+	// leaves protection untouched can skip the reload. A reload is not free:
+	// it resets every counter, unparks every blocked source and releases
+	// every engaged region lock, and an operator saving a probe interval
+	// mid-flood must not hand the flood a clean slate. Cleared whenever the
+	// table's presence is in doubt, because a stale latch skips a reload the
+	// kernel actually needs.
+	protectApplied string
 
 	// backendConns counts live control connections. A plain boolean was wrong:
 	// when the backend reconnects, the old connection's deferred teardown runs
@@ -1124,18 +1132,45 @@ func (e *Engine) applyProtect(ctx context.Context, cfg model.Config, gated, real
 		sysx.RemoveProtectRuleset(ctx, real)
 		e.mu.Lock()
 		e.protectOn = false
+		e.protectApplied = ""
+		// The samples describe rules that no longer exist; kept, they would
+		// be served again the moment protection is re-armed, for up to one
+		// sample tick - an engaged-lock alert for a lock not in the kernel.
+		e.protectCounters, e.protectBlocked, e.protectGeoLocked = nil, nil, nil
 		e.mu.Unlock()
+		return
+	}
+	// An unchanged ruleset is not reloaded. The reload resets the counters,
+	// unparks every blocked source and releases every engaged region lock, so
+	// a save that did not touch protection must not pay it - a settings save
+	// mid-flood would otherwise let the whole flood back in at once. Only a
+	// ruleset this process really loaded counts: observe mode and a failed
+	// apply both leave the latch empty, and sampleProtect drops it when the
+	// kernel stops answering for the table.
+	armed := gated.Applying()
+	e.mu.Lock()
+	unchanged := armed && e.protectOn && e.protectApplied == ruleset
+	e.mu.Unlock()
+	if unchanged {
 		return
 	}
 	if _, err := sysx.ApplyProtectRuleset(ctx, gated, e.stateDir, ruleset); err != nil {
 		e.log.Error("failed to apply the protection ruleset", "err", err)
 		_ = e.st.AddEvent(store.EventSystem, 0, "protection apply failed: %v", err)
+		e.mu.Lock()
+		e.protectApplied = ""
+		e.mu.Unlock()
 		return
 	}
 	e.mu.Lock()
-	e.protectOn = gated.Applying()
+	e.protectOn = armed
+	if armed {
+		e.protectApplied = ruleset
+	} else {
+		e.protectApplied = ""
+	}
 	e.mu.Unlock()
-	if gated.Applying() {
+	if armed {
 		e.log.Info("edge protection active", "iface", cfg.Frontend.PublicIface)
 	}
 }
@@ -1219,6 +1254,14 @@ func (e *Engine) sampleProtect(ctx context.Context) {
 	counters, blocked, locked, err := sysx.ProtectState(ctx, e.realRunner())
 	if err != nil {
 		e.log.Debug("cannot read protection state", "err", err)
+		// The table may be gone underneath the agent - flushed by hand, or
+		// nft restarted. Dropping the reload latch makes the next save load
+		// the ruleset again instead of skipping it as unchanged; a transient
+		// read failure costs one reload, which was every save's price before
+		// the latch existed.
+		e.mu.Lock()
+		e.protectApplied = ""
+		e.mu.Unlock()
 		return
 	}
 	e.mu.Lock()
@@ -2139,7 +2182,10 @@ func (e *Engine) Revert(ctx context.Context) {
 	e.pinned = 0
 	e.dataPlane = false
 	e.protectOn = false
-	e.protectCounters, e.protectBlocked = nil, nil
+	e.protectApplied = ""
+	// All three samples, not two: a stale engaged-lock reading served after a
+	// later re-arm is an attack alert for a lock that is not in the kernel.
+	e.protectCounters, e.protectBlocked, e.protectGeoLocked = nil, nil, nil
 	e.mu.Unlock()
 
 	_ = e.st.AddEvent(store.EventSystem, 0,

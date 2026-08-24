@@ -210,3 +210,36 @@ func TestARegionsRememberedCountryCodesAreValidated(t *testing.T) {
 		t.Fatal("a three-letter code was accepted")
 	}
 }
+
+// The fetch result's only destination is the configuration, so a fetch that
+// fills the form with more than a save can carry hands the operator work the
+// Save button then refuses - "request body too large" on every save until
+// the list is trimmed by hand. Bounded here, whole-or-nothing like every
+// other failure in this handler, with a message that says what to do.
+func TestGeoFetchOverTheTotalCapFailsWhole(t *testing.T) {
+	// Each list is under the per-country cap; together they are over the
+	// combined one. Duplicates are fine: the handler does not merge, and a
+	// real pair of countries can legitimately share nothing but size.
+	big := strings.Repeat("203.0.113.0/24\n", 250000) // ~3.6 MB each
+	s, _ := geoServer(t, map[string]string{
+		"/us-aggregated.zone": big,
+		"/de-aggregated.zone": big,
+		"/gb-aggregated.zone": big,
+	})
+	cookie := login(t, s, "admin", "first-run-password")
+
+	w := geoFetch(t, s, geoFetchRequest{Countries: []string{"us", "de", "gb"}}, cookie)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("an over-cap fetch returned %d, want 400", w.Code)
+	}
+	var res map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("response: %v", err)
+	}
+	if _, ok := res["cidrs"]; ok {
+		t.Error("an over-cap fetch still returned data")
+	}
+	if msg, _ := res["error"].(string); !strings.Contains(msg, "split them across regions") {
+		t.Errorf("the error does not say what to do: %q", msg)
+	}
+}

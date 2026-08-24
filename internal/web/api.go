@@ -42,7 +42,7 @@ func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
 // up its half over the control channel within a couple of seconds.
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	var cfg model.Config
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&cfg); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxConfigBytes)).Decode(&cfg); err != nil {
 		clientErr(w, fmt.Errorf("invalid configuration: %w", err))
 		return
 	}
@@ -430,6 +430,7 @@ func validate(cfg *model.Config) error {
 	regionDefined := map[string]bool{}
 	regionNetworks := map[string]bool{}
 	seenRegionSet := map[string]string{}
+	regionsBytes := 0
 	for i := range pr.Regions {
 		rg := &pr.Regions[i]
 		rg.Name = trimmed(rg.Name)
@@ -479,6 +480,7 @@ func validate(cfg *model.Config) error {
 				return fmt.Errorf("region %s: %v", rg.Name, err)
 			}
 			cleaned = append(cleaned, netw)
+			regionsBytes += len(netw) + 1
 		}
 		rg.CIDRs = cleaned
 		if len(cleaned) > 0 {
@@ -487,19 +489,22 @@ func validate(cfg *model.Config) error {
 
 		// The remembered fetch recipe. It generates nothing, but it is
 		// replayed into the fetch endpoint by the button, so it is held to
-		// the same shape the endpoint demands rather than left to fail there.
-		codes := rg.Countries[:0]
-		for _, cc := range rg.Countries {
-			cc = strings.ToLower(trimmed(cc))
-			if cc == "" {
-				continue
-			}
-			if bad := badCountryCode(cc); bad != "" {
-				return fmt.Errorf("region %s: country code %q: %s", rg.Name, cc, bad)
-			}
-			codes = append(codes, cc)
+		// the same shape the endpoint demands - through the endpoint's own
+		// cleaner, so the two cannot drift.
+		codes, err := cleanCountryCodes(rg.Countries)
+		if err != nil {
+			return fmt.Errorf("region %s: %v", rg.Name, err)
 		}
 		rg.Countries = codes
+	}
+	// Bounded in total, not per region, because what has to survive is the
+	// save that carries every region at once: a configuration validate
+	// accepted must always fit back through the PUT body cap, or one generous
+	// region blocks every later save of anything with an error that does not
+	// say why.
+	if regionsBytes > maxRegionsBytes {
+		return fmt.Errorf("the region lists hold %d MB of networks; the most a configuration can carry is %d MB - "+
+			"trim a list, or fetch fewer countries into one region", regionsBytes>>20, maxRegionsBytes>>20)
 	}
 
 	if cfg.Probe.ActiveIntervalMs < 50 {
@@ -653,6 +658,24 @@ func parseIPv4Network(c string) (string, error) {
 // name (geo_<name>) and part of a set comment, and nft bounds identifiers too;
 // 32 is far under either limit and long enough for any part of the world.
 const maxRegionName = 32
+
+// The three size caps are one story and must stay in this order:
+// geoFetchMaxTotal < maxRegionsBytes < maxConfigBytes. A fetch fills one
+// region, validate bounds what every region together may hold, and the PUT
+// body cap sits above that with room for the rest of the configuration and
+// JSON quoting. Any config that ever validated must fit back through a save,
+// and anything the Fetch button produces must survive one - the alternative
+// is a portal that fills a form its own save endpoint then refuses, with the
+// opaque "request body too large" where a real message should be, on every
+// save until the list is trimmed by hand.
+const (
+	// maxConfigBytes bounds one PUT /api/config body. The portal is on the
+	// admin tunnel, so this is a sanity ceiling rather than a defence.
+	maxConfigBytes = 32 << 20
+	// maxRegionsBytes bounds the region lists across the whole configuration,
+	// with a clear message where the body cap has none.
+	maxRegionsBytes = 24 << 20
+)
 
 // firstBadRegionRune returns the first character a region name cannot carry,
 // or "" when the name is safe. Stricter than a comment: the name becomes an

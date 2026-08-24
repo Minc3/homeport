@@ -494,7 +494,7 @@ function renderProtect(p) {
     body.append(el('p', { class: 'hint', text: 'Hover a card for what its limit drops. Every figure is packets dropped by that limit, except auto-lock trips, which is the threshold being crossed.' }));
     body.append(el('p', { class: 'hint', text: total === 0
       ? 'Nothing dropped since the rules were last loaded.'
-      : `${total.toLocaleString()} packets dropped since the rules were last loaded. Saving the configuration resets these.` }));
+      : `${total.toLocaleString()} packets dropped since the rules were last loaded. Saving a change to the protection settings resets these.` }));
   }
 
   // Said loudly, because an engaged lock looks exactly like the service being
@@ -505,7 +505,7 @@ function renderProtect(p) {
     body.append(el('div', { class: 'alert info' },
       el('p', { text: `Region lock engaged on ${l.proto}/${l.port}: traffic to it exceeded the auto-lock threshold, and the sources its lock bars are being dropped. `
         + (l.expires_sec ? `Releases in ${l.expires_sec}s unless the flood is still refreshing it.` : 'Releasing shortly.')
-        + ' Saving the configuration reloads the rules and releases the lock too, until the flood trips it again; best not to save mid-attack.' }),
+        + ' Saving a change to the protection settings reloads the rules and releases the lock too, until the flood trips it again; a save that leaves protection alone keeps it engaged.' }),
     ));
   }
 
@@ -638,6 +638,21 @@ function updateDirty() {
   document.querySelector('nav button[data-tab="settings"]').classList.toggle('dirty', settingsDirty);
 }
 
+// debounce(fn, ms) coalesces a burst of calls into one, ms after the last.
+// run() schedules or reschedules; flush() runs a pending call immediately,
+// for a handler that needs the result committed before anything reads it -
+// 'change' firing after typed 'input' is the case every user of this has.
+// One helper rather than a timer variable per site, because the flush
+// discipline is exactly the part that gets forgotten when the pattern is
+// copied by hand, and a forgotten flush is a stale parse read at save time.
+function debounce(fn, ms) {
+  let t = 0;
+  return {
+    run() { clearTimeout(t); t = setTimeout(() => { t = 0; fn(); }, ms); },
+    flush() { if (t) { clearTimeout(t); t = 0; fn(); } },
+  };
+}
+
 function markSaved() {
   savedConfig = JSON.parse(JSON.stringify(config));
   updateDirty();
@@ -681,10 +696,15 @@ function updateGeoWarn() {
 // speak through 'change' and 'click', so it skips typing entirely.
 {
   const form = document.getElementById('settings-form');
-  let dirtyTimer = 0;
+  const dirty = debounce(updateDirty, 250);
   form.addEventListener('input', () => {
-    clearTimeout(dirtyTimer);
-    dirtyTimer = setTimeout(updateDirty, 250);
+    // The flag itself is armed now, not 250ms from now: beforeunload reads
+    // it synchronously, and an edit followed by a fast close would slip out
+    // with no are-you-sure while the timer was still pending. Only the deep
+    // compare that repaints the badge - and can clear the flag again for an
+    // edit typed back to its saved value - waits for the debounce.
+    settingsDirty = true;
+    dirty.run();
   });
   for (const evt of ['change', 'click']) {
     form.addEventListener(evt, updateDirty);
@@ -800,6 +820,9 @@ function hostSelect(value, c, onChange) {
 }
 
 function serviceRow(s, c, onRemove) {
+  // Built ahead of the row because the region dropdown reaches into it: see
+  // the comment on its cell below.
+  const autoPPS = num('', s.geo_auto_pps, (v) => (s.geo_auto_pps = v || 0), { min: 0, placeholder: '0 = always' });
   const proto = el('select', {});
   for (const v of ['tcp', 'udp']) {
     const o = el('option', { value: v, text: v });
@@ -815,8 +838,19 @@ function serviceRow(s, c, onRemove) {
     el('td', {}, num('', s.port_end, (v) => (s.port_end = v), { min: 0, placeholder: '0 = single port' })),
     el('td', {}, hostSelect(s.target, c, (v) => (s.target = v))),
     el('td', {}, num('', s.ceiling_pps, (v) => (s.ceiling_pps = v || 0), { min: 0, placeholder: '0 = off' })),
-    el('td', {}, regionSelect(s, c, (v, block) => { s.geo_regions = v; s.geo_block = block; })),
-    el('td', {}, num('', s.geo_auto_pps, (v) => (s.geo_auto_pps = v || 0), { min: 0, placeholder: '0 = always' })),
+    el('td', {}, regionSelect(s, c, (v, block) => {
+      s.geo_regions = v; s.geo_block = block;
+      // Back to "anywhere" takes the auto-lock threshold with it: a
+      // threshold with no regions is a state validate refuses, and a
+      // dropdown must never build a row the Save button then rejects. The
+      // visible input is cleared with the model so what is on screen is
+      // what will be saved.
+      if (!v.length && s.geo_auto_pps) {
+        s.geo_auto_pps = 0;
+        autoPPS.querySelector('input').value = '';
+      }
+    })),
+    el('td', {}, autoPPS),
     el('td', {}, checkbox('', s.source_engine, (v) => (s.source_engine = v))),
     el('td', {}, checkbox('', s.enabled, (v) => (s.enabled = v))),
     el('td', {}, el('button', { class: 'btn danger', type: 'button', onclick: onRemove }, 'Remove')),
@@ -886,15 +920,12 @@ function regionRow(r, onRemove, onChange) {
   // exactly the field built for huge pastes. Debounced while typing; 'change'
   // fires on blur, which is always before a Save can be clicked, so the
   // parsed list can never be behind the screen at the moment it is read.
-  const parseTA = () => {
+  const parseTA = debounce(() => {
     r.cidrs = ta.value.split(/[\s,]+/).map((t) => t.trim()).filter(Boolean);
-  };
-  let taTimer = 0;
-  ta.addEventListener('input', () => {
-    clearTimeout(taTimer);
-    taTimer = setTimeout(() => { parseTA(); updateDirty(); }, 400);
-  });
-  ta.addEventListener('change', () => { clearTimeout(taTimer); parseTA(); });
+    updateDirty();
+  }, 400);
+  ta.addEventListener('input', parseTA.run);
+  ta.addEventListener('change', parseTA.flush);
 
   // One recipe for reading the codes field, shared by the remembering
   // listener and the Fetch click, so what the button sends can never drift
@@ -1401,11 +1432,7 @@ function renderSettings() {
   // rename rebuilds it. Debounced for the same reason the linker refresh is:
   // the name field fires per keystroke, and rebuilt eagerly every half-typed
   // name landed in the dropdowns as an option.
-  let regionRefresh = 0;
-  const regionsChanged = () => {
-    clearTimeout(regionRefresh);
-    regionRefresh = setTimeout(renderServices, 400);
-  };
+  const regionsChanged = debounce(renderServices, 400).run;
   const renderRegions = () => {
     regionBody.textContent = '';
     pr.regions.forEach((r, i) => regionBody.append(regionRow(r, () => {
@@ -1558,11 +1585,10 @@ function renderSettings() {
   // it may name renderEgress before that is declared further down. Debounced,
   // because the linker fields fire per keystroke: rebuilt eagerly, every
   // half-typed overlay address landed in the dropdowns as an option.
-  let linkerRefresh = 0;
+  const linkerRefresh = debounce(() => { renderServices(); renderEgress(); }, 400);
   const linkersChanged = () => {
     renderLinkerConfigs();
-    clearTimeout(linkerRefresh);
-    linkerRefresh = setTimeout(() => { renderServices(); renderEgress(); }, 400);
+    linkerRefresh.run();
   };
   const renderLinkers = () => {
     linkerBody.textContent = '';

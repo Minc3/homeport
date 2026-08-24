@@ -742,3 +742,33 @@ func TestAnAutoBlockOnlyDropsWhileEngaged(t *testing.T) {
 		t.Errorf("want the conditional block %q in:\n%s", want, ruleset)
 	}
 }
+
+// The Drops flag is the rule's own verdict, read back beside the counter, not
+// an inference from the comment. A counter that observes without dropping
+// must read as observing whatever it is called, and a rule that drops must
+// read as dropping under a name the parser has never seen - the alternative
+// was an exception list keyed on comment kinds, stale the day the generator
+// gains its next observe-only counter.
+func TestCounterDropsIsTheRuleVerdictNotTheName(t *testing.T) {
+	const out = `{"nftables": [
+		{"rule": {"chain": "raw", "comment": "geo:watch-only",
+			"expr": [{"counter": {"packets": 1, "bytes": 60}}]}},
+		{"rule": {"chain": "raw", "comment": "brand-new-limit",
+			"expr": [{"counter": {"packets": 2, "bytes": 120}}, {"drop": null}]}}
+	]}`
+
+	counters, _, _, err := parseProtectState(out)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	byName := map[string]model.ProtectCounter{}
+	for _, c := range counters {
+		byName[c.Name] = c
+	}
+	if byName["geo:watch-only"].Drops {
+		t.Error("a rule with no drop verdict reads as dropping")
+	}
+	if !byName["brand-new-limit"].Drops {
+		t.Error("a dropping rule under an unknown name reads as observing only")
+	}
+}

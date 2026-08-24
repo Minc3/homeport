@@ -121,9 +121,25 @@ func (s ProtectSpec) active(geoSvcs []ProtectService) bool {
 // hold, keyed by region name. A region that resolves to nothing - every entry
 // unparsable, or none at all - is absent from the map, so nothing downstream
 // can reference an empty set.
+//
+// Only regions some service references are merged at all. An unreferenced
+// region is a draft in the portal and never reaches the ruleset, but a
+// fetched country list is tens of thousands of networks, and this runs under
+// the engine's apply lock on every settings save - the same lock a failover
+// needs to install a route. Every lookup downstream is through a service's
+// GeoRegions, so the narrower map answers exactly the same questions.
 func (s ProtectSpec) geoRegionElems() map[string][]string {
+	referenced := map[string]bool{}
+	for _, sv := range s.Services {
+		for _, name := range sv.GeoRegions {
+			referenced[name] = true
+		}
+	}
 	out := map[string][]string{}
 	for _, r := range s.Regions {
+		if !referenced[r.Name] {
+			continue
+		}
 		if els := mergeCIDRs(r.CIDRs); len(els) > 0 {
 			out[r.Name] = els
 		}
@@ -179,10 +195,11 @@ func (s ProtectSpec) geoServices(elems map[string][]string) []ProtectService {
 // blob may predate that check, the region's set is shifted out of the way
 // instead, so the lock sets stay theirs and the region still renders.
 func GeoSetName(name string) string {
-	if folded := foldGeoName(name); !geoNameFoldsToLockSet(folded) {
-		return folded
+	folded := foldGeoName(name)
+	if geoNameFoldsToLockSet(folded) {
+		return folded + "_"
 	}
-	return foldGeoName(name) + "_"
+	return folded
 }
 
 // GeoNameReserved reports whether a region name folds onto a set name the
@@ -744,34 +761,41 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 	var locked []model.GeoLockedPort
 	for _, item := range doc.Nftables {
 		if rule := item.Rule; rule != nil && rule.Comment != "" {
-			for _, expr := range rule.Expr {
-				raw, ok := expr["counter"]
-				if !ok {
-					continue
-				}
-				var c struct {
-					Packets int64 `json:"packets"`
-					Bytes   int64 `json:"bytes"`
-				}
-				if json.Unmarshal(raw, &c) != nil {
-					continue
-				}
-				if i, ok := counterIdx[rule.Comment]; ok {
-					counters[i].Packets += c.Packets
-					counters[i].Bytes += c.Bytes
-					continue
-				}
-				counterIdx[rule.Comment] = len(counters)
-				// The trip counter observes the auto-lock threshold being
-				// crossed and drops nothing; every other counter here sits on
-				// a drop rule. Decided by the exact kind before the colon,
-				// because "geo" is itself a prefix of "geo-trip".
-				kind, _, _ := strings.Cut(rule.Comment, ":")
-				counters = append(counters, model.ProtectCounter{
-					Name: rule.Comment, Packets: c.Packets, Bytes: c.Bytes,
-					Drops: kind != CounterGeoTrip,
-				})
+			var c struct {
+				Packets int64 `json:"packets"`
+				Bytes   int64 `json:"bytes"`
 			}
+			counted := false
+			drops := false
+			for _, expr := range rule.Expr {
+				if raw, ok := expr["counter"]; ok && json.Unmarshal(raw, &c) == nil {
+					counted = true
+				}
+				// Whether the counted packets were dropped is the rule's own
+				// verdict, sitting beside the counter in the same expression
+				// list - the kernel's answer, not an inference from the
+				// comment. The auto-lock trip counter is the one that
+				// observes without dropping, and a future observe-only
+				// counter is covered without anyone remembering to extend an
+				// exception here.
+				if _, ok := expr["drop"]; ok {
+					drops = true
+				}
+			}
+			if !counted {
+				continue
+			}
+			if i, ok := counterIdx[rule.Comment]; ok {
+				counters[i].Packets += c.Packets
+				counters[i].Bytes += c.Bytes
+				counters[i].Drops = counters[i].Drops || drops
+				continue
+			}
+			counterIdx[rule.Comment] = len(counters)
+			counters = append(counters, model.ProtectCounter{
+				Name: rule.Comment, Packets: c.Packets, Bytes: c.Bytes,
+				Drops: drops,
+			})
 		}
 		if set := item.Set; set != nil {
 			if set.Name == "blocked" {
@@ -803,41 +827,39 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 	return counters, blocked, locked, nil
 }
 
-// parseLockedElem reads one lockdown set element: a bare port number, or an
-// object carrying the seconds until the lock releases. The same two shapes nft
-// emits for the blocklist, with a number where that one has an address.
-func parseLockedElem(raw json.RawMessage) (model.GeoLockedPort, bool) {
-	var plain int
-	if json.Unmarshal(raw, &plain) == nil && plain > 0 {
-		return model.GeoLockedPort{Port: plain}, true
+// parseSetElem reads one dynamic-set element in either shape nft -j emits: a
+// bare value for an element with no timeout left to report, or an object
+// carrying the remaining seconds. One function rather than a copy per set,
+// because this is the knowledge of how nft renders elements - an nft version
+// shifting the shape must be absorbed once, not remembered at every readback.
+func parseSetElem[T comparable](raw json.RawMessage) (val T, expires int, ok bool) {
+	var zero T
+	var plain T
+	if json.Unmarshal(raw, &plain) == nil && plain != zero {
+		return plain, 0, true
 	}
 	var wrapped struct {
 		Elem struct {
-			Val     int `json:"val"`
+			Val     T   `json:"val"`
 			Expires int `json:"expires"`
 		} `json:"elem"`
 	}
-	if json.Unmarshal(raw, &wrapped) == nil && wrapped.Elem.Val > 0 {
-		return model.GeoLockedPort{Port: wrapped.Elem.Val, ExpiresSec: wrapped.Elem.Expires}, true
+	if json.Unmarshal(raw, &wrapped) == nil && wrapped.Elem.Val != zero {
+		return wrapped.Elem.Val, wrapped.Elem.Expires, true
 	}
-	return model.GeoLockedPort{}, false
+	return zero, 0, false
 }
 
-// parseBlockedElem handles both shapes nft emits: a bare address for an element
-// with no timeout left to report, and an object carrying the remaining seconds.
+// parseLockedElem reads one lockdown set element: a port and the seconds until
+// the lock releases.
+func parseLockedElem(raw json.RawMessage) (model.GeoLockedPort, bool) {
+	port, expires, ok := parseSetElem[int](raw)
+	return model.GeoLockedPort{Port: port, ExpiresSec: expires}, ok
+}
+
+// parseBlockedElem reads one blocklist element: an address and the seconds
+// until the parking expires.
 func parseBlockedElem(raw json.RawMessage) (model.BlockedSource, bool) {
-	var plain string
-	if json.Unmarshal(raw, &plain) == nil {
-		return model.BlockedSource{Address: plain}, true
-	}
-	var wrapped struct {
-		Elem struct {
-			Val     string `json:"val"`
-			Expires int    `json:"expires"`
-		} `json:"elem"`
-	}
-	if json.Unmarshal(raw, &wrapped) == nil && wrapped.Elem.Val != "" {
-		return model.BlockedSource{Address: wrapped.Elem.Val, ExpiresSec: wrapped.Elem.Expires}, true
-	}
-	return model.BlockedSource{}, false
+	addr, expires, ok := parseSetElem[string](raw)
+	return model.BlockedSource{Address: addr, ExpiresSec: expires}, ok
 }

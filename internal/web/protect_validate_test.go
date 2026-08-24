@@ -289,3 +289,27 @@ func TestNegativeRegionLockNumbersAreRefused(t *testing.T) {
 		t.Error("a negative auto-lock threshold was accepted")
 	}
 }
+
+// The caps are one story: a configuration validate accepts must always fit
+// back through the PUT body cap, or one generous region blocks every later
+// save of anything with an opaque "request body too large". Refused here,
+// where the error can say which lists to trim, before the body cap ever has
+// to say nothing.
+func TestRegionListsOverTheTotalCapAreRefused(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Frontend.PublicIface = "eth0"
+	cfg.Protect.Enabled = true
+	entries := make([]string, (maxRegionsBytes/len("203.0.113.0/24"))+2)
+	for i := range entries {
+		entries[i] = "203.0.113.0/24"
+	}
+	cfg.Protect.Regions = []model.GeoRegion{{Name: "everything", CIDRs: entries}}
+
+	err := validate(&cfg)
+	if err == nil {
+		t.Fatal("a region list larger than a save can carry was accepted")
+	}
+	if !strings.Contains(err.Error(), "trim a list") {
+		t.Errorf("the error does not say what to do: %v", err)
+	}
+}

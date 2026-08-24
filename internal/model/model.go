@@ -809,8 +809,8 @@ type ProtectStatus struct {
 }
 
 // ProtectCounter is one limiter's tally since the rules were last loaded.
-// Saving the configuration reloads them, so these reset when you change a
-// setting.
+// Saving a change to the protection settings reloads them, so these reset
+// when a limit is edited; a save that leaves protection untouched does not.
 type ProtectCounter struct {
 	Name    string `json:"name"`
 	Packets int64  `json:"packets"`
@@ -818,9 +818,10 @@ type ProtectCounter struct {
 
 	// Drops says whether the packets counted were discarded. The auto-lock
 	// trip counter observes a threshold being crossed and drops nothing, and
-	// the portal's "packets dropped" total must not include it. Carried here,
-	// where the rule was generated, rather than sniffed off the counter's
-	// name in the portal: a name is a label, not a semantic.
+	// the portal's "packets dropped" total must not include it. Read from
+	// the rule's own drop verdict in the kernel readback rather than sniffed
+	// off the counter's name in the portal: a name is a label, not a
+	// semantic, and the verdict cannot go stale when a counter is added.
 	Drops bool `json:"drops"`
 }
 

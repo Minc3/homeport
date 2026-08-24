@@ -620,9 +620,11 @@ must be enabled for any of this to exist.
    about a minute after it stops (**Auto-lock release** tunes that). Set the
    threshold above the busiest legitimate moment you have measured, because
    in-region traffic counts towards it too. Engaged locks are announced on the
-   dashboard. Saving the configuration reloads the rules, which releases an
-   engaged lock until the flood trips it again - like the counters resetting,
-   a property of the reload - so hold off saving mid-attack.
+   dashboard. Saving a change to the protection settings reloads the rules,
+   which releases an engaged lock until the flood trips it again - like the
+   counters resetting, a property of the reload. A save that leaves
+   protection untouched skips the reload, so editing an unrelated setting
+   mid-attack costs nothing.
 
 It matches where an address is allocated, not where a player is: a VPN
 endpoint inside the region walks straight through. It keeps a server regional

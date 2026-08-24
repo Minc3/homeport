@@ -730,7 +730,11 @@ replace a working allowlist with nobody watching, while staleness only costs
 a few newly allocated networks. It is also whole-or-nothing (`fetchCountry`):
 a truncated download is valid CIDRs all the way to the cut, so any bad line,
 an empty list, or a response over the size cap fails the entire request
-rather than becoming a plausible fragment of an allowlist - and
+rather than becoming a plausible fragment of an allowlist. The caps are one
+ordered story (`geoFetchMaxTotal` < `maxRegionsBytes` < `maxConfigBytes`):
+what a fetch fills in must fit back through a save, or the button hands the
+operator a form the save endpoint refuses with "request body too large" on
+every save until the list is trimmed by hand - and
 `deploy/geo-zones.sh` buffers for the same reason, printing nothing unless
 every country fetched, because a redirect holding half a region is that same
 fragment made by hand. Country codes are
@@ -794,12 +798,16 @@ exactly like the service being down to everybody outside the region.
 players cannot connect" and "that threshold is too tight" look identical from
 outside. Every drop rule carries a `counter` and a comment; `sysx.ProtectState`
 reads them back out of the kernel with `nft -j`, because the numbers live in the
-rules and reloading the table resets them. The portal shows them beside the
-parked sources. Whether a counter's packets were dropped is the API's
-`ProtectCounter.Drops` flag, decided where the rules are generated - the
-auto-lock trip counter observes a threshold and drops nothing - so the portal
-never infers semantics from a counter's name, where "geo" being a prefix of
-"geo-trip" is a trap waiting for a `startsWith`. The lockdown sets are read
+rules and reloading the table resets them. That is also why a save that leaves
+the generated protection ruleset unchanged skips the reload (`Engine.
+protectApplied`): the reload resets the counters, unparks every blocked source
+and releases every engaged region lock, and an operator saving a probe interval
+mid-flood must not hand the flood a clean slate. The portal shows the numbers
+beside the parked sources. Whether a counter's packets were dropped is the
+API's `ProtectCounter.Drops` flag, read from the rule's own drop verdict in
+the same `nft -j` readback - the auto-lock trip counter carries none - so
+neither the portal nor the parser infers semantics from a counter's name,
+where "geo" being a prefix of "geo-trip" is a trap waiting for a `startsWith`. The lockdown sets are read
 back by their two exact names, never by the `geo_lockdown_` prefix, because
 region sets share that namespace and an operator's `lockdown_eu` must not be
 scanned as engaged-lock state for a protocol called "eu".
