@@ -6,8 +6,11 @@ type or check.
 Nothing here explains how the system works or why it is built this way. That is
 [REFERENCE.md](../REFERENCE.md) for the behaviour and [CLAUDE.md](../CLAUDE.md)
 for the internals. If a step looks arbitrary, the reason is in one of those two.
-In a hurry, on the shipped defaults, with nothing optional?
+
+**In a hurry, on the shipped defaults, with nothing optional?**
 [SIMPLE-SETUP.md](SIMPLE-SETUP.md) is the same install in a tenth of the words.
+It works in the same order as this guide, so you can start there and come
+back here the moment something needs checking or explaining.
 
 Done on Debian 13 and Ubuntu 24.04. Any other systemd distribution will
 probably work and has not been tried.

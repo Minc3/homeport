@@ -767,10 +767,10 @@ function serviceRow(s, c, onRemove) {
     el('td', {}, num('', s.port, (v) => (s.port = v), { min: 1, placeholder: '27015' })),
     el('td', {}, num('', s.port_end, (v) => (s.port_end = v), { min: 0, placeholder: '0 = single port' })),
     el('td', {}, hostSelect(s.target, c, (v) => (s.target = v))),
-    el('td', {}, checkbox('', s.source_engine, (v) => (s.source_engine = v))),
     el('td', {}, num('', s.ceiling_pps, (v) => (s.ceiling_pps = v || 0), { min: 0, placeholder: '0 = off' })),
     el('td', {}, regionSelect(s, c, (v, block) => { s.geo_regions = v; s.geo_block = block; })),
     el('td', {}, num('', s.geo_auto_pps, (v) => (s.geo_auto_pps = v || 0), { min: 0, placeholder: '0 = always' })),
+    el('td', {}, checkbox('', s.source_engine, (v) => (s.source_engine = v))),
     el('td', {}, checkbox('', s.enabled, (v) => (s.enabled = v))),
     el('td', {}, el('button', { class: 'btn danger', type: 'button', onclick: onRemove }, 'Remove')),
   );
@@ -1295,9 +1295,6 @@ function renderSettings() {
         th('Published to', 'The machine this service runs on: the backend, which is what most sites want, '
           + 'or one of the linkers from the section below. A linker has to be added there before it appears here, '
           + 'because publishing to an address with no host behind it looks exactly like the service being down.'),
-        th('Source engine', 'Tick for a Source game port. It does nothing unless protection is on, and then it lets the connectionless packets, '
-          + 'the A2S queries and connection attempts, which are what gets flooded, be rate limited on their own. '
-          + 'A player already in the game sends sequence-numbered packets and is never touched by it.'),
         th('Ceiling pps', 'A cap on this service in total, across every client, in packets per second. 0 is off. '
           + 'Set it above the busiest legitimate moment you have measured and below what the active tunnel can carry: '
           + 'the point is that a flood is discarded here rather than filling a 20 Mbit LTE link and being billed to your quota.'),
@@ -1311,6 +1308,9 @@ function renderSettings() {
           + 'flood lasts, and releases on its own once it stops. The threshold counts every packet to the row\'s ports together, '
           + 'in-region traffic included, so it belongs above the busiest legitimate moment you have measured: a full server tripping '
           + 'it costs out-of-region players their access.'),
+        th('Source engine', 'Tick for a Source game port. It does nothing unless protection is on, and then it lets the connectionless packets, '
+          + 'the A2S queries and connection attempts, which are what gets flooded, be rate limited on their own. '
+          + 'A player already in the game sends sequence-numbered packets and is never touched by it.'),
         th('Enabled', 'Untick to stop publishing without losing the row. The rule disappears from the ruleset on the next save.'),
         el('th', {}),
       )),

@@ -14,6 +14,17 @@ real IP address, on UDP as much as on TCP.
 Those are deliberately left to you. It assumes the tunnels exist and are correct,
 and steers traffic across them.
 
+## Installing
+
+Two guides to the same install, in the same order, so you can swap between
+them at any point:
+
+- **[deploy/SIMPLE-SETUP.md](deploy/SIMPLE-SETUP.md)**: the bare minimum on
+  the shipped defaults, five short steps.
+- **[deploy/SETUP.md](deploy/SETUP.md)**: the full walk-through, with the
+  verification at each stage, the optional features, and what to do when
+  something does not match.
+
 ## The two things it does
 
 ### Your services see the client's real IP address, on UDP as well as TCP
