@@ -741,13 +741,38 @@ function serviceRow(s, c, onRemove) {
     el('td', {}, hostSelect(s.target, c, (v) => (s.target = v))),
     el('td', {}, checkbox('', s.source_engine, (v) => (s.source_engine = v))),
     el('td', {}, num('', s.ceiling_pps, (v) => (s.ceiling_pps = v || 0), { min: 0, placeholder: '0 = off' })),
-    el('td', {}, field('', (s.geo_regions || []).join(', '), (v) => {
-      s.geo_regions = v.split(',').map((t) => t.trim()).filter(Boolean);
-    }, { placeholder: 'anywhere' })),
+    el('td', {}, regionSelect(s, c, (v) => (s.geo_regions = v))),
     el('td', {}, num('', s.geo_auto_pps, (v) => (s.geo_auto_pps = v || 0), { min: 0, placeholder: '0 = always' })),
     el('td', {}, checkbox('', s.enabled, (v) => (s.enabled = v))),
     el('td', {}, el('button', { class: 'btn danger', type: 'button', onclick: onRemove }, 'Remove')),
   );
+}
+
+// regionSelect is the "which region" dropdown for a service row: anywhere, or
+// one of the regions defined under Protection. Options come from that table
+// rather than being typed, for the same reason hostSelect's do: a mistyped
+// name is refused at save, and a dropdown cannot mistype. A stored value that
+// matches no region (a renamed row, or several regions on one service, which
+// the API allows and this dropdown keeps but does not build) stays visible as
+// its own option instead of being silently shown as anywhere, so what would
+// be saved is what is on screen.
+function regionSelect(s, c, onChange) {
+  const value = (s.geo_regions || []).join(', ');
+  const sel = el('select', {});
+  sel.append(el('option', { value: '', text: 'anywhere' }));
+  const known = new Set();
+  for (const r of (c.protect && c.protect.regions) || []) {
+    if (!r.name || known.has(r.name)) continue;
+    known.add(r.name);
+    sel.append(el('option', { value: r.name, text: r.name }));
+  }
+  if (value && !known.has(value)) {
+    const label = value.includes(',') ? `${value} (several regions)` : `${value} (no such region)`;
+    sel.append(el('option', { value, text: label }));
+  }
+  sel.value = value;
+  sel.addEventListener('change', () => onChange(sel.value.split(',').map((t) => t.trim()).filter(Boolean)));
+  return sel;
 }
 
 // A region is a name and a pile of networks, filled either way: the Fetch
@@ -758,7 +783,7 @@ function serviceRow(s, c, onRemove) {
 // The fetch fills the form and nothing else. What came back is on screen, the
 // unsaved badge is lit, and it goes through Save and validation exactly like
 // something typed - the configuration is never touched by the fetch itself.
-function regionRow(r, onRemove) {
+function regionRow(r, onRemove, onChange) {
   const ta = el('textarea', { rows: 4, placeholder: '1.128.0.0/11\n101.160.0.0/11\n…' });
   ta.value = (r.cidrs || []).join('\n');
   ta.addEventListener('input', () => {
@@ -794,7 +819,7 @@ function regionRow(r, onRemove) {
   }, 'Fetch');
 
   return el('tr', {},
-    el('td', {}, field('', r.name, (v) => (r.name = v), { placeholder: 'oceania' })),
+    el('td', {}, field('', r.name, (v) => { r.name = v; onChange(); }, { placeholder: 'oceania' })),
     el('td', {}, el('div', { class: 'row' }, codes, fetchBtn)),
     el('td', {}, ta),
     el('td', {}, el('button', { class: 'btn danger', type: 'button', onclick: onRemove }, 'Remove')),
@@ -1231,9 +1256,10 @@ function renderSettings() {
         th('Ceiling pps', 'A cap on this service in total, across every client, in packets per second. 0 is off. '
           + 'Set it above the busiest legitimate moment you have measured and below what the active tunnel can carry: '
           + 'the point is that a flood is discarded here rather than filling a 20 Mbit LTE link and being billed to your quota.'),
-        th('Regions', 'Lock this port to the named regions, comma separated: everything arriving from outside them is dropped '
-          + 'before it is translated or sent down a tunnel. Blank means reachable from anywhere. The regions themselves are defined '
-          + 'in the Protection section below, and like everything there the lock only exists while protection is enabled.'),
+        th('Region', 'Lock this port to a region: everything arriving from outside it is dropped before it is translated '
+          + 'or sent down a tunnel. Anywhere means no lock. The regions on offer are defined in the Protection section below, '
+          + 'so add one there first, and like everything in that section the lock only exists while protection is enabled. '
+          + 'Several regions on one service are possible through the API and are kept if present.'),
         th('Auto-lock pps', 'Leave 0 and the lock above is permanent. Set a packets-per-second threshold instead and the port stays '
           + 'open to the world until its total traffic exceeds it: the lock then engages in the kernel at line rate, holds while the '
           + 'flood lasts, and releases on its own once it stops. The threshold counts every packet to the row\'s ports together, '
@@ -1255,12 +1281,22 @@ function renderSettings() {
   if (!pr.regions) pr.regions = [];
 
   const regionBody = el('tbody', {});
+  // The services table's Regions dropdown is built from this table, so a
+  // rename rebuilds it. Debounced for the same reason the linker refresh is:
+  // the name field fires per keystroke, and rebuilt eagerly every half-typed
+  // name landed in the dropdowns as an option.
+  let regionRefresh = 0;
+  const regionsChanged = () => {
+    clearTimeout(regionRefresh);
+    regionRefresh = setTimeout(renderServices, 400);
+  };
   const renderRegions = () => {
     regionBody.textContent = '';
     pr.regions.forEach((r, i) => regionBody.append(regionRow(r, () => {
       pr.regions.splice(i, 1);
       renderRegions();
-    })));
+      renderServices();
+    }, regionsChanged)));
   };
   renderRegions();
 
