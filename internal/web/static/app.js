@@ -471,7 +471,7 @@ function renderProtect(p) {
   const locked = p.geo_locked || [];
   for (const l of locked) {
     body.append(el('div', { class: 'alert info' },
-      el('p', { text: `Region lock engaged on ${l.proto}/${l.port}: traffic to it exceeded the auto-lock threshold, and sources outside its allowed regions are being dropped. `
+      el('p', { text: `Region lock engaged on ${l.proto}/${l.port}: traffic to it exceeded the auto-lock threshold, and the sources its lock bars are being dropped. `
         + (l.expires_sec ? `Releases in ${l.expires_sec}s unless the flood is still refreshing it.` : 'Releasing shortly.') }),
     ));
   }
@@ -769,7 +769,7 @@ function serviceRow(s, c, onRemove) {
     el('td', {}, hostSelect(s.target, c, (v) => (s.target = v))),
     el('td', {}, checkbox('', s.source_engine, (v) => (s.source_engine = v))),
     el('td', {}, num('', s.ceiling_pps, (v) => (s.ceiling_pps = v || 0), { min: 0, placeholder: '0 = off' })),
-    el('td', {}, regionSelect(s, c, (v) => (s.geo_regions = v))),
+    el('td', {}, regionSelect(s, c, (v, block) => { s.geo_regions = v; s.geo_block = block; })),
     el('td', {}, num('', s.geo_auto_pps, (v) => (s.geo_auto_pps = v || 0), { min: 0, placeholder: '0 = always' })),
     el('td', {}, checkbox('', s.enabled, (v) => (s.enabled = v))),
     el('td', {}, el('button', { class: 'btn danger', type: 'button', onclick: onRemove }, 'Remove')),
@@ -785,21 +785,33 @@ function serviceRow(s, c, onRemove) {
 // its own option instead of being silently shown as anywhere, so what would
 // be saved is what is on screen.
 function regionSelect(s, c, onChange) {
-  const value = (s.geo_regions || []).join(', ');
+  // Each region offers both directions: "only x" admits that region and drops
+  // the rest of the world, "block x" drops that region and admits the rest.
+  // A leading ! on the option value carries the direction; the stored config
+  // keeps them apart as geo_regions plus geo_block.
+  const names = (s.geo_regions || []).join(', ');
+  const value = s.geo_block && names ? '!' + names : names;
   const sel = el('select', {});
   sel.append(el('option', { value: '', text: 'anywhere' }));
-  const known = new Set();
+  const known = new Set(['']);
   for (const r of (c.protect && c.protect.regions) || []) {
     if (!r.name || known.has(r.name)) continue;
     known.add(r.name);
-    sel.append(el('option', { value: r.name, text: r.name }));
+    known.add('!' + r.name);
+    sel.append(el('option', { value: r.name, text: `only ${r.name}` }));
+    sel.append(el('option', { value: '!' + r.name, text: `block ${r.name}` }));
   }
   if (value && !known.has(value)) {
-    const label = value.includes(',') ? `${value} (several regions)` : `${value} (no such region)`;
+    const prefix = s.geo_block ? 'block' : 'only';
+    const label = names.includes(',') ? `${prefix} ${names} (several regions)` : `${prefix} ${names} (no such region)`;
     sel.append(el('option', { value, text: label }));
   }
   sel.value = value;
-  sel.addEventListener('change', () => onChange(sel.value.split(',').map((t) => t.trim()).filter(Boolean)));
+  sel.addEventListener('change', () => {
+    const block = sel.value.startsWith('!');
+    const list = sel.value.replace(/^!/, '').split(',').map((t) => t.trim()).filter(Boolean);
+    onChange(list, block && list.length > 0);
+  });
   return sel;
 }
 
@@ -1289,9 +1301,10 @@ function renderSettings() {
         th('Ceiling pps', 'A cap on this service in total, across every client, in packets per second. 0 is off. '
           + 'Set it above the busiest legitimate moment you have measured and below what the active tunnel can carry: '
           + 'the point is that a flood is discarded here rather than filling a 20 Mbit LTE link and being billed to your quota.'),
-        th('Region', 'Lock this port to a region: everything arriving from outside it is dropped before it is translated '
-          + 'or sent down a tunnel. Anywhere means no lock. The regions on offer are defined in the Protection section below, '
-          + 'so add one there first, and like everything in that section the lock only exists while protection is enabled. '
+        th('Region', 'Two directions per region: "only x" admits that region and drops the rest of the world, "block x" drops '
+          + 'that region and admits everyone else. Either way the drop happens before anything is translated or sent down a '
+          + 'tunnel, and anywhere means no lock. The regions on offer are defined in the Protection section below, so add one '
+          + 'there first, and like everything in that section the lock only exists while protection is enabled. '
           + 'Several regions on one service are possible through the API and are kept if present.'),
         th('Auto-lock pps', 'Leave 0 and the lock above is permanent. Set a packets-per-second threshold instead and the port stays '
           + 'open to the world until its total traffic exceeds it: the lock then engages in the kernel at line rate, holds while the '

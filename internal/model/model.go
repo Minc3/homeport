@@ -128,9 +128,9 @@ type ProtectConfig struct {
 // schedule, and validation refuses anything nftables would choke on, so a
 // typo is a rejected save rather than a rejected table.
 //
-// It is also only ever an allowlist. Locking a port to a region means
-// dropping the rest of the internet, which is a much smaller thing to reason
-// about than a blocklist that has to enumerate what it is afraid of.
+// A region is direction-neutral: it is only a list. Each service chooses how
+// to use one - admit only these sources (the default) or drop exactly these
+// sources (Service.GeoBlock) - so the list can serve both jobs unchanged.
 type GeoRegion struct {
 	// Name is how services refer to the region. It becomes an nftables set
 	// name (geo_<name>), so validation holds it to lowercase letters, digits,
@@ -624,6 +624,14 @@ type Service struct {
 	// tidiness: unticking the protection master switch must remain the one
 	// action that backs every filter out at once, region locks included.
 	GeoRegions []string `json:"geo_regions,omitempty"`
+
+	// GeoBlock inverts the lock: instead of admitting only the named regions,
+	// drop them and admit everywhere else. False, the shipped and historical
+	// value, is the allow-only lock above. The regions themselves are
+	// direction-neutral lists; which way a port uses one is decided here, per
+	// service, so one "au" region can lock a game server to Australia and bar
+	// Australia from something else at the same time.
+	GeoBlock bool `json:"geo_block,omitempty"`
 
 	// GeoAutoPPS makes the lock conditional: the port stays open to the world
 	// until its total arriving traffic exceeds this many packets per second,

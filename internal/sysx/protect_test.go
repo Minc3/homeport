@@ -581,3 +581,78 @@ func TestCollidingFoldedRegionNamesEmitOneSet(t *testing.T) {
 		t.Errorf("the folded set is defined %d times; nft loads it once or not at all:\n%s", got, ruleset)
 	}
 }
+
+// The inverted lock: block the named region, admit everywhere else. A positive
+// set match rather than a negated one, and never both on one rule.
+func TestABlockLockDropsOnlyTheRegion(t *testing.T) {
+	cfg := geoCfg()
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoBlock = true
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	want := `tcp dport 25565 ip saddr @geo_oceania counter drop comment "geo:minecraft"`
+	if !strings.Contains(ruleset, want) {
+		t.Errorf("want the block rule %q in:\n%s", want, ruleset)
+	}
+	for _, line := range strings.Split(ruleset, "\n") {
+		if strings.Contains(line, "@geo_") && strings.Contains(line, "!=") {
+			t.Errorf("a block lock generated a negated match, which is the allow direction: %q", line)
+		}
+	}
+}
+
+// Several blocked regions are an OR - drop a source inside any of them - and
+// one rule ANDs its matches, so it has to be one rule per region. A single
+// rule with two positive matches would drop only their intersection, which is
+// usually nothing, and the lock would silently admit both regions.
+func TestABlockOnSeveralRegionsDropsAnyOfThem(t *testing.T) {
+	cfg := geoCfg()
+	cfg.Protect.Regions = append(cfg.Protect.Regions,
+		model.GeoRegion{Name: "aotearoa", CIDRs: []string{"49.224.0.0/14"}})
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoRegions = []string{"oceania", "aotearoa"}
+			cfg.Services[i].GeoBlock = true
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	for _, want := range []string{
+		`tcp dport 25565 ip saddr @geo_oceania counter drop comment "geo:minecraft"`,
+		`tcp dport 25565 ip saddr @geo_aotearoa counter drop comment "geo:minecraft"`,
+	} {
+		if !strings.Contains(ruleset, want) {
+			t.Errorf("want %q in:\n%s", want, ruleset)
+		}
+	}
+	for _, line := range strings.Split(ruleset, "\n") {
+		if strings.Contains(line, "@geo_oceania") && strings.Contains(line, "@geo_aotearoa") {
+			t.Errorf("two blocked regions share one rule, which drops their intersection instead of their union: %q", line)
+		}
+	}
+}
+
+// The automatic variant of the block direction: the same trigger and lockdown
+// set as the allow direction, with each block rule conditional on the port
+// being locked.
+func TestAnAutoBlockOnlyDropsWhileEngaged(t *testing.T) {
+	cfg := geoCfg()
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoBlock = true
+			cfg.Services[i].GeoAutoPPS = 50000
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	if !strings.Contains(ruleset, `update @geo_lockdown_tcp { th dport timeout 60s }`) {
+		t.Errorf("no trigger rule was generated:\n%s", ruleset)
+	}
+	want := `tcp dport 25565 th dport @geo_lockdown_tcp ip saddr @geo_oceania counter drop comment "geo:minecraft"`
+	if !strings.Contains(ruleset, want) {
+		t.Errorf("want the conditional block %q in:\n%s", want, ruleset)
+	}
+}

@@ -48,6 +48,7 @@ type ProtectService struct {
 	SourceEngine bool
 	CeilingPPS   int
 	GeoRegions   []string
+	GeoBlock     bool
 	GeoAutoPPS   int
 }
 
@@ -345,7 +346,7 @@ func ProtectSpecFrom(cfg model.Config) ProtectSpec {
 		spec.Services = append(spec.Services, ProtectService{
 			Name: s.Name, Proto: proto, Port: s.Port, PortEnd: s.PortEnd,
 			SourceEngine: s.SourceEngine, CeilingPPS: s.CeilingPPS,
-			GeoRegions: s.GeoRegions, GeoAutoPPS: s.GeoAutoPPS,
+			GeoRegions: s.GeoRegions, GeoBlock: s.GeoBlock, GeoAutoPPS: s.GeoAutoPPS,
 		})
 	}
 	return spec
@@ -510,41 +511,54 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 		fmt.Fprintf(&b, "\t\tip saddr %s counter drop comment %q\n", martianSet(), CounterSpoofed)
 	}
 	if len(geoSvcs) > 0 {
-		b.WriteString("\t\t# Region locks: everything outside a service's allowed regions is\n")
-		b.WriteString("\t\t# dropped. Before conntrack and on every packet, not just new\n")
-		b.WriteString("\t\t# connections: the set answer is fixed per address, so a player from\n")
-		b.WriteString("\t\t# an allowed region can never be newly caught by it, while matching\n")
-		b.WriteString("\t\t# statelessly means an out-of-region flood costs no conntrack entry\n")
-		b.WriteString("\t\t# and a lock engaging also ends flows already in progress.\n")
+		b.WriteString("\t\t# Region locks: an allow lock drops everything outside its regions,\n")
+		b.WriteString("\t\t# a block lock drops exactly what is inside them. Before conntrack\n")
+		b.WriteString("\t\t# and on every packet, not just new connections: the set answer is\n")
+		b.WriteString("\t\t# fixed per address, so a player the lock admits can never be newly\n")
+		b.WriteString("\t\t# caught by it, while matching statelessly means a barred flood costs\n")
+		b.WriteString("\t\t# no conntrack entry and a lock engaging also ends flows already in\n")
+		b.WriteString("\t\t# progress.\n")
 		for _, sv := range geoSvcs {
-			var matches strings.Builder
+			// The conditional lock, engaged and released entirely in the
+			// kernel. The trigger runs first and takes no verdict, so it sees
+			// the whole flood - including the packets the drop beneath it is
+			// discarding - and keeps refreshing the lock for as long as the
+			// flood lasts; put after the drop it would only see surviving
+			// traffic, release mid-attack, and let a burst through every
+			// timeout. The drops then apply only while the port is in the
+			// lockdown set.
+			lockCond := ""
+			if sv.GeoAutoPPS > 0 {
+				fmt.Fprintf(&b, "\t\t%s dport %s limit rate over %d/second update @%s { th dport timeout %ds } counter comment %q\n",
+					sv.Proto, portSpec(sv.Port, sv.PortEnd), sv.GeoAutoPPS,
+					geoLockSetName(sv.Proto), spec.geoLockSeconds(),
+					CounterGeoTrip+":"+sv.Name)
+				lockCond = fmt.Sprintf("th dport @%s ", geoLockSetName(sv.Proto))
+			}
+			if sv.GeoBlock {
+				// Inverted: drop a source inside any named region. That is an
+				// OR, and one rule ANDs its matches, so it is one rule per
+				// region rather than one rule per service.
+				for _, name := range sv.GeoRegions {
+					if len(geoElems[name]) == 0 {
+						continue
+					}
+					fmt.Fprintf(&b, "\t\t%s dport %s %sip saddr @%s counter drop comment %q\n",
+						sv.Proto, portSpec(sv.Port, sv.PortEnd), lockCond,
+						geoSetName(name), CounterGeo+":"+sv.Name)
+				}
+				continue
+			}
 			// Several regions AND together as negations: dropped only when the
 			// source is inside none of them, which is the union as an allowlist.
+			var matches strings.Builder
 			for _, name := range sv.GeoRegions {
 				if len(geoElems[name]) > 0 {
 					fmt.Fprintf(&matches, "ip saddr != @%s ", geoSetName(name))
 				}
 			}
-			if sv.GeoAutoPPS > 0 {
-				// The conditional lock, engaged and released entirely in the
-				// kernel. The trigger runs first and takes no verdict, so it
-				// sees the whole flood - including the packets the next rule is
-				// dropping - and keeps refreshing the lock for as long as the
-				// flood lasts; put after the drop it would only see surviving
-				// traffic, release mid-attack, and let a burst through every
-				// timeout. The drop then applies only while the port is in the
-				// lockdown set.
-				fmt.Fprintf(&b, "\t\t%s dport %s limit rate over %d/second update @%s { th dport timeout %ds } counter comment %q\n",
-					sv.Proto, portSpec(sv.Port, sv.PortEnd), sv.GeoAutoPPS,
-					geoLockSetName(sv.Proto), spec.geoLockSeconds(),
-					CounterGeoTrip+":"+sv.Name)
-				fmt.Fprintf(&b, "\t\t%s dport %s th dport @%s %scounter drop comment %q\n",
-					sv.Proto, portSpec(sv.Port, sv.PortEnd), geoLockSetName(sv.Proto),
-					matches.String(), CounterGeo+":"+sv.Name)
-				continue
-			}
-			fmt.Fprintf(&b, "\t\t%s dport %s %scounter drop comment %q\n",
-				sv.Proto, portSpec(sv.Port, sv.PortEnd), matches.String(),
+			fmt.Fprintf(&b, "\t\t%s dport %s %s%scounter drop comment %q\n",
+				sv.Proto, portSpec(sv.Port, sv.PortEnd), lockCond, matches.String(),
 				CounterGeo+":"+sv.Name)
 		}
 	}

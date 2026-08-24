@@ -607,8 +607,10 @@ must be enabled for any of this to exist.
    the current aggregated lists into the box for you to review. Or paste
    networks by hand, one per line; `deploy/geo-zones.sh au nz` prints the same
    data offline.
-2. On the service row, set **Regions** to `oceania` and save. Everything
+2. On the service row, set **Region** to `only oceania` and save. Everything
    arriving from outside the region is now dropped before it is translated.
+   The same dropdown offers `block oceania`, which is the inverse: that
+   region is dropped and the rest of the world admitted.
 3. Optional, instead of a permanent lock: set **Auto-lock pps** on the row.
    The port stays open to the world until its traffic exceeds that rate; the
    lock then engages in the kernel, holds while the flood lasts, and releases

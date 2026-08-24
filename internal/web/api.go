@@ -608,6 +608,12 @@ func validate(cfg *model.Config) error {
 			refs = append(refs, name)
 		}
 		sv.GeoRegions = refs
+		// A direction with nothing to point it at. Cleared rather than
+		// refused: it is what unpicking a block lock leaves behind, and it
+		// changes nothing.
+		if len(sv.GeoRegions) == 0 {
+			sv.GeoBlock = false
+		}
 		if sv.GeoAutoPPS < 0 {
 			return fmt.Errorf("service %s has a negative auto-lock threshold", sv.Name)
 		}

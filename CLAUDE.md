@@ -743,10 +743,15 @@ conntrack entry, and a lock engaging also ends flows already in progress. The
 lists are merged in Go before they reach the file (`mergeCIDRs`), because CIDR
 blocks either nest or are disjoint and nft rejects the whole table over one
 contained duplicate - a generous paste must not take every limit down.
-Regions are only ever an allowlist, and a reference that resolves to nothing
-generates no rule rather than a drop-everything: `web.validate` refuses the
-dangling reference at save, and the build must not take a published service
-off the air over an older or hand-edited blob.
+A region is direction-neutral: `Service.GeoBlock` chooses per service between
+admitting only the named regions (the default, negated lookups ANDed into one
+rule) and dropping exactly them (one positive-match rule per region, because
+"inside any of them" is an OR and a single rule ANDs its matches - two blocked
+regions on one rule would drop only their intersection and silently admit
+both). A reference that resolves to nothing generates no rule rather than a
+drop-everything: `web.validate` refuses the dangling reference at save, and
+the build must not take a published service off the air over an older or
+hand-edited blob.
 
 **The automatic region lock lives entirely in the kernel, like the parking
 blocklist it copies.** `Service.GeoAutoPPS` makes the lock conditional: a
@@ -1632,7 +1637,10 @@ where a subtle regression would be invisible in production until an outage:
   interval`; overlapping and duplicate networks in a pasted list are merged
   (nft rejects the table over one contained duplicate); several regions on a
   service AND their negated lookups into one rule, which is the union as an
-  allowlist; a dangling region reference locks nothing rather than dropping
+  allowlist; the block direction matches positively and puts each region on
+  its own rule, so several blocked regions drop their union rather than their
+  intersection, with the auto variant conditional on the lockdown set like
+  the allow one; a dangling region reference locks nothing rather than dropping
   everything; the automatic lock's trigger precedes its drop so a locked flood
   keeps refreshing the lock, its lockdown set is dynamic and per protocol, and
   the release lag is configurable with zero meaning the shipped minute; region
