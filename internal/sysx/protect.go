@@ -2,8 +2,10 @@ package sysx
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -45,6 +47,8 @@ type ProtectService struct {
 	PortEnd      int
 	SourceEngine bool
 	CeilingPPS   int
+	GeoRegions   []string
+	GeoAutoPPS   int
 }
 
 // ProtectSpec is everything the ruleset is rendered from.
@@ -61,7 +65,24 @@ type ProtectSpec struct {
 	DropBogusTCP bool
 	DropSpoofed  bool
 
-	Services []ProtectService
+	GeoLockSeconds int
+	Regions        []model.GeoRegion
+	Services       []ProtectService
+}
+
+// DefaultGeoLockSeconds is how long an automatic region lock outlives the
+// flood that engaged it when the configuration does not say. See
+// model.ProtectConfig.GeoLockSeconds for the reasoning behind a minute.
+const DefaultGeoLockSeconds = 60
+
+// geoLockSeconds resolves the configured release lag, defaulting here rather
+// than in Normalise so an older blob and a zero left in the portal both mean
+// the same thing without a repair pass.
+func (s ProtectSpec) geoLockSeconds() int {
+	if s.GeoLockSeconds > 0 {
+		return s.GeoLockSeconds
+	}
+	return DefaultGeoLockSeconds
 }
 
 // active reports whether anything at all would be generated. A spec with the
@@ -85,7 +106,135 @@ func (s ProtectSpec) active() bool {
 			return true
 		}
 	}
+	if len(s.geoServices(s.geoRegionElems())) > 0 {
+		return true
+	}
 	return false
+}
+
+// geoRegionElems merges each region's networks into the elements its set will
+// hold, keyed by region name. A region that resolves to nothing - every entry
+// unparsable, or none at all - is absent from the map, so nothing downstream
+// can reference an empty set.
+func (s ProtectSpec) geoRegionElems() map[string][]string {
+	out := map[string][]string{}
+	for _, r := range s.Regions {
+		if els := mergeCIDRs(r.CIDRs); len(els) > 0 {
+			out[r.Name] = els
+		}
+	}
+	return out
+}
+
+// geoServices lists the services whose lock resolves to at least one real
+// set. A service whose every region reference dangles - a name no region
+// carries, or one whose list is empty - gets no rule at all rather than a
+// drop-everything: web.validate refuses both states at save time, so meeting
+// one here means an older or hand-edited blob, and inventing a total drop for
+// it would take a published service down in silence.
+func (s ProtectSpec) geoServices(elems map[string][]string) []ProtectService {
+	var out []ProtectService
+	for _, sv := range s.Services {
+		for _, name := range sv.GeoRegions {
+			if len(elems[name]) > 0 {
+				out = append(out, sv)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// geoSetName is the nftables set a region renders to. Validation holds region
+// names to characters nft accepts in an identifier, but the ruleset must stay
+// loadable whatever an older or hand-edited blob carries, so anything else is
+// folded to an underscore here rather than handed to nft to refuse - which
+// would reject the whole table, every other limit included.
+func geoSetName(name string) string {
+	var sb strings.Builder
+	sb.WriteString("geo_")
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteByte('_')
+		}
+	}
+	return sb.String()
+}
+
+// geoLockSetName is the dynamic set holding the ports whose automatic region
+// lock is currently engaged, one per protocol.
+func geoLockSetName(proto string) string {
+	return "geo_lockdown_" + strings.ToLower(proto)
+}
+
+// mergeCIDRs normalises a region's networks into elements one nftables set
+// will accept: parsed, masked to their network address, duplicates and
+// contained networks dropped. Two CIDR blocks either nest or are disjoint, so
+// containment is the only overlap there is - and it must be handled here for
+// the same reason mergePorts exists: nft rejects the whole table over one
+// overlapping element, and a pasted country list being generous is not an
+// error worth taking every limit down over.
+//
+// An entry that does not parse as an IPv4 network is skipped rather than
+// carried, on the same reasoning as geoServices: validation refuses it at
+// save, and one bad string in an old blob must not cost the table.
+func mergeCIDRs(cidrs []string) []string {
+	type block struct {
+		start, end uint32
+		text       string
+	}
+	var blocks []block
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(strings.TrimSpace(c))
+		if err != nil || n.IP.To4() == nil {
+			continue
+		}
+		ones, bits := n.Mask.Size()
+		if bits != 32 {
+			continue
+		}
+		start := binary.BigEndian.Uint32(n.IP.To4())
+		blocks = append(blocks, block{start, start | (0xffffffff >> ones), n.String()})
+	}
+	sort.Slice(blocks, func(i, j int) bool {
+		if blocks[i].start != blocks[j].start {
+			return blocks[i].start < blocks[j].start
+		}
+		return blocks[i].end > blocks[j].end // the containing network first
+	})
+	out := make([]string, 0, len(blocks))
+	lastEnd := int64(-1)
+	for _, bl := range blocks {
+		// Blocks nest or are disjoint, so ending inside the previous kept
+		// network means being contained in it (a duplicate included).
+		if int64(bl.end) <= lastEnd {
+			continue
+		}
+		out = append(out, bl.text)
+		lastEnd = int64(bl.end)
+	}
+	return out
+}
+
+// geoElements renders a set's elements a few to a line. The file is left on
+// disk as a readable record, and a region is routinely hundreds of networks
+// long; one line that long is a record nobody can read.
+func geoElements(elems []string) string {
+	var sb strings.Builder
+	for i, e := range elems {
+		if i > 0 {
+			sb.WriteString(",")
+			if i%6 == 0 {
+				sb.WriteString("\n\t\t\t")
+			} else {
+				sb.WriteString(" ")
+			}
+		}
+		sb.WriteString(e)
+	}
+	return sb.String()
 }
 
 func (s ProtectSpec) ports(proto string) []string {
@@ -179,9 +328,11 @@ func ProtectSpecFrom(cfg model.Config) ProtectSpec {
 		PacketsPerSec:     p.PacketsPerSec,
 		QueriesPerSec:     p.QueriesPerSec,
 		BlockSeconds:      p.BlockSeconds,
+		GeoLockSeconds:    p.GeoLockSeconds,
 		DropInvalid:       p.DropInvalid,
 		DropBogusTCP:      p.DropBogusTCP,
 		DropSpoofed:       p.DropSpoofed,
+		Regions:           p.Regions,
 	}
 	for _, s := range cfg.Services {
 		if !s.Enabled {
@@ -194,6 +345,7 @@ func ProtectSpecFrom(cfg model.Config) ProtectSpec {
 		spec.Services = append(spec.Services, ProtectService{
 			Name: s.Name, Proto: proto, Port: s.Port, PortEnd: s.PortEnd,
 			SourceEngine: s.SourceEngine, CeilingPPS: s.CeilingPPS,
+			GeoRegions: s.GeoRegions, GeoAutoPPS: s.GeoAutoPPS,
 		})
 	}
 	return spec
@@ -212,6 +364,8 @@ const (
 	CounterPacketRate = "packet-rate"
 	CounterQueryRate  = "query-rate"
 	CounterCeiling    = "ceiling"
+	CounterGeo        = "geo"
+	CounterGeoTrip    = "geo-trip"
 )
 
 // BuildProtectRuleset renders the edge filtering table, or "" when there is
@@ -271,6 +425,64 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 		dynSet("query_rate", 60)
 	}
 
+	// Region sets. Only the regions a locked service actually references
+	// become sets: an unreferenced region is a draft in the portal, not a
+	// rule, and a set nothing consults is dead weight the kernel still has to
+	// hold. Order follows the services so the output is stable across saves.
+	geoElems := spec.geoRegionElems()
+	geoSvcs := spec.geoServices(geoElems)
+	var geoOrder []string
+	seenGeo := map[string]bool{}
+	for _, sv := range geoSvcs {
+		for _, name := range sv.GeoRegions {
+			if len(geoElems[name]) == 0 {
+				continue
+			}
+			// Deduplicated on the folded set name, not the raw one: two names
+			// the folding makes identical are one set to nft, and emitting it
+			// twice rejects the whole table - the exact failure the folding
+			// exists to prevent. validate refuses the collision at save; an
+			// older blob carrying one gets the first region's list.
+			if set := geoSetName(name); !seenGeo[set] {
+				seenGeo[set] = true
+				geoOrder = append(geoOrder, name)
+			}
+		}
+	}
+	for _, name := range geoOrder {
+		fmt.Fprintf(&b, "\tset %s {\n", geoSetName(name))
+		b.WriteString("\t\ttype ipv4_addr\n")
+		// interval, because the elements are networks; without the flag a
+		// CIDR element is refused and the whole table with it.
+		b.WriteString("\t\tflags interval\n")
+		// Fixed text rather than the region's name: the set name already
+		// carries it, and a comment is the one place a hand-edited blob could
+		// smuggle a quote past the identifier folding above.
+		b.WriteString("\t\tcomment \"sources allowed to reach the services locked to this region\"\n")
+		fmt.Fprintf(&b, "\t\telements = { %s }\n", geoElements(geoElems[name]))
+		b.WriteString("\t}\n\n")
+	}
+
+	// The lockdown sets hold the ports whose automatic lock is currently
+	// engaged, written from the packet path exactly like the blocklist. One
+	// per protocol rather than one keyed on protocol and port together,
+	// because a plain inet_service key works on every kernel this deploys to
+	// and a tcp service on a port must not be locked by a udp flood to the
+	// same number.
+	lockSets := map[string]bool{}
+	for _, sv := range geoSvcs {
+		if sv.GeoAutoPPS > 0 && !lockSets[sv.Proto] {
+			lockSets[sv.Proto] = true
+			fmt.Fprintf(&b, "\tset %s {\n", geoLockSetName(sv.Proto))
+			b.WriteString("\t\ttype inet_service\n")
+			b.WriteString("\t\tsize 65535\n")
+			b.WriteString("\t\tflags dynamic,timeout\n")
+			fmt.Fprintf(&b, "\t\ttimeout %ds\n", spec.geoLockSeconds())
+			b.WriteString("\t\tcomment \"ports whose region lock is engaged; entries release on their own\"\n")
+			b.WriteString("\t}\n\n")
+		}
+	}
+
 	// The parking statement, appended to whichever limit tripped. Written the
 	// same way everywhere so the blocklist cannot end up populated by one limit
 	// and not another.
@@ -296,6 +508,45 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	if spec.DropSpoofed {
 		b.WriteString("\t\t# Source addresses that cannot legitimately arrive from the internet.\n")
 		fmt.Fprintf(&b, "\t\tip saddr %s counter drop comment %q\n", martianSet(), CounterSpoofed)
+	}
+	if len(geoSvcs) > 0 {
+		b.WriteString("\t\t# Region locks: everything outside a service's allowed regions is\n")
+		b.WriteString("\t\t# dropped. Before conntrack and on every packet, not just new\n")
+		b.WriteString("\t\t# connections: the set answer is fixed per address, so a player from\n")
+		b.WriteString("\t\t# an allowed region can never be newly caught by it, while matching\n")
+		b.WriteString("\t\t# statelessly means an out-of-region flood costs no conntrack entry\n")
+		b.WriteString("\t\t# and a lock engaging also ends flows already in progress.\n")
+		for _, sv := range geoSvcs {
+			var matches strings.Builder
+			// Several regions AND together as negations: dropped only when the
+			// source is inside none of them, which is the union as an allowlist.
+			for _, name := range sv.GeoRegions {
+				if len(geoElems[name]) > 0 {
+					fmt.Fprintf(&matches, "ip saddr != @%s ", geoSetName(name))
+				}
+			}
+			if sv.GeoAutoPPS > 0 {
+				// The conditional lock, engaged and released entirely in the
+				// kernel. The trigger runs first and takes no verdict, so it
+				// sees the whole flood - including the packets the next rule is
+				// dropping - and keeps refreshing the lock for as long as the
+				// flood lasts; put after the drop it would only see surviving
+				// traffic, release mid-attack, and let a burst through every
+				// timeout. The drop then applies only while the port is in the
+				// lockdown set.
+				fmt.Fprintf(&b, "\t\t%s dport %s limit rate over %d/second update @%s { th dport timeout %ds } counter comment %q\n",
+					sv.Proto, portSpec(sv.Port, sv.PortEnd), sv.GeoAutoPPS,
+					geoLockSetName(sv.Proto), spec.geoLockSeconds(),
+					CounterGeoTrip+":"+sv.Name)
+				fmt.Fprintf(&b, "\t\t%s dport %s th dport @%s %scounter drop comment %q\n",
+					sv.Proto, portSpec(sv.Port, sv.PortEnd), geoLockSetName(sv.Proto),
+					matches.String(), CounterGeo+":"+sv.Name)
+				continue
+			}
+			fmt.Fprintf(&b, "\t\t%s dport %s %scounter drop comment %q\n",
+				sv.Proto, portSpec(sv.Port, sv.PortEnd), matches.String(),
+				CounterGeo+":"+sv.Name)
+		}
 	}
 	b.WriteString("\t}\n\n")
 
@@ -395,15 +646,15 @@ func RemoveProtectRuleset(ctx context.Context, r Runner) {
 // resets them. A limiter nobody can see the effect of is worse than none at
 // all - "some players cannot connect" and "this threshold is too tight" look
 // identical from the outside, and only these numbers separate them.
-func ProtectState(ctx context.Context, r Runner) ([]model.ProtectCounter, []model.BlockedSource, error) {
+func ProtectState(ctx context.Context, r Runner) ([]model.ProtectCounter, []model.BlockedSource, []model.GeoLockedPort, error) {
 	out, err := r.Run(ctx, "nft", "-j", "list", "table", "ip", NFTProtectTable)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	return parseProtectState(out)
 }
 
-func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.BlockedSource, error) {
+func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.BlockedSource, []model.GeoLockedPort, error) {
 	var doc struct {
 		Nftables []struct {
 			Rule *struct {
@@ -417,11 +668,12 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 		} `json:"nftables"`
 	}
 	if err := json.Unmarshal([]byte(jsonText), &doc); err != nil {
-		return nil, nil, fmt.Errorf("read protection state: %w", err)
+		return nil, nil, nil, fmt.Errorf("read protection state: %w", err)
 	}
 
 	var counters []model.ProtectCounter
 	var blocked []model.BlockedSource
+	var locked []model.GeoLockedPort
 	for _, item := range doc.Nftables {
 		if rule := item.Rule; rule != nil && rule.Comment != "" {
 			for _, expr := range rule.Expr {
@@ -438,16 +690,47 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 				}
 			}
 		}
-		if set := item.Set; set != nil && set.Name == "blocked" {
-			for _, raw := range set.Elem {
-				if b, ok := parseBlockedElem(raw); ok {
-					blocked = append(blocked, b)
+		if set := item.Set; set != nil {
+			if set.Name == "blocked" {
+				for _, raw := range set.Elem {
+					if b, ok := parseBlockedElem(raw); ok {
+						blocked = append(blocked, b)
+					}
+				}
+			}
+			if proto, ok := strings.CutPrefix(set.Name, "geo_lockdown_"); ok {
+				for _, raw := range set.Elem {
+					if p, ok := parseLockedElem(raw); ok {
+						p.Proto = proto
+						locked = append(locked, p)
+					}
 				}
 			}
 		}
 	}
 	sort.Slice(blocked, func(i, j int) bool { return blocked[i].ExpiresSec > blocked[j].ExpiresSec })
-	return counters, blocked, nil
+	sort.Slice(locked, func(i, j int) bool { return locked[i].Port < locked[j].Port })
+	return counters, blocked, locked, nil
+}
+
+// parseLockedElem reads one lockdown set element: a bare port number, or an
+// object carrying the seconds until the lock releases. The same two shapes nft
+// emits for the blocklist, with a number where that one has an address.
+func parseLockedElem(raw json.RawMessage) (model.GeoLockedPort, bool) {
+	var plain int
+	if json.Unmarshal(raw, &plain) == nil && plain > 0 {
+		return model.GeoLockedPort{Port: plain}, true
+	}
+	var wrapped struct {
+		Elem struct {
+			Val     int `json:"val"`
+			Expires int `json:"expires"`
+		} `json:"elem"`
+	}
+	if json.Unmarshal(raw, &wrapped) == nil && wrapped.Elem.Val > 0 {
+		return model.GeoLockedPort{Port: wrapped.Elem.Val, ExpiresSec: wrapped.Elem.Expires}, true
+	}
+	return model.GeoLockedPort{}, false
 }
 
 // parseBlockedElem handles both shapes nft emits: a bare address for an element

@@ -173,9 +173,10 @@ type Engine struct {
 	// protectOn records that the edge filtering table is really loaded, so the
 	// counters are only read when there is something to read. protectCounters
 	// and protectBlocked are the last sample of what the kernel reports.
-	protectOn       bool
-	protectCounters []model.ProtectCounter
-	protectBlocked  []model.BlockedSource
+	protectOn        bool
+	protectCounters  []model.ProtectCounter
+	protectBlocked   []model.BlockedSource
+	protectGeoLocked []model.GeoLockedPort
 
 	// backendConns counts live control connections. A plain boolean was wrong:
 	// when the backend reconnects, the old connection's deferred teardown runs
@@ -1215,7 +1216,7 @@ func (e *Engine) sampleProtect(ctx context.Context) {
 	if !on {
 		return
 	}
-	counters, blocked, err := sysx.ProtectState(ctx, e.realRunner())
+	counters, blocked, locked, err := sysx.ProtectState(ctx, e.realRunner())
 	if err != nil {
 		e.log.Debug("cannot read protection state", "err", err)
 		return
@@ -1223,6 +1224,7 @@ func (e *Engine) sampleProtect(ctx context.Context) {
 	e.mu.Lock()
 	e.protectCounters = counters
 	e.protectBlocked = blocked
+	e.protectGeoLocked = locked
 	e.mu.Unlock()
 }
 
@@ -2168,7 +2170,11 @@ func (e *Engine) protectStatus() *model.ProtectStatus {
 	if !e.protectOn {
 		return nil
 	}
-	return &model.ProtectStatus{Counters: e.protectCounters, Blocked: e.protectBlocked}
+	return &model.ProtectStatus{
+		Counters:  e.protectCounters,
+		Blocked:   e.protectBlocked,
+		GeoLocked: e.protectGeoLocked,
+	}
 }
 
 // linkerStates reports every configured linker and whether it is connected.

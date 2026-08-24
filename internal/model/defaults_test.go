@@ -1,6 +1,9 @@
 package model
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // A fresh install must not move or divert a single packet on the strength of
 // nobody having deleted a shipped example row. The services are DNAT rules and
@@ -60,8 +63,11 @@ func TestTheShippedServicesAreThisDeploymentsPorts(t *testing.T) {
 	if len(got) != len(want) {
 		t.Fatalf("services = %d rows, want %d", len(got), len(want))
 	}
+	// DeepEqual because Service carries slices now (the region locks), which
+	// == cannot compare. It also holds that no shipped row carries a lock:
+	// want lists none, and a mismatch here would say so.
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("service %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}

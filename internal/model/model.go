@@ -97,6 +97,58 @@ type ProtectConfig struct {
 	DropInvalid  bool `json:"drop_invalid,omitempty"`   // packets conntrack cannot place
 	DropBogusTCP bool `json:"drop_bogus_tcp,omitempty"` // flag combinations no stack sends
 	DropSpoofed  bool `json:"drop_spoofed,omitempty"`   // private and reserved sources from the internet
+
+	// Regions are the named network lists that Service.GeoRegions locks ports
+	// to. Empty, like every other field here, means the feature does not
+	// exist: no set is generated, no rule mentions one, and an older config
+	// unmarshals to exactly this.
+	Regions []GeoRegion `json:"regions,omitempty"`
+
+	// GeoLockSeconds is how long an automatic region lock lingers once the
+	// flood that engaged it stops. While the traffic stays over a service's
+	// threshold the lock is refreshed continuously, so this is release lag,
+	// not a rearm interval. Zero takes the default of a minute: long enough
+	// that a flood pulsing on and off does not let a burst through between
+	// pulses, short enough that out-of-region players are not locked out for
+	// long after a false trip.
+	GeoLockSeconds int `json:"geo_lock_seconds,omitempty"`
+}
+
+// GeoRegion is a named list of source networks - "oceania" as the address
+// space allocated to AU, NZ and the Pacific islands, say - that a published
+// service can be locked to.
+//
+// The list is operator-declared data, deliberately. There is no GeoIP
+// database here: an address-to-country mapping would be a second external
+// dependency with a licence and an update cadence, and a stale copy fails in
+// silence, in whichever direction it happens to fail. The portal's Fetch
+// button (see web.handleGeoFetch) fills the list for a set of country codes
+// and deploy/geo-zones.sh prints the same data for pasting by hand; either
+// way it lands here through a reviewed save, nothing refreshes on a
+// schedule, and validation refuses anything nftables would choke on, so a
+// typo is a rejected save rather than a rejected table.
+//
+// It is also only ever an allowlist. Locking a port to a region means
+// dropping the rest of the internet, which is a much smaller thing to reason
+// about than a blocklist that has to enumerate what it is afraid of.
+type GeoRegion struct {
+	// Name is how services refer to the region. It becomes an nftables set
+	// name (geo_<name>), so validation holds it to lowercase letters, digits,
+	// hyphens and underscores.
+	Name string `json:"name"`
+
+	// CIDRs are the source networks the region admits. Overlapping and
+	// duplicate entries are merged at generation - nftables rejects a whole
+	// table over one overlapping set element, and a pasted list being
+	// generous must not take every limit down with it.
+	CIDRs []string `json:"cidrs"`
+
+	// Countries is the remembered recipe for the portal's fetch button: the
+	// ISO codes this list was last fetched for, so refreshing it is a click
+	// rather than a thing to reconstruct. It routes nothing and generates
+	// nothing - only CIDRs reaches the ruleset - and a hand-maintained
+	// region simply leaves it empty.
+	Countries []string `json:"countries,omitempty"`
 }
 
 // Linker is an extra host behind the backend that holds an overlay address.
@@ -560,6 +612,31 @@ type Service struct {
 	// attack that the datacentre link shrugs off will still bury a 20 Mbit LTE
 	// service and bill you for it.
 	CeilingPPS int `json:"ceiling_pps,omitempty"`
+
+	// GeoRegions locks this service to sources inside the named protection
+	// regions: with one or more set, everything arriving from outside their
+	// union is dropped before it is translated or sent down a tunnel. Empty
+	// means reachable from anywhere, which is what every service meant before
+	// this existed.
+	//
+	// Like SourceEngine and CeilingPPS it does nothing unless protection is
+	// on. The drop lives in the protection table, and that is not just
+	// tidiness: unticking the protection master switch must remain the one
+	// action that backs every filter out at once, region locks included.
+	GeoRegions []string `json:"geo_regions,omitempty"`
+
+	// GeoAutoPPS makes the lock conditional: the port stays open to the world
+	// until its total arriving traffic exceeds this many packets per second,
+	// and only then is everything outside GeoRegions dropped. The lock
+	// engages in the kernel at line rate, holds while the flood continues,
+	// and releases GeoLockSeconds after it stops - the agent decides nothing
+	// and polls nothing, so a flood arriving at 3am is met at once.
+	//
+	// Zero with regions set means the lock is unconditional. The threshold
+	// counts every packet to the row's ports together, in-region traffic
+	// included, so it belongs above the busiest legitimate moment measured -
+	// a full server tripping it costs out-of-region players their access.
+	GeoAutoPPS int `json:"geo_auto_pps,omitempty"`
 }
 
 // TargetOr resolves where a service is published, defaulting to the backend.
@@ -715,6 +792,12 @@ type SharedEndpoint struct {
 type ProtectStatus struct {
 	Counters []ProtectCounter `json:"counters,omitempty"`
 	Blocked  []BlockedSource  `json:"blocked,omitempty"`
+
+	// GeoLocked lists the ports whose automatic region lock is currently
+	// engaged. Reported for the same reason the counters are: an engaged lock
+	// looks exactly like the service being down to everybody outside the
+	// region, and only this says which of the two is happening.
+	GeoLocked []GeoLockedPort `json:"geo_locked,omitempty"`
 }
 
 // ProtectCounter is one limiter's tally since the rules were last loaded.
@@ -729,6 +812,16 @@ type ProtectCounter struct {
 // BlockedSource is an address parked by a limit, and the seconds it has left.
 type BlockedSource struct {
 	Address    string `json:"address"`
+	ExpiresSec int    `json:"expires_sec"`
+}
+
+// GeoLockedPort is one port with its automatic region lock engaged, and the
+// seconds until it releases if the traffic that engaged it has stopped. While
+// the flood continues the expiry keeps being refreshed, so a lock that will
+// not count down is one whose flood is still arriving.
+type GeoLockedPort struct {
+	Proto      string `json:"proto"`
+	Port       int    `json:"port"`
 	ExpiresSec int    `json:"expires_sec"`
 }
 

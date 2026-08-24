@@ -1,4 +1,4 @@
-# homeport — orientation for an AI agent
+# homeport - orientation for an AI agent
 
 Read this before changing anything. The design has several load-bearing
 decisions that look like arbitrary complexity until you know why they are
@@ -13,7 +13,7 @@ If you only read one section, read **Invariants** and **Why it is like this**.
 
 A Garry's Mod server and some websites are hosted on a Debian box at a house.
 They are published to the internet from a Debian box in a datacentre. Between
-the two are three WireGuard tunnels riding three different internet services —
+the two are three WireGuard tunnels riding three different internet services -
 a main fixed line, and two LTE services.
 
 The job: give the datacentre box **one stable path** to the home box, and move
@@ -41,7 +41,7 @@ arrangement where the box terminating the tunnels is not the box doing the work:
 a small dedicated backend that only routes, with the game servers and the
 websites on separate machines behind it. **Treat it as an addon throughout.** A
 site that has not configured one must generate byte-identical rules and
-identical `ip` commands to a build that had never heard of it — see invariant
+identical `ip` commands to a build that had never heard of it - see invariant
 19.
 
 **The frontend is authoritative for everything.** The backend makes no
@@ -100,15 +100,19 @@ installed is still there, and refuses to remove anything if that fails. Config
 and state go with it unless `--keep-config` or `--keep-state` says otherwise;
 WireGuard and the overlay address survive regardless.
 
-- **Commit straight to `main`.** No feature branches, no PRs — this is a
+- **Commit straight to `main`.** No feature branches, no PRs - this is a
   single-operator repo and the branch would only ever be merged by the person
   who wrote it. Do not create one "to be safe"; just commit.
 - Go 1.25. Module `github.com/quinlan102/homeport`.
 - **One external dependency**: `modernc.org/sqlite`. Keep it that way unless
-  there is a strong reason — CGO must stay disabled so the binaries are static.
+  there is a strong reason - CGO must stay disabled so the binaries are static.
 - Development happens on Windows, deployment is Debian. Linux-only code goes in
   `_linux.go` files with a `!linux` stub beside it (see `internal/sysx/mark_*.go`),
   so the tree still builds and tests on the dev machine.
+- **No em dashes, anywhere.** Not in docs, code comments, portal text, help
+  strings or generated files. Use a comma, a colon, a spaced hyphen or a new
+  sentence instead. The docs and the portal have been purged of them more than
+  once; writing a new one is a regression, not a style choice.
 - **Line endings are LF everywhere**, pinned by `.gitattributes`. Without it
   `core.autocrlf` hands the Windows working tree CRLF while the blobs stay LF,
   and `gofmt -l` then reports every Go file as unformatted. The check above
@@ -138,9 +142,9 @@ Both hosts carry a fixed overlay address on a **dummy interface**:
 Failover changes only the outgoing interface. The source and destination
 addresses never change, so:
 
-- conntrack keeps its entries — the DNAT binding for a player's UDP flow stays
+- conntrack keeps its entries - the DNAT binding for a player's UDP flow stays
   valid,
-- the client's 5-tuple is untouched — srcds sees the same peer,
+- the client's 5-tuple is untouched - srcds sees the same peer,
 - established TCP connections stall for ~2s, retransmit, and continue.
 
 That is why a failover is a brief freeze rather than a mass disconnect. If you
@@ -171,48 +175,48 @@ tunnel** regardless of which one is active.
 
 ### Frontend files worth knowing
 
-- `engine/engine.go` — the `Engine` struct and its `Run` loop. `selectPath` is
+- `engine/engine.go` - the `Engine` struct and its `Run` loop. `selectPath` is
   the policy; `evaluate` computes blocks and applies the choice;
   `reconcileRouting` puts back what the kernel discarded (see invariant 18).
-- `engine/tracker.go` — per-path health state machine. Knows nothing about
+- `engine/tracker.go` - per-path health state machine. Knows nothing about
   priorities or quotas by design.
-- `engine/prober.go` — one UDP prober per path, plus the sliding `Window` used
+- `engine/prober.go` - one UDP prober per path, plus the sliding `Window` used
   for loss/RTT/jitter.
-- `engine/control.go` — accepts the backend's connection, pushes config, folds
+- `engine/control.go` - accepts the backend's connection, pushes config, folds
   in usage deltas.
-- `sysx/route.go` — every routing command, with the addressing model explained
+- `sysx/route.go` - every routing command, with the addressing model explained
   in comments. Also the kernel readbacks the reconcilers depend on (`RouteVia`,
   `DefaultVia`, `RPFilterOff`), which report what is actually installed rather
   than what the agent believes it installed.
-- `sysx/nft.go` — DNAT ruleset generation, plus the separate `failover_egress`
+- `sysx/nft.go` - DNAT ruleset generation, plus the separate `failover_egress`
   source NAT and the Docker forward exceptions both of them need.
 
 ### Backend files
 
-- `agent/agent.go` — state, config application, `SetActivePath`, and
+- `agent/agent.go` - state, config application, `SetActivePath`, and
   `reconcileRouting`, which shares `applyLoop`'s goroutine so route repairs
   cannot race a decision being applied. Also `Revert`, the backend half of a
   rollback, reached by `failover-backend -revert` rather than over the control
   channel: revert is the panic button, and one a lost frame can press is not a
   panic button.
-- `agent/responder.go` — probe replies, and applying the frontend's decision.
-- `agent/meter.go` — counter sampling with on-disk buffering.
-- `agent/client.go` — dials the frontend, reports upward.
+- `agent/responder.go` - probe replies, and applying the frontend's decision.
+- `agent/meter.go` - counter sampling with on-disk buffering.
+- `agent/client.go` - dials the frontend, reports upward.
 
 ### Linker files
 
-- `linker/linker.go` — the agent. `apply` installs, `reconcile` re-reads,
+- `linker/linker.go` - the agent. `apply` installs, `reconcile` re-reads,
   `applyEgress` handles what the frontend pushes down. That last one keeps two
   lists: what the frontend asked for and what actually went in. They differ only
   after a failed install, and `reconcile` retries the difference. The frontend
   pushes once per configuration version, so without a retry a transient failure
   at boot (no route to the backend yet, so no interface to scope the source NAT
   to) would last until somebody saved settings again.
-- `linker/client.go` — the control client. Dials the frontend from a socket
+- `linker/client.go` - the control client. Dials the frontend from a socket
   bound to the overlay address, so the channel rides the active tunnel like
   everything else this host sends.
-- `sysx/linker.go` — the rules, the readbacks, the two nftables tables, and
-  `DefaultLinkerTable` (200, and only a default — see `Linker.Table`).
+- `sysx/linker.go` - the rules, the readbacks, the two nftables tables, and
+  `DefaultLinkerTable` (200, and only a default - see `Linker.Table`).
 
 ---
 
@@ -241,7 +245,7 @@ coming back to traffic returning to it, against roughly 100s before. Failover
    current active path and a monotonic decision sequence**, and an HMAC-SHA256
    tag over everything.
 3. Backend responder authenticates it, applies the decision if the sequence
-   advanced, and replies from a socket marked for the *same* path — so the
+   advanced, and replies from a socket marked for the *same* path - so the
    reply leaves by the tunnel the request arrived on.
 4. Frontend matches the reply to its outstanding sequence and records an RTT.
    Unanswered probes are resolved as lost after the timeout.
@@ -254,7 +258,7 @@ liveness, hostname, build and the routing table it actually used, and receives
 the egress networks belonging to its own overlay address. It reports no usage
 and is told no path or mode.
 
-Its socket is bound to the overlay address deliberately — that is what puts it
+Its socket is bound to the overlay address deliberately - that is what puts it
 on the `from <overlay> lookup <table>` rule and therefore onto the backend, so
 the channel follows failover for free. Unbound it would leave by the host's own
 default route and never arrive.
@@ -331,7 +335,7 @@ behind it and none was delivered.
 
 1. Backend samples `/sys/class/net/<iface>/statistics` every 10s.
 2. Computes `Δbytes` and `Δpackets`. A negative delta means the interface was
-   recreated — rebaseline, do not log.
+   recreated - rebaseline, do not log.
 3. Buffers the delta to disk with a per-path sequence number.
 4. Ships batches up the control channel; the frontend dedupes on the sequence
    (`meta` key `usage_seq:<pathID>`) and folds them into the SQLite ledger,
@@ -341,7 +345,7 @@ behind it and none was delivered.
    bytes twice.
 5. The frontend acks the highest sequence per path that is durably in the
    ledger (`usage_ack`), and only then does the backend drop its buffered
-   copy. A successful TCP write is not delivery — the batch in flight when the
+   copy. A successful TCP write is not delivery - the batch in flight when the
    connection dies would otherwise be lost, and the connection dies at every
    failover, which is exactly when LTE usage is accruing. Anything unacked is
    resent on the next tick; the sequence dedupe makes the overlap free.
@@ -361,7 +365,7 @@ continuously, so the decision arrives over whatever still works. The monotonic
 `DecisionSeq` stops a reordered probe from rewinding it.
 
 **DNAT only, never SNAT.** Leaving the source address alone is the whole reason
-srcds and the web server see real client IPs — for UDP as well as TCP, which no
+srcds and the web server see real client IPs - for UDP as well as TCP, which no
 proxy could do. The cost is that the backend must route replies from
 `10.99.0.2` back out the tunnel (`ip rule from 10.99.0.2 lookup 100`) instead of
 out pfSense. `sysx/nft_test.go` asserts the ruleset never contains a masquerade.
@@ -372,8 +376,8 @@ table.** `Frontend.BackendEgress` (off by default) makes connections the
 That is not a weakening of the rule above: it applies to the opposite direction,
 where there is no client address to preserve because there is no client. It
 exists because a Source game server is listed in the server browser at the
-address Steam observes its heartbeat coming from — there is no way to declare a
-different one, deliberately, as anti-spoofing — so without it the server is
+address Steam observes its heartbeat coming from - there is no way to declare a
+different one, deliberately, as anti-spoofing - so without it the server is
 advertised at the house's own WAN address, which has no port forward behind it,
 changes with the service, and is unreachable entirely while a CGNAT'd LTE path
 is carrying traffic. Players who found it through the browser would bypass the
@@ -389,26 +393,26 @@ way, and therefore through the LTE quota during a failover.
 
 **The container half is selected by source network, because nothing else is
 available.** Binding to the overlay address (`-ip 10.99.0.2`) is enough for a
-service on the backend host, and needs no backend rules at all — the existing
+service on the backend host, and needs no backend rules at all - the existing
 `ip rule from 10.99.0.2 lookup 100` already puts that traffic on the tunnel. A
 container cannot do it: the overlay address does not exist in its network
-namespace. Nor can it be identified by process — `meta skuid` and cgroup
+namespace. Nor can it be identified by process - `meta skuid` and cgroup
 matching work on locally *originated* packets, and a container's are *forwarded*
 through the host, so there is no local socket to inspect. What is left is the
 bridge network's address range, which is what `Egress.Sources` configures.
 
 **And only the internet-bound part of it.** Both egress rulesets qualify the
-source match with `ip daddr != { … }` over `sysx.nonInternetDestinations` —
+source match with `ip daddr != { … }` over `sysx.nonInternetDestinations` -
 RFC 1918, CGNAT, loopback, link-local, `0.0.0.0/8` and `224.0.0.0/3`. Matched on
 source alone the mark stamped everything a container sent: its DNS queries to
 the LAN resolver, its traffic to the host's own LAN address, to a database on
 the next bridge, to the panel that manages it. All of it went down the tunnel to
 a frontend that can do nothing with a private destination, and the symptom was
-the containers going offline the moment their network was ticked — unable to
+the containers going offline the moment their network was ticked - unable to
 resolve a name or reach their panel, while their internet traffic was fine. The
 frontend's NAT is an internet address; only internet traffic should seek it out.
 On the linker the same set qualifies the SNAT too, because its one interface is
-both its way to the backend and its way to everything else on the LAN — and the
+both its way to the backend and its way to everything else on the LAN - and the
 linker additionally marks and translates traffic to the overlay subnet, because
 its main table has no route there (only its own table does, selected by the
 overlay source or by this mark), so a container on a linker talking to a
@@ -417,7 +421,7 @@ on. The backend needs no such rule: its main table carries the route to the
 frontend overlay and a host route to every linker.
 
 Two rules on the backend, doing two jobs (`BuildBackendEgressRuleset`). The
-prerouting `meta mark` diverts the traffic — a forwarded packet is routed after
+prerouting `meta mark` diverts the traffic - a forwarded packet is routed after
 that hook, so the mark is what sends it to table 100 rather than out to pfSense,
 and table 100 already tracks the active tunnel so it follows failover for free.
 The postrouting `snat to 10.99.0.2` is what makes the frontend's rule match and
@@ -435,7 +439,7 @@ replies belong back down it.
 
 **`Suspect` paths stay selectable.** A single lost probe demotes a path from
 `up` to `suspect`. If suspect were ineligible, one dropped packet would abandon
-the active tunnel — and LTE drops packets routinely. Sustained trouble is
+the active tunnel - and LTE drops packets routinely. Sustained trouble is
 caught two other ways: `FailThreshold` consecutive losses condemn the path, and
 the loss/RTT thresholds block it as degraded. `Tracker.Usable()` is the
 eligibility test; do not change it back to `Health() == HealthUp`.
@@ -449,7 +453,7 @@ back and forth.
 **Quality selection only chooses between fallbacks, never against the preferred
 path.** `Failover.Selection = "quality"` (off by default) changes exactly one
 thing: once the preferred path is out, the replacement is the best-*measuring*
-eligible path rather than simply the next one down the list — a clean LTE2 beats
+eligible path rather than simply the next one down the list - a clean LTE2 beats
 an LTE1 dropping one packet in ten.
 
 It is deliberately not "pick the best path". While the preferred path is usable
@@ -461,9 +465,9 @@ would park traffic on a metered link indefinitely and report itself as
 optimising. `preferredPathID` is the guard; `qualityTarget` returns early on it.
 
 Moving between two fallbacks needs both dampers, and neither is optional. The
-candidate must beat the running path by `Quality.MarginPct` — measured against
+candidate must beat the running path by `Quality.MarginPct` - measured against
 the path actually carrying traffic, not against the one that is down, or a third
-path could pull traffic off a second one it is no better than — and it must hold
+path could pull traffic off a second one it is no better than - and it must hold
 that lead for `HoldDownSec`. Without the margin two similar links trade places on
 measurement noise; every swap is a visible stall for connected players.
 `Engine.beatenSince` times that hold-down against *the active path being beaten*
@@ -472,20 +476,20 @@ for the lead would otherwise restart the clock forever and the switch would
 never happen however badly the active path was performing.
 
 Because the margin applies in both directions there is a dead zone rather than a
-threshold — moving A→B needs `score(B) < 0.75×score(A)`, moving back needs
-`score(A) < 0.75×score(B)`, and both cannot hold at once — so oscillation on
+threshold - moving A→B needs `score(B) < 0.75×score(A)`, moving back needs
+`score(A) < 0.75×score(B)`, and both cannot hold at once - so oscillation on
 noise is impossible rather than merely unlikely. What that does *not* bound is
 how often a genuine alternation can switch: two links really taking turns being
 much better, which is what a carrier working on a tower produces, would move
 traffic every hold-down for as long as it lasted. `Quality.MinDwellSec` is the
-floor under that, and it applies only to a choice between two working fallbacks
-— it never delays leaving a path that has become unusable, nor a failback to the
-preferred path.
+floor under that, and it applies only to a choice between two working
+fallbacks: it never delays leaving a path that has become unusable, nor a
+failback to the preferred path.
 
 The score is milliseconds-equivalent: `loss% × LossWeight + rtt × RTTWeight +
 jitter × JitterWeight`. `LossWeight` defaults to 25 because for a game server a
 clean 60ms link genuinely beats a lossy 30ms one. A flawless path scores zero
-and cannot be displaced — the margin comparison is strict, so two idle tunnels
+and cannot be displaced - the margin comparison is strict, so two idle tunnels
 never swap.
 
 **Detection speed is a portal preset, not a configuration field.** The
@@ -540,18 +544,18 @@ undercounts by 5–15%, meaning the real cap is hit while the ledger still think
 there is headroom.
 
 **Usage deltas are buffered on disk when the control channel is down.** That
-window is exactly when LTE data is burning hardest — a failover to LTE often
+window is exactly when LTE data is burning hardest - a failover to LTE often
 coincides with the frontend being unreachable. Dropping accounting then would
 lose the usage that matters most.
 
 **The portal lives on the frontend, not the backend.** When all three tunnels
-are down, the backend is unreachable by definition — and that is precisely when
+are down, the backend is unreachable by definition - and that is precisely when
 somebody needs to see why and click "use LTE2 anyway". The frontend is in a
 datacentre on independent internet, so the portal survives a total path outage.
 
 **The portal must never be able to take the agent down.** It binds an address on
 the admin tunnel, and that address does not exist until `wg-quick` has brought
-the interface up — unit ordering asks for that but cannot guarantee it, and an
+the interface up - unit ordering asks for that but cannot guarantee it, and an
 admin tunnel down for any other reason has the same effect. Returning the listen
 error killed the process: probing stopped, the control channel closed, and
 failover was gone until somebody noticed a restart loop. `Server.listen` retries
@@ -563,7 +567,7 @@ It is generated on first start and logged in the clear, so it lives in the
 journal for as long as the journal is kept. Without a way to rotate it, anything
 that could read the journal held a permanent credential. `POST /api/password`
 takes the account from the *session* rather than the request body, requires the
-current password, and drops every other session for that account — the usual
+current password, and drops every other session for that account - the usual
 reason to change a password is that somebody else may have had it. Over the
 root-only socket (`failoverctl passwd`) no current password is required, because
 the case that path exists for is not having one, and anyone who can reach that
@@ -580,7 +584,7 @@ have used them anyway, and ACME HTTP-01/TLS-ALPN-01 would both fail.)
 Publishing from a machine behind the backend could have been done by DNAT'ing
 again on the backend and demultiplexing by port. Giving it `10.99.0.3` on its
 own `dummy0` instead means no second translation, no port demux, and no port
-collisions — two boxes can both run 27015. It also carries the stable-address
+collisions - two boxes can both run 27015. It also carries the stable-address
 property one hop further, so the linker's replies survive a failover for the
 same reason everything else does. The backend needs one route to reach it and
 its existing connection marking handles the replies unchanged.
@@ -589,22 +593,22 @@ The bigger payoff is egress selection. On the backend, binding a service to the
 overlay address *is* the selector for leaving via the frontend's public address.
 That holds one hop down: `srcds -ip 10.99.0.3` gets the server-browser heartbeat
 right for free, while everything else on that box keeps its normal route. The
-`Egress.Sources` CIDR list is not needed and should not be used there — it
+`Egress.Sources` CIDR list is not needed and should not be used there - it
 exists for containers, which cannot bind an address that does not exist in their
 namespace, and it catches every packet from the network it names.
 
 **A linker is never told which tunnel is active, because it does not need to
 be.** Its whole job is to put traffic sourced from its overlay address onto the
 backend, and the backend already tracks the active path in table 100. That is
-why there are no probes, no `decisionSeq`, and no metering in `internal/linker`
-— not an unfinished agent, a complete one for a job that is genuinely this
-small. Adding decision handling to it would create a second thing that has to
+why there are no probes, no `decisionSeq`, and no metering in
+`internal/linker`: not an unfinished agent, a complete one for a job that is
+genuinely this small. Adding decision handling to it would create a second thing that has to
 agree with the frontend, which is the failure mode §8 warns about for pfSense.
 
 **A linker has no observe mode, and that is a decision.** The other two agents
 need one because their rules move published traffic the moment they exist. The
 linker's rules match only packets sourced from, or addressed to, its own overlay
-address — and nothing on the box uses that address unless a service was
+address - and nothing on the box uses that address unless a service was
 deliberately bound to it, or the frontend's DNAT points at it. So on a host
 where nothing has opted in they are inert. What actually directs traffic to a
 linker is that DNAT, which has an observe mode and is where the decision belongs.
@@ -613,7 +617,7 @@ linker is that DNAT, which has an observe mode and is where the decision belongs
 number belongs to the host's own namespace, not to this system. `DefaultLinkerTable`
 is 200; the first real deployment landed on a machine already using 200 for its
 second ISP, under the name `isp2`, and the agent wrote its own default route
-straight over that host's — sending the operator's other traffic to the backend
+straight over that host's - sending the operator's other traffic to the backend
 with nothing anywhere reporting it. `Linker.Table` is set in the portal row and
 must also appear in that host's bootstrap file, because the rule it names is what
 carries the control channel: the agent cannot be told a value it needs in order
@@ -622,7 +626,7 @@ cannot drift unnoticed.
 
 **The linker reports `rp_filter` and never sets it.** The other two turn it off
 because their tunnels carry no address of their own, which makes even "loose"
-mode drop probe replies — broken by construction, as §8 explains at length. A
+mode drop probe replies - broken by construction, as §8 explains at length. A
 linker has an ordinary interface with an ordinary address, and on a host with
 one route to the internet the reverse lookup lands on the arrival interface and
 passes. Silently changing a system-wide sysctl on a machine that is somebody's
@@ -633,14 +637,14 @@ suspect it.
 tidiness. Docker's default bridge is `172.17.0.0/16` on every machine and the
 allocator walks `172.18`, `172.19` and so on in the same order on each one, so
 several hosts routinely hold the identical subnet. A global list would have
-every agent installing every row — pulling containers onto the tunnel on hosts
+every agent installing every row - pulling containers onto the tunnel on hosts
 the row was never meant to touch, silently, and billing them to the LTE quota.
 The matching rule is the opposite of the one for paths: the same CIDR on two
 hosts is normal and must stay legal, while a repeat within one host is rejected.
 
 **Shaping is at both ends because a queue only controls the direction it sits
 in front of.** `Path.Shape.ToBackendMbit` is the frontend's queue on that
-tunnel — the house's download — and `ToFrontendMbit` is the backend's, the
+tunnel - the house's download - and `ToFrontendMbit` is the backend's, the
 house's upload. Only the second is sent down the control channel, because the
 first is none of the backend's business. Both are zero by default and a site
 that sets neither issues no `tc` command that changes anything.
@@ -650,7 +654,7 @@ queue forms in the carrier's buffer instead of ours, which is the entire thing
 being fixed: that buffer is enormous, serves in arrival order, and puts seconds
 of delay in front of a game packet stuck behind a download. CAKE rather than
 fq_codel because it does the rate limiting itself rather than needing an htb or
-tbf parent, and because its flow isolation gives sparse flows priority — which
+tbf parent, and because its flow isolation gives sparse flows priority - which
 is what keeps a 66-byte probe every 250ms out from behind a bulk transfer with
 no classification to maintain. `ShapeOverheadBytes` is 80 because the shaper
 counts the payload it is handed while the carrier bills what leaves the WAN.
@@ -661,8 +665,8 @@ bottleneck; the frontend is upstream of it.
 
 **TCP MSS is clamped on every SYN that leaves by a tunnel, on both hosts.**
 The tunnels run at WireGuard's 1420 and everything either side of them at
-1500, so a *forwarded* TCP connection — a player to a containerised server, a
-container to the internet through the frontend — depended on path MTU
+1500, so a *forwarded* TCP connection - a player to a containerised server, a
+container to the internet through the frontend - depended on path MTU
 discovery: the host in front of the tunnel sending ICMP "fragmentation
 needed" and the far end acting on it. Plenty of far ends never see that ICMP,
 and Valve's servers are the canonical case: steamcmd from a container routed
@@ -673,23 +677,23 @@ by the house's 1500-byte path. `writeMSSClamp` puts a forward chain in the
 frontend's `failover` table and the backend's `failover_return` table:
 `oifname { tunnels } tcp flags syn tcp option maxseg size set rt mtu`. `rt
 mtu` is the leaving route's MTU, so the number tracks the tunnel rather than
-being written here. Forwarded packets only — a connection a host originates on
-its own address already sizes itself from the route — and it rides in the two
+being written here. Forwarded packets only - a connection a host originates on
+its own address already sizes itself from the route - and it rides in the two
 mode-gated tables, so observe mode touches nothing.
 
 **Protection is a separate nftables table, and everything in it is off.** Same
 reasoning as `failover_egress`: `NFTTable` carries the published services and is
 asserted to contain no translation, this can be removed on its own, and a reader
 can tell which rules publish from which rules drop. Two chains, because they
-need different information — `raw` (-300) runs before conntrack, so the
+need different information - `raw` (-300) runs before conntrack, so the
 blocklist and the malformed packets cost nothing to discard, and `filter` (-150)
 runs after conntrack and before `dstnat` (-100), the only window where a rule
 can know a packet's connection state and still stop it before it is translated
 and sent down a tunnel.
 
 **Every protection rule is scoped to the public interface, and that is a safety
-property rather than an optimisation.** The system's own traffic — probes on
-51999, the control channel on 51998, everything between overlay addresses —
+property rather than an optimisation.** The system's own traffic - probes on
+51999, the control channel on 51998, everything between overlay addresses -
 arrives on the tunnels. A limiter that could match it would let the frontend
 condemn a healthy link because of its own firewall and move traffic to a metered
 one. `web.validate` refuses to enable protection without a public interface for
@@ -705,10 +709,60 @@ same ground here.
 
 **Source-engine limiting matches only connectionless packets.** `@th,64,32
 0xffffffff` is the first four bytes after the UDP header, which the A2S queries
-and connection attempts carry and an in-game client never does — its packets are
+and connection attempts carry and an in-game client never does - its packets are
 sequence numbered. That is what makes a limit of two or three per second safe:
 it cannot touch the traffic of a player already connected. Without the payload
 match the same rule would throttle gameplay at a rate chosen for queries.
+
+**Region locks are operator-declared network lists, not a GeoIP database.**
+`Protect.Regions` is named lists of CIDRs; `Service.GeoRegions` locks a port to
+their union, dropping everything else in the raw chain. A GeoIP database would
+be a second external dependency with a licence and an update cadence, and a
+stale copy fails in silence in whichever direction it happens to fail. The
+lists arrive two ways and land in the same field: the portal's Fetch button
+(`POST /api/geo/fetch`) has the frontend download the aggregated lists for a
+set of ISO country codes, or the operator pastes them (`deploy/geo-zones.sh`
+prints the same files offline). The fetch fills the settings form, never the
+configuration - what came back still goes through the operator's eyes and
+then through `PUT /api/config` like anything typed - and it happens only on a
+click, never a schedule: an automatic refresh that half-succeeds at 3am would
+replace a working allowlist with nobody watching, while staleness only costs
+a few newly allocated networks. It is also whole-or-nothing (`fetchCountry`):
+a truncated download is valid CIDRs all the way to the cut, so any bad line,
+an empty list, or a response over the size cap fails the entire request
+rather than becoming a plausible fragment of an allowlist. Country codes are
+checked against two-lowercase-letters before they go near the URL, and
+validation refuses anything nft would choke on. Region names are folded to nft
+identifiers at generation and each folded set name is emitted once, because
+two names the fold makes identical are one set to nft and defining it twice
+rejects the whole table; validate refuses that collision at save, the build
+survives it in an older blob. The rules are stateless
+and per-packet, deliberately: the set answer is fixed per address so an
+allowed player can never be newly caught, an out-of-region flood costs no
+conntrack entry, and a lock engaging also ends flows already in progress. The
+lists are merged in Go before they reach the file (`mergeCIDRs`), because CIDR
+blocks either nest or are disjoint and nft rejects the whole table over one
+contained duplicate - a generous paste must not take every limit down.
+Regions are only ever an allowlist, and a reference that resolves to nothing
+generates no rule rather than a drop-everything: `web.validate` refuses the
+dangling reference at save, and the build must not take a published service
+off the air over an older or hand-edited blob.
+
+**The automatic region lock lives entirely in the kernel, like the parking
+blocklist it copies.** `Service.GeoAutoPPS` makes the lock conditional: a
+`limit rate over` trigger writes the port into a dynamic `geo_lockdown_<proto>`
+set (timeout `GeoLockSeconds`, default 60s) and the drop rule matches only
+while the port is in it - so the lock engages at line rate mid-flood with the
+agent deciding nothing and polling nothing, holds while the flood lasts, and
+releases on its own after it stops. The trigger rule runs *before* the drop
+and takes no verdict, which is load-bearing: it must see the whole flood,
+including the packets the drop is discarding, or the surviving in-region
+traffic alone would fall under the threshold, the entry would expire
+mid-attack, and a burst would get through every timeout. One lockdown set per
+protocol, so a tcp flood cannot lock a udp service on the same port number.
+The engaged locks are read back out of the kernel with the counters
+(`ProtectState`) and said loudly in the portal, because an engaged lock looks
+exactly like the service being down to everybody outside the region.
 
 **Counters exist because a limiter nobody can see is worse than none.** "Some
 players cannot connect" and "that threshold is too tight" look identical from
@@ -719,7 +773,7 @@ parked sources.
 
 **WireGuard handshake age never influences a decision.** It is collected and
 displayed for context only. A WireGuard interface stays up long after the link
-beneath it has died — catching that is the entire reason the probes are
+beneath it has died - catching that is the entire reason the probes are
 end-to-end.
 
 ---
@@ -740,14 +794,14 @@ Breaking any of these is a correctness bug even if the tests pass.
    rules also carry an **explicit priority** (`sysx.ProbeRulePrefBase`) so they
    outrank the backend's broader `from <overlay> lookup 100` rule. `ip rule
    add` without one takes the first rule's priority minus one, so each rule
-   added lands *ahead* of the previous — and the backend adds the path rules
+   added lands *ahead* of the previous - and the backend adds the path rules
    first. That put the source rule on top and sent every probe reply down the
    active tunnel instead of its own: standby paths still got replies, so they
    read healthy while measuring a mix of two tunnels.
 
    **Both sides of that comparison must be pinned, not just one.** Fixing only
    the path rules leaves the same bug waiting for the next source rule anybody
-   adds — which is exactly what happened when `overlay.subnet` introduced a
+   adds - which is exactly what happened when `overlay.subnet` introduced a
    second one. The path rules were correctly at 30001-30003, the new `from
    10.99.0.0/24 lookup 100` was handed 30000 by the kernel, and every probe
    reply went back to matching the wrong rule. Source rules now carry
@@ -785,7 +839,7 @@ Breaking any of these is a correctness bug even if the tests pass.
    **And a path's rules fail closed, because a lookup rule on its own fails
    open.** A rule whose table holds no route for the destination is skipped,
    not terminal, so with the tunnel absent `fwmark 0x101 lookup 101` sends the
-   probe on to the next rule that matches — on the frontend that is main and
+   probe on to the next rule that matches - on the frontend that is main and
    the public uplink, on the backend it is `from 10.99.0.2 lookup 100` and the
    active tunnel. Each path therefore carries a second rule, `fwmark 0x101
    unreachable` at `sysx.ProbeDenyRulePrefBase + id` (31001–31003), behind the
@@ -799,7 +853,7 @@ Breaking any of these is a correctness bug even if the tests pass.
    leave the datacentre addressed to `10.99.0.2`. On a site with backend egress
    on they matched `ip saddr 10.99.0.0/24 oifname eth0 snat` on the way out. A
    source NAT binding belongs to the connection, not to the interface, and the
-   prober keeps one socket for as long as sends succeed — so once the tunnels
+   prober keeps one socket for as long as sends succeed - so once the tunnels
    came up every probe from that socket still carried the public address, the
    backend answered to the public address from an ephemeral port that matched
    no conntrack entry, and nothing was listening there. (That was the second
@@ -810,15 +864,15 @@ Breaking any of these is a correctness bug even if the tests pass.
    interface-less case is the one they are for, and the route follows from the
    reconciler when the tunnel appears. It is a rule rather than an
    `unreachable default` inside the table so the table carries only the one
-   route this system installs — the number belongs to the host (invariant 8).
+   route this system installs - the number belongs to the host (invariant 8).
 
    **The band is the ownership line, in both directions.** A fwmark is only a
    number, and a host that already policy-routes may refuse on the same value
    for its own reasons, so a `fwmark … unreachable` outside 31001–31099 is
    neither "already installed" nor a stray and is never touched. Inside it,
    everything is this system's: `EnsureProbeRoutes` sweeps any refusal whose
-   mark no path carries — a mark edited in the portal, or the shipped defaults
-   a backend runs on until its first push — because unlike an orphaned lookup
+   mark no path carries - a mark edited in the portal, or the shipped defaults
+   a backend runs on until its first push - because unlike an orphaned lookup
    rule, which selects an empty table and does nothing, an orphaned refusal
    blackholes that mark for good. `RemoveProbeRoutes` clears the whole band,
    not just the configured marks, for the mark changed while the agent was
@@ -830,12 +884,12 @@ Breaking any of these is a correctness bug even if the tests pass.
    **The two egress lookups carry the same backstop, for a worse version of
    the same reason.** `fwmark 0x300 lookup 100` on the backend and `fwmark
    0x301 lookup <table>` on a linker fail open the moment the table loses its
-   default — the active tunnel deleted, the LAN route bounced — and a marked
+   default - the active tunnel deleted, the LAN route bounced - and a marked
    container packet then leaves by the host's own internet, where Docker's
    masquerade gives it that address. The binding belongs to the connection, so
    once the route is back the same flow is sent to the frontend carrying an
-   address its NAT does not match, dead until the entry expires — never, for
-   a UDP flow that keeps sending — and a heartbeat sent in the gap lists the
+   address its NAT does not match, dead until the entry expires - never, for
+   a UDP flow that keeps sending - and a heartbeat sent in the gap lists the
    server at the house's address, which is the one thing the feature exists to
    prevent. `EgressDenyRulePref` (31100) and `LinkerEgressDenyRulePref`
    (32403) sit behind their lookups; each is owned by its pinned priority
@@ -849,14 +903,14 @@ Breaking any of these is a correctness bug even if the tests pass.
    forge path health or steer traffic.
 6. Backend reply routing must match the frontend's choice. Asymmetric flows
    break pfSense state.
-7. Observe mode must not move traffic — but it must still measure. The split is
+7. Observe mode must not move traffic - but it must still measure. The split is
    deliberately not "changes nothing": the overlay address, sysctls, per-path
    probe tables, fwmark rules and the backend's route to the frontend overlay
    are installed for real in both modes, because without them the probe sockets
    cannot bind and every path would follow the single active route, making the
    observation worthless. None of that moves traffic. Observe mode suppresses
    the main-table route to the backend, the DNAT ruleset, the backend's
-   reply-path default route, and — added with them, for the same reason — the
+   reply-path default route, and - added with them, for the same reason - the
    shapers and the protection rules. A queue discipline does not misdirect
    traffic the way a route does, but it decides what is dropped and when, and a
    rate limiter plainly does; observe mode's promise is that nothing the agent
@@ -865,13 +919,13 @@ Breaking any of these is a correctness bug even if the tests pass.
 
    **It also loads no nftables table, on either host.** The backend's
    connection-marking table (`failover_return`) was installed as plumbing on
-   the strength of being inert — the mark it restores selects table 100, whose
-   default route observe mode never installs — and it is inert, but it was
+   the strength of being inert - the mark it restores selects table 100, whose
+   default route observe mode never installs - and it is inert, but it was
    also a table sitting in `nft list ruleset` on a host whose portal said there
    was none. It now goes through the gated runner with the rest of the data
    plane: the file is written in both modes, loaded only when armed. The `ip
-   rule` beside it stays plumbing, exactly like the probe rules — a rule into
-   an empty table is nothing — and that is what lets arming take effect with
+   rule` beside it stays plumbing, exactly like the probe rules - a rule into
+   an empty table is nothing - and that is what lets arming take effect with
    one reload rather than a rule add that can fail.
 
    **`sysx.isReadOnly` is the other half of that promise, and it fails in the
@@ -923,21 +977,21 @@ Breaking any of these is a correctness bug even if the tests pass.
    both `PUT /api/config` and `POST /api/mode` call `Reconfigure`. Its
    `stopProbers` / `startProbers` pair is not atomic on its own, and the gap
    between them contains `applySystemConfig`, which shells out to `ip`, `nft`
-   and `tc` — hundreds of milliseconds, wide open. Interleaved, the second
+   and `tc` - hundreds of milliseconds, wide open. Interleaved, the second
    caller's `stopProbers` found `proberCancel` already nil, cancelled nothing,
    and both callers then started a generation; the first `cancel` was
    overwritten and lost, and since the context descends from `baseCtx` that
    generation probed until the process was restarted.
 
    Nothing reported it, because every path went on measuring perfectly. The
-   only symptom was a standby path on a 5000ms interval reporting every 2–3s —
-   two tickers out of phase — with the metered quota billed twice for the
+   only symptom was a standby path on a 5000ms interval reporting every 2–3s -
+   two tickers out of phase - with the metered quota billed twice for the
    privilege and `FailThreshold` consecutive losses reached in half the
    wall-clock time it was configured for. It compounded: each racing pair added
    another generation.
 
    Three things hold it now, and they are not redundant. `Reconfigure` takes
-   `e.reconfMu` for its whole body — a separate lock from `e.mu` precisely
+   `e.reconfMu` for its whole body - a separate lock from `e.mu` precisely
    because it must be held across `applySystemConfig`, which is far too slow to
    hold the state lock for. `startProbers` cancels any generation it finds
    still recorded rather than overwriting the handle, so no future caller can
@@ -945,14 +999,14 @@ Breaking any of these is a correctness bug even if the tests pass.
    instead of merely cancelling: a cancelled prober still holds its marked
    socket and is still probing until its send loop reaches the select and its
    read deadline expires, so without the wait every settings save doubled the
-   traffic on every path for a moment — briefly, but against the one
+   traffic on every path for a moment - briefly, but against the one
    measurement every failover decision is made from. Same reasoning as
    invariant 17.
 10. **Commit state only after the system accepts the change.** Both
     `Engine.evaluate` and `Agent.SetActivePath` install routes first and record
     the new active path second. Recording first means a failed `ip route
     replace` is never retried, because the next pass sees the choice as already
-    current — and the portal reports a path traffic is not using.
+    current - and the portal reports a path traffic is not using.
 11. **`decisionSeq` must increase across a frontend restart.** The backend
     remembers the highest sequence it has seen and ignores anything lower. It is
     seeded from the wall clock in `New`; do not reset it to zero.
@@ -970,7 +1024,7 @@ Breaking any of these is a correctness bug even if the tests pass.
     `applyDecision`; a real straggler is always strictly lower.
 12. **Revert must also disarm.** The decision loop runs every 500ms. Removing
     the rules without dropping to observe means the very next tick sees no
-    active path, picks one, and reinstalls the route — leaving the host half
+    active path, picks one, and reinstalls the route - leaving the host half
     reverted, routing restored and nftables gone.
 
     **And it must exclude a settings save, for a worse version of the same
@@ -979,7 +1033,7 @@ Breaking any of these is a correctness bug even if the tests pass.
     only at the end. A `Reconfigure` landing in that window runs
     `applySystemConfig` and puts the DNAT ruleset and the route straight back;
     revert then finishes and reports the system reverted. Unlike the disarm
-    case, nothing corrects it afterwards — the engine believes there is nothing
+    case, nothing corrects it afterwards - the engine believes there is nothing
     installed, so nothing tries. The rules stay live while the portal says they
     are gone, which is invariant 13 failing in the one direction it must not,
     on the one command that exists to be trusted. `Revert` takes `reconfMu` and
@@ -987,19 +1041,19 @@ Breaking any of these is a correctness bug even if the tests pass.
 
     **Only the frontend can disarm itself, and the other two need the unit
     stopped instead.** `failoverctl revert` runs inside the engine, so setting
-    observe mode is enough — but observe mode alone was not: its whole point is
+    observe mode is enough - but observe mode alone was not: its whole point is
     to keep measuring, so the reconciler went on repairing probe tables and
     rp_filter, and put back within one tick what the revert had just removed.
     `Engine.reverted` is the latch that stops it: set by `Revert` before the
     teardown, it stops the probers and holds the reconciler, the decision loop
     and the sample writer down until `Reconfigure` clears it. Without it,
-    uninstalling the frontend was a race — the script stops the unit moments
+    uninstalling the frontend was a race - the script stops the unit moments
     after the revert returns, and a reconcile tick landing in that gap stranded
     rules the about-to-be-deleted binary was the only thing able to remove.
     The latch is persisted alongside being set, and `Run`'s startup both checks
     it and holds `reconfMu`, because the same race had two more entrances: the
     unit restarts itself (`Restart=always`), so a crash in that window brought
-    up a process that reinstalled everything unconditionally — and the
+    up a process that reinstalled everything unconditionally - and the
     failoverctl socket opens concurrently with startup, so a revert served
     mid-startup could be followed by the startup sequence putting the plumbing
     back and starting probers on a latched engine.
@@ -1015,14 +1069,14 @@ Breaking any of these is a correctness bug even if the tests pass.
 
     **And it must never be handed a request context.** `ExecRunner` builds every
     command with `exec.CommandContext`, so a cancelled context does not abort a
-    revert — it makes each command fail instantly while `Revert`, which checks
+    revert - it makes each command fail instantly while `Revert`, which checks
     none of their errors, goes on to record `dataPlane = false` and answer
     "reverted". That is the same corrupt state as above, reached from the other
     side. Waiting on the two locks is what made it reachable: the wait is
     longest when a settings save is stuck on a slow `nft`, which is exactly when
     somebody reaches for this button, and `failoverctl` gives up after 15s.
     `web.handleRevert` detaches with `context.WithoutCancel`, and deliberately
-    adds no timeout of its own — `ExecRunner` caps every command at 10s, so the
+    adds no timeout of its own - `ExecRunner` caps every command at 10s, so the
     whole thing is bounded by construction, and a ceiling low enough to matter
     could truncate a slow revert and reintroduce the fault in miniature.
     `engine/revert_context_test.go` pins the hazard rather than the handler,
@@ -1036,11 +1090,11 @@ Breaking any of these is a correctness bug even if the tests pass.
     must agree on it, and a change would tear down the channel the change has to
     travel over. `handlePutConfig` overwrites whatever the client sent.
 15. **The backend installs its plumbing at startup, before the responder and
-    control client start** — overlay address, sysctls, per-path probe routes,
+    control client start** - overlay address, sysctls, per-path probe routes,
     return rule and the seeded route to the frontend overlay. It cannot wait
     for the frontend's first push: the push arrives over a TCP connection
     sourced from the overlay address and routed down a tunnel, so a backend
-    that waits deadlocks — the responder cannot bind, the client cannot dial,
+    that waits deadlocks - the responder cannot bind, the client cannot dial,
     and both retry forever. `wg-quick` sets `Table = off`, so without the
     seeded route the kernel sends overlay traffic out the LAN to pfSense and
     the dial times out. `Agent.Run` calls `applyPlumbing` with the cached
@@ -1054,8 +1108,8 @@ Breaking any of these is a correctness bug even if the tests pass.
 17. **A goroutine blocked on a socket must have that socket closed on
     cancellation.** A context does not interrupt a read in progress. Every read
     loop here sits on a connection with only a deadline behind it, and a silent
-    channel is the normal healthy case — the frontend speaks only when it has
-    something to say — so cancelling the context alone leaves the goroutine
+    channel is the normal healthy case - the frontend speaks only when it has
+    something to say - so cancelling the context alone leaves the goroutine
     parked for up to `proto.ControlDeadline` (45s). `Agent.Run` waits on all
     four of its goroutines, the unit's `TimeoutStopSec` is 10s, and the result
     was that every backend restart ended in SIGKILL rather than a clean exit.
@@ -1065,8 +1119,8 @@ Breaking any of these is a correctness bug even if the tests pass.
 
     **`Prober.loop` was the exception, and stayed one until something waited on
     it.** It relied on its one-second read deadline instead, which cost nothing
-    while `stopProbers` merely cancelled. Once that started waiting — it has to,
-    or a replaced generation goes on probing the same path as its replacement —
+    while `stopProbers` merely cancelled. Once that started waiting - it has to,
+    or a replaced generation goes on probing the same path as its replacement -
     the deadline became a second of latency on every settings save. It is
     invisible on a development machine, where the probe sockets cannot bind to
     the overlay address and there is no read loop to wait for at all, so
@@ -1078,7 +1132,7 @@ Breaking any of these is a correctness bug even if the tests pass.
     *and* resets its sysctls, and `wg-quick down` deletes the interface.
     Bringing the tunnel back restores neither, so `systemctl restart
     wg-quick@wg-main` leaves that path's probe table empty and its `rp_filter`
-    back at the system default of 2 — either alone is enough to make the path
+    back at the system default of 2 - either alone is enough to make the path
     read as down forever, while the tunnel recovers on the wire and never
     recovers in the portal. `Engine.reconcileRouting` and
     `Agent.reconcileRouting` re-read the kernel every 10s and reinstall only
@@ -1095,7 +1149,7 @@ Breaking any of these is a correctness bug even if the tests pass.
     same-goroutine argument never covered, and the collision is the one that
     argument describes: a settings save reads the outgoing path, `evaluate`
     installs the incoming one, and the save then writes the dead tunnel back
-    over it — published traffic down a link that has just failed, portal showing
+    over it - published traffic down a link that has just failed, portal showing
     the healthy one, until a reconciler notices up to 10s later. `Engine.applyMu`
     and `Agent.applyMu` serialise every route writer, so only one goroutine is
     ever inside `ip`. `internal/linker` had this from the start and is the
@@ -1105,7 +1159,7 @@ Breaking any of these is a correctness bug even if the tests pass.
     `evaluate` and `applyDecision` read the runner under the state lock at their
     start and then shell out for as long as `ip` takes. A swap outside the apply
     lock can therefore land in the middle of a decision that has already
-    captured the previous runner — one route installed with the armed runner
+    captured the previous runner - one route installed with the armed runner
     after the mode has gone to observe. `Agent.ApplyConfig` takes `applyMu`
     before the swap; `Engine.Reconfigure` takes it around the swap and releases
     it again immediately, because `applySystemConfig` takes it itself and these
@@ -1122,12 +1176,12 @@ Breaking any of these is a correctness bug even if the tests pass.
     interface exactly as `rp_filter` does, so `wg-quick down` takes it with the
     device and the replacement comes back with the kernel default. Nothing
     reports it: traffic keeps flowing, unshaped, and the only symptom is that
-    latency under load quietly gets bad again — the hardest kind of regression
+    latency under load quietly gets bad again - the hardest kind of regression
     to attribute, weeks later. Both reconcilers call `sysx.EnsureQdisc` for any
     path with a rate, and neither runs `tc` at all for a path without one.
 19. **Multi-host support must be invisible until it is configured.** With
-    `overlay.subnet` empty — an older site, or one that opted out with
-    `--subnet ''` — the generated rulesets and the `ip` commands must be
+    `overlay.subnet` empty - an older site, or one that opted out with
+    `--subnet ''` - the generated rulesets and the `ip` commands must be
     byte-identical to a build with no linker support at all. This is a property
     of the code and does not change with what the installers write: they now
     default the field to the `/24` the overlay addresses sit in, because it
@@ -1136,34 +1190,34 @@ Breaking any of these is a correctness bug even if the tests pass.
     supported, and stays tested. This is not neatness: a site with one
     host at the far end has no reason to have a range routed down its tunnel,
     its `DOCKER-USER` exceptions widened, or its egress NAT matching addresses
-    nothing holds — and every one of those is a live rule on a working system.
-    So nothing here is derived or inferred — not from whether any service names
+    nothing holds - and every one of those is a live rule on a working system.
+    So nothing here is derived or inferred - not from whether any service names
     a target, not from anything else. `sysx/linker_test.go` pins the generated output; the real check is to
     diff it against the previous commit.
 20. **`MatchPrefix` and `RoutePrefix` look redundant and are not.** nftables
     matched the backend on a bare address while `ip route` installed an
     explicit `/32`. Collapsing them into one helper changes whichever of the
-    two you did not pick, on every existing deployment — equivalent to the
+    two you did not pick, on every existing deployment - equivalent to the
     kernel, and a diff in `ruleset.nft` on a host where nothing was meant to
     move. They return the same string once a subnet is set, which is what makes
     the duplication look pointless. Leave them.
 
     For the same reason, `sysx.RouteVia` takes the prefix that was **installed**
     rather than an address inside it. `ip route show` filters on an exact prefix
-    — unlike `ip route get`, it will not report a `/24` when asked about a `/32`
-    within it — so a caller that installs a range and reads back a host address
+    - unlike `ip route get`, it will not report a `/24` when asked about a `/32`
+    within it - so a caller that installs a range and reads back a host address
     sees "no route" on every tick and reinstalls what was already there. Each
     call site passes its own prefix so which one widens is visible where it is
     decided.
 21. **A widened route must remove the one it superseded.** `ip route replace`
     writes the new prefix and leaves any other alone, so setting a subnet on a
-    running site leaves both `10.99.0.2/32` and `10.99.0.0/24` installed — and
+    running site leaves both `10.99.0.2/32` and `10.99.0.0/24` installed - and
     the `/32` is more specific. The backend stays pinned to whichever tunnel
     was active at that moment while every later failover moves only the range.
     Nothing reports it: probes and the control channel are steered into their
     own tables by fwmark, so all three paths go on measuring perfectly.
     `Engine.dropSupersededHostRoute` removes it, on apply and on reconcile,
-    and only in the widening direction — it has no record of a previous subnet
+    and only in the widening direction - it has no record of a previous subnet
     to clean up in the other.
 
 ---
@@ -1179,7 +1233,7 @@ documented in `deploy/SETUP.md`:
 - Gateway monitoring **action** must be disabled per gateway. By default,
   pfSense removes policy-routing rules for a gateway it thinks is down, and the
   traffic falls through to the default gateway. The "LTE1 tunnel" would then
-  ride the main link — three tunnels on one link, all probing healthy, no
+  ride the main link - three tunnels on one link, all probing healthy, no
   failover at all.
 
 **`AllowedIPs` is asymmetric, and the backend's must be `0.0.0.0/0`.** It is a
@@ -1192,15 +1246,15 @@ from the overlay address, so the portal shows three healthy paths while nothing
 published works. `tcpdump` on the tunnel shows nothing at all, since the packet
 never gets injected.
 
-The frontend's side is `10.99.0.0/24` — the whole overlay range, not the
+The frontend's side is `10.99.0.0/24` - the whole overlay range, not the
 backend's `/32`. The `/32` is narrower and is what a backend-only site strictly
 needs, but the default is the wider one because of the shape of the failure: the
 day the site adds a second host at `10.99.0.3`, a peer pinned to the backend's
 address silently refuses to transmit to it, and the only symptom is one
 unreachable machine long after anybody last edited a WireGuard file. The range
 is private, carries nothing but this system, and every channel on it is
-separately authenticated — `Engine.KnownLinker` refuses an address that is not
-configured whatever key the peer holds — so the wider filter gives away very
+separately authenticated - `Engine.KnownLinker` refuses an address that is not
+configured whatever key the peer holds - so the wider filter gives away very
 little. Deliberately narrowing it on a site that will only ever have one backend
 is a reasonable hardening step and is documented as one.
 
@@ -1230,7 +1284,7 @@ tunnel.
 
 **Restarting a tunnel silently empties its routing table.** `wg-quick down`
 runs `ip link delete`, and the kernel discards every route pointing at that
-device — the path's probe/reply route in table 10x, and, if it was the active
+device - the path's probe/reply route in table 10x, and, if it was the active
 tunnel, the main-table route and the return-path default too. `wg show` looks
 perfect afterwards (a handshake seconds ago) while the path probes as 100%
 loss, because the packets have nowhere to go. The reconcilers exist for this;
@@ -1242,11 +1296,11 @@ repaired.** A table that has never held a route does not exist to the kernel,
 and `ip route show … table 101` answers with `Error: ipv4: FIB table does not
 exist` (exit 2) rather than an empty listing. A table emptied by a restart
 still exists and lists as empty. `RouteVia` and `DefaultVia` used to pass that
-error up, and both reconcilers skip a path on error — so a frontend rebooted
+error up, and both reconcilers skip a path on error - so a frontend rebooted
 ahead of `wg-quick` never created the tables for the tunnels that came up
 after it and never repaired them, every tick, for the life of the process. The
 fingerprint: `wg show` with one tunnel carrying kilobytes and the others at 92
-bytes sent — one handshake response and not a single probe — and a service
+bytes sent - one handshake response and not a single probe - and a service
 restart fixing it instantly, because by then every interface existed before
 the routes were installed. Every route readback now goes through
 `sysx.showRoutes`, which reports a nonexistent table as the empty listing it
@@ -1284,7 +1338,7 @@ counter, indistinguishable from two dead links. `sysx.EnsureSysctls` sets both
 
 **And setting it once is not enough.** The value belongs to the interface, not
 to the name. `wg-quick down` deletes the device and `up` creates a new one,
-which inherits `net.ipv4.conf.default.rp_filter` — systemd ships that as 2 —
+which inherits `net.ipv4.conf.default.rp_filter` - systemd ships that as 2 -
 rather than the zero the agent set on the device it replaced. So restarting a
 tunnel silently re-arms the filter on it and every probe arriving there is
 dropped, while `wg show` reports a handshake seconds ago. The fingerprint is a
@@ -1396,7 +1450,7 @@ timestamps (`base`, `feedAt`) rather than the wall clock. Keep doing that.
 
 ## 9. State and storage
 
-**Frontend** — SQLite at `/var/lib/failover/failover.db`:
+**Frontend** - SQLite at `/var/lib/failover/failover.db`:
 
 | Table | Contents |
 |---|---|
@@ -1415,17 +1469,17 @@ written only when `Frontend.BackendEgress` is on), `protect.nft` (the rate
 limiting and edge filtering, written only when protection is on and something in
 it is configured) and `ctl.sock` (the failoverctl socket, mode 0600).
 
-**Backend** — no database. `backend-config.json` (cached pushed config, so a
+**Backend** - no database. `backend-config.json` (cached pushed config, so a
 frontend outage does not leave it unable to route replies after a restart),
 `usage-buffer.jsonl` (undelivered deltas), `meter-state.json` (counter
-baselines and sequence numbers — persisting the baseline means usage during
+baselines and sequence numbers - persisting the baseline means usage during
 agent downtime is still accounted for).
 
 **Bootstrap files** (`/etc/failover/{frontend,backend}.json`) hold only the
 shared secret, state paths and overlay addressing. Everything else is in the
 portal, on purpose: there is one place to manage the system from.
 
-**Linker** — no database and no state files at all. `/etc/failover/linker.json`
+**Linker** - no database and no state files at all. `/etc/failover/linker.json`
 carries the shared secret, the overlay addressing, and the two things the
 frontend has no way to discover: this host's own overlay address and the
 backend's address on the local network. `LoadBootstrap` refuses a linker config
@@ -1443,14 +1497,14 @@ an older build unmarshals with every newer field at its zero value, and
 without accounting for that gave every upgraded system a scoring function where
 all weights were zero and the portal a form full of zeros. `model.Normalise` is
 where that is repaired, and it is called on load and on save. It fills in a
-group only when every field in it is zero — which cannot be deliberate — so an
+group only when every field in it is zero - which cannot be deliberate - so an
 individually chosen zero, a margin or a dwell of none, survives.
 
 
 **Five fields exist only for multi-host sites, and empty means "the backend"
 for all of them.** That is what keeps them invisible: an older config
 unmarshals with every one at its zero value and behaves exactly as it did.
-`Normalise` deliberately leaves them alone — there is nothing to repair,
+`Normalise` deliberately leaves them alone - there is nothing to repair,
 because zero is already the right answer.
 
 | Field | Empty means | Owned by |
@@ -1463,6 +1517,8 @@ because zero is already the right answer.
 | `Path.Shape` | no shaping; no `tc` command changes anything | portal |
 | `Config.Protect` | no filtering; the table is not loaded at all | portal |
 | `Service.SourceEngine`, `Service.CeilingPPS` | an ordinary published port | portal |
+| `Protect.Regions`, `Service.GeoRegions` | no region locks; reachable from anywhere | portal |
+| `Service.GeoAutoPPS` | a lock with regions set is unconditional | portal |
 
 `Config.Linkers` is the topology the backend cannot work out for itself. An
 overlay address says nothing about which machine holds it, so each row pairs one
@@ -1476,7 +1532,7 @@ let an unauthenticated box on the LAN claim any address in the overlay and move
 the backend's routing from outside it. `web.validate` fails closed in both
 directions: a linker must sit inside the subnet and not collide with the
 frontend, the backend or another linker, and a `Service.Target` must name a
-linker that actually exists — being inside the subnet only proves the *frontend*
+linker that actually exists - being inside the subnet only proves the *frontend*
 can route it.
 
 `Config.BackendLAN` routes nothing. It is the one fact a linker's own bootstrap
@@ -1487,7 +1543,7 @@ generate that file instead of the operator assembling it by hand.
 in invariant 14, plus one of its own: it has to be covered by `AllowedIPs` on
 the frontend's peers, and the portal cannot edit a WireGuard config. The shipped
 setup puts the whole range there from the start precisely so that this is
-normally already true — see the `AllowedIPs` trap for why the narrower value is
+normally already true - see the `AllowedIPs` trap for why the narrower value is
 the more dangerous default.
 
 `model.Config` is the whole user-editable surface. The portal `PUT`s it whole;
@@ -1500,9 +1556,9 @@ Defaults (`model.Defaults()`) match the intended deployment: main/LTE1/LTE2 at
 priorities 1/2/3, tables 101/102/103, marks `0x101`/`0x102`/`0x103`, 250ms
 active and 5s standby probing, 8 losses to condemn (~2.6s detection), 90s
 failback hold-down, 60 GB and 20 GB quotas resetting on the 1st in
-`model.DefaultTimezone` (`Australia/Melbourne`), and **observe mode**. The six example services —
+`model.DefaultTimezone` (`Australia/Melbourne`), and **observe mode**. The six example services -
 `http 80/tcp`, `https 443/tcp`, `pterodactyl-sftp 2022/tcp`, `pterodactyl-wings
-8080/tcp`, `source 27015–27030/udp`, `minecraft 25565/tcp` — ship **disabled**:
+8080/tcp`, `source 27015–27030/udp`, `minecraft 25565/tcp` - ship **disabled**:
 a row is a DNAT rule, and a fresh install must not publish a port on the
 strength of nobody having deleted it. Arming is when the shipped list would
 have gone live, which is why observe mode is not the answer to this on its own.
@@ -1524,25 +1580,25 @@ admin tunnel `51830/udp`, portal `10.98.0.2:8088`.
 
 ## 11. Testing
 
-Tests are pure and fast — no network, no root, no sockets. They cover the parts
+Tests are pure and fast - no network, no root, no sockets. They cover the parts
 where a subtle regression would be invisible in production until an outage:
 
-- `engine/select_test.go` — the whole selection policy: priority, immediate
+- `engine/select_test.go` - the whole selection policy: priority, immediate
   failover, hold-down failback, quota skip, held states, dead-man, pinning.
-- `engine/quality_test.go` — quality selection: that it never displaces the
+- `engine/quality_test.go` - quality selection: that it never displaces the
   preferred path however much better a fallback measures, that priority mode is
   untouched, that loss outranks latency, that the margin and hold-down both
   apply between fallbacks, that identical paths never swap, that a change of
   challenger does not restart the clock, and that the dead-man and pinning
   still win.
-- `engine/tracker_test.go` — health transitions, the suspect-stays-usable rule,
+- `engine/tracker_test.go` - health transitions, the suspect-stays-usable rule,
   clean-streak reset, circuit breaker and its backoff, degraded thresholds.
-- `quota/quota_test.go` — billing period boundaries including short-month
+- `quota/quota_test.go` - billing period boundaries including short-month
   clamping, metered-byte reconstruction, grants expiring by time and by bytes,
   ceiling overriding a grant.
-- `proto/proto_test.go` — round trip, and rejection of wrong keys, tampering,
+- `proto/proto_test.go` - round trip, and rejection of wrong keys, tampering,
   wrong sizes and replayed challenges.
-- `sysx/nft_test.go` — the published ruleset never masquerades; atomic replace;
+- `sysx/nft_test.go` - the published ruleset never masquerades; atomic replace;
   both mode-gated tables clamp the TCP MSS on SYNs leaving by a tunnel, scoped
   to the tunnels, and render no clamp with no tunnels;
 - `linker/linker_test.go` also holds that the egress rules go in before the
@@ -1557,11 +1613,11 @@ where a subtle regression would be invisible in production until an outage:
   comments cannot match each other; the backend egress SNAT stays ahead of
   Docker's masquerade and never fires off the tunnels; no two fwmarks collide;
   return marking is limited to connections that originated from a tunnel.
-- `web/password_test.go` — a password can be changed, doing so logs out every
+- `web/password_test.go` - a password can be changed, doing so logs out every
   other session while keeping the caller signed in, the current password is
   required, an unauthenticated request cannot change one, the local socket can
   reset a forgotten one, and a very short password is refused.
-- `sysx/protect_test.go` — protection off generates no table at all, and the
+- `sysx/protect_test.go` - protection off generates no table at all, and the
   switch on with no thresholds generates none either; every chain excludes
   non-public traffic in its first rule; the system's own ports and overlay
   addresses never appear; the table never translates an address; the chains run
@@ -1571,24 +1627,51 @@ where a subtle regression would be invisible in production until an outage:
   and bounded; two services on one port still produce a set nftables will
   accept; and the counters and blocklist parse back out of `nft -j`.
 
+  The region locks are pinned in the same file: a lock alone activates the
+  table, matches statelessly before conntrack, and its set carries `flags
+  interval`; overlapping and duplicate networks in a pasted list are merged
+  (nft rejects the table over one contained duplicate); several regions on a
+  service AND their negated lookups into one rule, which is the union as an
+  allowlist; a dangling region reference locks nothing rather than dropping
+  everything; the automatic lock's trigger precedes its drop so a locked flood
+  keeps refreshing the lock, its lockdown set is dynamic and per protocol, and
+  the release lag is configurable with zero meaning the shipped minute; region
+  names are folded to loadable set names whatever the blob holds, and two
+  names that fold together emit one set rather than a rejected table; and
+  engaged locks parse back out of `nft -j` with the rest.
+  `web/protect_validate_test.go` holds the fail-closed half: a lock on an
+  undefined or empty region is refused, so is an auto threshold with no
+  regions, a network that does not parse, an IPv6 network in an ip-family
+  table, a name outside the slug the set name needs, and two names that fold
+  to one set; while a valid lock saves with bare addresses widened to /32 and
+  host-part CIDRs masked to their network.
+  `web/geofetch_test.go` pins the fetch endpoint against a local fake host:
+  the merged lists and per-country counts come back in request order, a list
+  with anything that is not an IPv4 network in it fails whole with no partial
+  data, a missing or empty list is refused, a bad country code is refused
+  before any request leaves, an oversized response is a loud error rather
+  than a silently shorter list, the endpoint requires a session, and a
+  region's remembered country codes are validated to the same shape the
+  endpoint demands.
+
   The last two are load failures, not cosmetic ones, and both were found by
   reading the generated ruleset rather than by any test passing. A set that is
   not `dynamic` refuses every `add` from the packet path, and a set literal with
-  a repeated or overlapping element is rejected outright — in each case nft
+  a repeated or overlapping element is rejected outright - in each case nft
   rejects the **whole table**, so one duplicated service port would have taken
   every limit down with it. Generated nftables is worth reading by eye before
   trusting: the tests can only assert what somebody thought to assert.
-- `sysx/shape_test.go` — an unshaped path installs nothing, the configured rate
+- `sysx/shape_test.go` - an unshaped path installs nothing, the configured rate
   reaches the kernel with the overhead, an intact shaper is left alone, one lost
   with its interface is restored, clearing the rate removes it, a queue
   discipline this agent did not install is never removed, and tc's units are
   read back whichever it chose to print.
-- `engine/protect_test.go`, and the shaping cases in `agent/reconcile_test.go` —
+- `engine/protect_test.go`, and the shaping cases in `agent/reconcile_test.go` -
   observe mode neither shapes nor loads a limiter, disabling protection removes
   the table, shaping lost with a tunnel is restored while an intact one is left
   alone, an unshaped site never runs `tc` in the reconciler, and revert removes
   only the shapers this agent installed.
-- `sysx/route_test.go` — that a table with a name in `rt_tables` does not hide
+- `sysx/route_test.go` - that a table with a name in `rt_tables` does not hide
   the agent's own rules from it, that the control and return-mark rules carry an
   explicit priority ahead of the probe band, that moving a rule to its pinned
   priority adds before it deletes, the control rule selects on mark not addresses,
@@ -1602,7 +1685,7 @@ where a subtle regression would be invisible in production until an outage:
   left alone, that revert clears the band, and that the egress lookup carries
   its own refusal, owned by its priority alone and removed with the lookup
   (`sysx/linker_test.go` holds the same for a linker's).
-- `engine/reconcile_test.go`, `agent/reconcile_test.go` — what a tunnel restart
+- `engine/reconcile_test.go`, `agent/reconcile_test.go` - what a tunnel restart
   leaves behind gets repaired, a probe table that was never created (the
   tunnel absent at startup, which the kernel reports as an error rather than
   an empty table) is repaired too, an intact system is left completely alone, a
@@ -1633,56 +1716,56 @@ where a subtle regression would be invisible in production until an outage:
   another path, which is a restarted frontend's first switch, is still queued;
   and, with the worker actually running, the newest decision is applied, a
   straggler never reaches the kernel, and the equal-sequence decision lands.
-- `engine/prober_lifecycle_test.go` — one generation of probers, always: a
+- `engine/prober_lifecycle_test.go` - one generation of probers, always: a
   replaced generation is cancelled rather than orphaned, `stopProbers` returns
   only once the old goroutines are gone, and eight concurrent `Reconfigure`
   calls leave exactly one prober per path. These run the probers as real
-  goroutines rather than stubs — their sockets cannot bind on a development
+  goroutines rather than stubs - their sockets cannot bind on a development
   machine, which is the intended shape, because `Prober.Run` then sits in its
   dial/`reportUnreachable` cycle holding a context exactly like a working one.
   `Engine.liveProbers` exists so this is assertable at all: from outside, a
   duplicate generation is invisible except as a path probing faster than its
   configured interval. On the original code the last of these reported 24
   goroutines where three were wanted.
-- `engine/apply_serialise_test.go`, `agent/apply_serialise_test.go` — no two
+- `engine/apply_serialise_test.go`, `agent/apply_serialise_test.go` - no two
   goroutines are ever inside a system command at once. Both drive every route
   writer concurrently against a runner that reports the peak number of
   overlapping calls, which is the property that matters: each fault in this
   family is two goroutines writing the same route, and which one lands last is
   a matter of timing. On the unguarded code they report four and three.
-- `engine/revert_context_test.go` — a revert handed a cancelled context runs no
+- `engine/revert_context_test.go` - a revert handed a cancelled context runs no
   commands at all and still reports the rules gone, which is why
   `web.handleRevert` detaches the request context; and the same revert with a
   live one does the work.
-- `engine/revert_latch_test.go` — the revert latch survives a restart: a fresh
+- `engine/revert_latch_test.go` - the revert latch survives a restart: a fresh
   process on the same database starts held, its startup installs nothing and
   starts no probers, and a settings save releases both the in-memory flag and
   the persisted copy.
-- `sysx/linker_test.go` — that a site with no subnet generates byte-identical
+- `sysx/linker_test.go` - that a site with no subnet generates byte-identical
   rules, that the two prefix helpers agree once one is set, that a service
   target moves only the DNAT, and that the source rules stay behind the
   per-path rules and get moved when found elsewhere. Also the ownership line
   the sweeps hold: a mark rule in another table is swept only when it sits at
-  the pinned priority — the mark constants are this system's but a fwmark is
+  the pinned priority - the mark constants are this system's but a fwmark is
   only a number, and a host that already policy-routes may select on the same
-  value for its own tables (invariant 8) — while the source rule may claim
+  value for its own tables (invariant 8) - while the source rule may claim
   every match, because nothing but this system holds the overlay address. And
   that a table abandoned by a change of `linker.table` is relieved of this
   system's `default via <backend>` when its stray rule is swept, on ensure and
   on revert, gateway-qualified so a default the operator has put back is never
-  the one removed — with the route deleted *before* the rule, and the rule
+  the one removed - with the route deleted *before* the rule, and the rule
   kept whenever the table could not be confirmed clean. The stray rule is the
   only evidence the table was ever this system's, so it is the marker the next
   reconcile tick retries from; deleting it first would turn any failure in the
   gap into a permanent, invisible misroute.
-- `agent/revert_test.go` — the backend takes down what it installed: both return
+- `agent/revert_test.go` - the backend takes down what it installed: both return
   sources, the mark rule, the marking and egress tables, the routes to extra
   hosts, the probe tables and the overlay route; that it deletes table 100's
   default route rather than flushing the table; that it removes only the shapers
   it installed; that it acts in observe mode; and, the one guarding every
   existing site, that a site with no subnet and no linkers reverts nothing that
   mentions either.
-- `linker/linker_test.go` — an egress install the kernel refused is not recorded
+- `linker/linker_test.go` - an egress install the kernel refused is not recorded
   as applied and is retried on the next reconcile tick, an unchanged push costs
   nothing, a host the frontend has never spoken to has its egress left alone,
   an intact linker is left alone, the route lost with
@@ -1691,43 +1774,43 @@ where a subtle regression would be invisible in production until an outage:
   which never translates an address. Also that marking happens before dstnat and
   only in the original direction, which is what makes it match the overlay
   address rather than the container's.
-- `engine/linker_registry_test.go` — each linker receives only its own networks,
+- `engine/linker_registry_test.go` - each linker receives only its own networks,
   an unowned row never leaks to one, nothing is pushed while the egress master
   switch is off, only configured linkers are accepted, and a configured host
   that has never connected still reports as down rather than vanishing.
-- `engine/linker_session_test.go` — the control channel end to end over a real
+- `engine/linker_session_test.go` - the control channel end to end over a real
   socket: authentication, the first push, liveness registration, a linker
   claiming an address nobody configured being refused, and a roleless hello
   still being understood as the backend.
-- `sysx/forward_test.go` — the Docker forward exceptions widen when the overlay
+- `sysx/forward_test.go` - the Docker forward exceptions widen when the overlay
   subnet is set, leave an already-correct chain alone, and never touch a rule
   they do not own.
 - `web/linker_config_test.go` also covers the routing table: out of range,
   colliding with a table this system uses at the far end, and zero meaning the
   default.
-- `engine/superseded_test.go` — the `/32` a widened route replaced is removed
+- `engine/superseded_test.go` - the `/32` a widened route replaced is removed
   once, not repeatedly, never without a subnet, and never in observe mode.
-- `engine/egresshost_test.go` — each agent receives only its own egress
+- `engine/egresshost_test.go` - each agent receives only its own egress
   networks, and an unowned row still means the backend.
-- `agent/linker_test.go` — the backend installs a route per linker, repairs one
+- `agent/linker_test.go` - the backend installs a route per linker, repairs one
   lost with the LAN interface, corrects one pointing at the wrong host, leaves
-  an intact one alone, withdraws one that was removed, and — the one that
-  guards every existing site — issues no `via` route at all when no linker is
+  an intact one alone, withdraws one that was removed, and - the one that
+  guards every existing site - issues no `via` route at all when no linker is
   configured.
-- `web/linker_config_test.go` — the fail-closed rules: no linkers without a
+- `web/linker_config_test.go` - the fail-closed rules: no linkers without a
   subnet, no two on one address, none outside the subnet or colliding with the
   frontend or backend, no publishing to an address no linker holds.
-- `engine/linker_push_test.go` — only enabled linkers reach the backend, and a
+- `engine/linker_push_test.go` - only enabled linkers reach the backend, and a
   site with none sends nothing.
-- `agent/agent_test.go` — observe mode loads no nftables table: the marking
+- `agent/agent_test.go` - observe mode loads no nftables table: the marking
   table's file is written, `nft -f` is not run, the return-mark rule still goes
   in as plumbing, and arming loads it.
-- `model/defaults_test.go` — the shipped service rows are this deployment's
+- `model/defaults_test.go` - the shipped service rows are this deployment's
   ports, and nothing in the shipped configuration is live: the
   mode is observe, no example service is enabled, backend egress is off and the
   shipped egress row is disabled. A fresh install must not publish a port or
   divert a container network because nobody deleted a row.
-- `web/validate_test.go` — a path mark colliding with any of the five the system
+- `web/validate_test.go` - a path mark colliding with any of the five the system
   reserves, duplicate marks/tables, contradictory ceilings,
   unknown timezones, and a blank timezone taking the deployment's own zone
   rather than UTC, which would draw the billing boundary ten hours from where
@@ -1748,20 +1831,20 @@ next agent learns which behaviours are deliberate.
   routing and is not currently detected.
 - A recreated interface is noticed by polling, not by netlink. The reconcilers
   read the kernel every 10s, so a restarted tunnel is unusable for up to that
-  long after it comes back — on top of the probes needed to prove it healthy.
+  long after it comes back - on top of the probes needed to prove it healthy.
   Subscribing to `RTM_NEWLINK` would make it immediate, at the cost of the
   first netlink dependency in a codebase that deliberately shells out.
 - Egress selection is by overlay source address (host services, via `-ip`) or by
   source network (`Egress.Sources`, for containers). There is no per-process
-  selector. A host service that opens an unbound socket — a Lua `http.Fetch`, a
-  workshop download — picks its source from the route to the destination and
+  selector. A host service that opens an unbound socket - a Lua `http.Fetch`, a
+  workshop download - picks its source from the route to the destination and
   still leaves via pfSense, and `-ip` does not change that. Covering it would
   mean `meta skuid` or cgroup matching in an output chain, which is not built.
   The container case has the opposite property: the network match catches
   every internet-bound packet from that network, wanted or not. Only the
   destination is considered, never which process sent it.
 - The reconcilers repair routes and `rp_filter`. Anything else the kernel
-  attaches to an interface — a queue discipline, an nftables device set — would
+  attaches to an interface - a queue discipline, an nftables device set - would
   be lost on a restart with nothing to notice.
 - Metering trusts the WireGuard interface counters plus a calibration factor
   rather than reading pfSense's WAN counters. It should land within a few

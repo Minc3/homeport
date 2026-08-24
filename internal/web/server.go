@@ -66,6 +66,12 @@ type Server struct {
 	// in the page unless it was asked for.
 	psk string
 
+	// The region-list fetch. A base URL and a client rather than constants,
+	// so the tests can point the handler at a local server and the one
+	// outbound dependency this package has is visible here in one place.
+	geoBase   string
+	geoClient *http.Client
+
 	mu       sync.Mutex
 	attempts map[string]*attemptRecord
 }
@@ -78,11 +84,13 @@ type attemptRecord struct {
 // New builds the portal server.
 func New(eng *engine.Engine, st *store.Store, log *slog.Logger, psk string) *Server {
 	return &Server{
-		eng:      eng,
-		st:       st,
-		log:      log.With("component", "portal"),
-		psk:      psk,
-		attempts: map[string]*attemptRecord{},
+		eng:       eng,
+		st:        st,
+		log:       log.With("component", "portal"),
+		psk:       psk,
+		geoBase:   geoFetchBase,
+		geoClient: defaultGeoClient(),
+		attempts:  map[string]*attemptRecord{},
 	}
 }
 
@@ -138,6 +146,10 @@ func (s *Server) Handler(trusted bool) http.Handler {
 	api("POST /api/approve", s.handleApprove)
 	api("POST /api/revoke", s.handleRevoke)
 	api("POST /api/quarantine/clear", s.handleClearQuarantine)
+	// Fetches region lists for the settings form. It fills the form, never
+	// the configuration: what comes back still goes through the operator's
+	// eyes and then through PUT /api/config like anything typed by hand.
+	api("POST /api/geo/fetch", s.handleGeoFetch)
 	api("POST /api/revert", s.handleRevert)
 	// Takes the trusted flag directly: over the root-only socket there is no
 	// session to read a username from, and no current password to demand from

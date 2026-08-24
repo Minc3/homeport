@@ -231,15 +231,23 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 		{"metainfo": {"version": "1.0.6"}},
 		{"set": {"name": "blocked", "table": "failover_protect",
 			"elem": [{"elem": {"val": "198.51.100.7", "expires": 421}}, "203.0.113.9"]}},
+		{"set": {"name": "geo_lockdown_udp", "table": "failover_protect",
+			"elem": [{"elem": {"val": 27015, "expires": 42}}]}},
 		{"rule": {"chain": "filter", "comment": "packet-rate",
 			"expr": [{"match": {}}, {"counter": {"packets": 1200, "bytes": 96000}}, {"drop": null}]}},
 		{"rule": {"chain": "raw", "comment": "blocked",
 			"expr": [{"counter": {"packets": 4, "bytes": 240}}, {"drop": null}]}}
 	]}`
 
-	counters, blocked, err := parseProtectState(out)
+	counters, blocked, locked, err := parseProtectState(out)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
+	}
+	// An engaged region lock looks exactly like the service being down to
+	// everyone outside the region, so it has to read back out of the kernel
+	// with the counters - the set is where the truth lives.
+	if len(locked) != 1 || locked[0].Proto != "udp" || locked[0].Port != 27015 || locked[0].ExpiresSec != 42 {
+		t.Errorf("engaged locks read as %+v, want udp/27015 releasing in 42s", locked)
 	}
 	if len(counters) != 2 {
 		t.Fatalf("read %d counters, want 2: %+v", len(counters), counters)
@@ -320,5 +328,256 @@ func TestTheBlocklistSetIsDynamic(t *testing.T) {
 	}
 	if !strings.Contains(decl, "size ") {
 		t.Errorf("the blocklist set has no size bound:\n%s", decl)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Region locks
+// ---------------------------------------------------------------------------
+
+// geoCfg is protectCfg with one region and the minecraft service locked to it,
+// and nothing else switched on - so anything the ruleset contains is the lock.
+func geoCfg() model.Config {
+	cfg := protectCfg()
+	cfg.Protect.Regions = []model.GeoRegion{
+		{Name: "oceania", CIDRs: []string{"1.128.0.0/11", "101.160.0.0/11"}},
+	}
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoRegions = []string{"oceania"}
+		}
+	}
+	return cfg
+}
+
+// A site whose only protection is a region lock still needs the table loaded,
+// so the lock has to make the spec active on its own.
+func TestARegionLockActivatesTheTableOnItsOwn(t *testing.T) {
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(geoCfg()))
+	if ruleset == "" {
+		t.Fatal("a region lock alone generated no ruleset")
+	}
+	if !strings.Contains(ruleset, "set geo_oceania {") {
+		t.Errorf("no region set was generated:\n%s", ruleset)
+	}
+	// interval, because the elements are networks: without the flag the
+	// kernel refuses the first CIDR element and the whole table with it.
+	if !strings.Contains(ruleset, "flags interval") {
+		t.Errorf("the region set is not an interval set:\n%s", ruleset)
+	}
+	want := `tcp dport 25565 ip saddr != @geo_oceania counter drop comment "geo:minecraft"`
+	if !strings.Contains(ruleset, want) {
+		t.Errorf("the lock rule is missing or malformed; want %q in:\n%s", want, ruleset)
+	}
+}
+
+// The lock matches every packet, statelessly, before conntrack. The set answer
+// is fixed per address so an allowed player can never be newly caught by it,
+// an out-of-region flood must not cost conntrack entries, and engaging a lock
+// mid-attack has to end flows already in progress rather than grandfather them.
+func TestRegionLocksMatchEveryPacketBeforeConntrack(t *testing.T) {
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(geoCfg()))
+	rawChain := ruleset[:strings.Index(ruleset, "chain filter")]
+	if !strings.Contains(rawChain, "@geo_oceania") {
+		t.Errorf("the lock rule is not in the raw chain:\n%s", ruleset)
+	}
+	for _, line := range strings.Split(ruleset, "\n") {
+		if strings.Contains(line, "@geo_oceania") && strings.Contains(line, "ct state") {
+			t.Errorf("a region lock depends on connection state: %q", line)
+		}
+	}
+}
+
+// A region nothing references is a draft in the portal, not a rule. It must
+// render no set - a set nothing consults is dead weight the kernel holds - and
+// with nothing else configured, no table at all.
+func TestARegionNobodyReferencesRendersNothing(t *testing.T) {
+	cfg := geoCfg()
+	for i := range cfg.Services {
+		cfg.Services[i].GeoRegions = nil
+	}
+	if got := BuildProtectRuleset(ProtectSpecFrom(cfg)); got != "" {
+		t.Errorf("an unreferenced region generated a ruleset:\n%s", got)
+	}
+
+	cfg.Protect.PacketsPerSec = 400
+	if got := BuildProtectRuleset(ProtectSpecFrom(cfg)); strings.Contains(got, "geo_") {
+		t.Errorf("an unreferenced region generated a set beside the other limits:\n%s", got)
+	}
+}
+
+// nftables rejects a whole table over one overlapping set element, and a
+// pasted country list being generous - a duplicate line, a /24 inside a /8 -
+// is ordinary, not an error worth taking every limit down over. CIDR blocks
+// either nest or are disjoint, so dropping the contained ones is a full merge.
+func TestOverlappingRegionNetworksAreMerged(t *testing.T) {
+	cfg := geoCfg()
+	cfg.Protect.Regions = []model.GeoRegion{
+		{Name: "oceania", CIDRs: []string{"1.0.0.0/8", "1.2.3.0/24", "1.0.0.0/8", "2.0.0.0/16"}},
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	if strings.Contains(ruleset, "1.2.3.0/24") {
+		t.Errorf("a network contained in another was kept, which nft refuses to load:\n%s", ruleset)
+	}
+	if strings.Count(ruleset, "1.0.0.0/8") != 1 {
+		t.Errorf("a duplicate network was kept:\n%s", ruleset)
+	}
+	if !strings.Contains(ruleset, "2.0.0.0/16") {
+		t.Errorf("a disjoint network was lost in the merge:\n%s", ruleset)
+	}
+}
+
+// Several regions on one service are a union allowlist: negated lookups AND
+// together in one rule, so a packet is dropped only when it is inside none of
+// them. Two rules would drop everything outside the intersection instead.
+func TestALockOnSeveralRegionsAdmitsAnyOfThem(t *testing.T) {
+	cfg := geoCfg()
+	cfg.Protect.Regions = append(cfg.Protect.Regions,
+		model.GeoRegion{Name: "aotearoa", CIDRs: []string{"49.224.0.0/14"}})
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoRegions = []string{"oceania", "aotearoa"}
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	want := `ip saddr != @geo_oceania ip saddr != @geo_aotearoa counter drop`
+	if !strings.Contains(ruleset, want) {
+		t.Errorf("want the negations ANDed in one rule (%q) in:\n%s", want, ruleset)
+	}
+}
+
+// A reference that resolves to nothing - a region no list defines, or one
+// whose networks are empty - must lock nothing rather than invent a
+// drop-everything rule. web.validate refuses both states at save time, so
+// meeting one here means an older or hand-edited blob, and taking a published
+// service off the air in silence is the worse of the two silent answers.
+func TestADanglingRegionReferenceLocksNothing(t *testing.T) {
+	cfg := geoCfg()
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoRegions = []string{"atlantis"}
+		}
+	}
+	if got := BuildProtectRuleset(ProtectSpecFrom(cfg)); got != "" {
+		t.Errorf("a dangling region reference generated rules:\n%s", got)
+	}
+}
+
+// The automatic lock: with a threshold set, the port stays open to the world
+// until its traffic exceeds it, and only then does the region drop apply. Both
+// halves live in the kernel - the trigger writes the port into a dynamic set
+// exactly the way the blocklist parks a source, and the agent decides nothing.
+func TestAnAutoLockOnlyDropsWhileEngaged(t *testing.T) {
+	cfg := geoCfg()
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoAutoPPS = 50000
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	trigger := `tcp dport 25565 limit rate over 50000/second update @geo_lockdown_tcp { th dport timeout 60s } counter comment "geo-trip:minecraft"`
+	if !strings.Contains(ruleset, trigger) {
+		t.Errorf("want the trigger rule %q in:\n%s", trigger, ruleset)
+	}
+	drop := `tcp dport 25565 th dport @geo_lockdown_tcp ip saddr != @geo_oceania counter drop comment "geo:minecraft"`
+	if !strings.Contains(ruleset, drop) {
+		t.Errorf("want the conditional drop %q in:\n%s", drop, ruleset)
+	}
+	// The trigger must come first: it has to see the whole flood, including
+	// the packets the drop discards, or the lock would release mid-attack -
+	// the surviving in-region traffic alone falls under the threshold, the
+	// entry expires, and a burst gets through every timeout.
+	if strings.Index(ruleset, trigger) > strings.Index(ruleset, drop) {
+		t.Errorf("the trigger runs after the drop, so a locked flood cannot refresh the lock:\n%s", ruleset)
+	}
+	// dynamic, for the same reason the blocklist is: without the flag the
+	// kernel refuses every update from the packet path and the whole table
+	// fails to load.
+	lock := ruleset[strings.Index(ruleset, "set geo_lockdown_tcp {"):]
+	lock = lock[:strings.Index(lock, "}")]
+	if !strings.Contains(lock, "flags dynamic,timeout") {
+		t.Errorf("the lockdown set cannot be written from the packet path:\n%s", lock)
+	}
+	// No udp lockdown set: nothing udp is auto-locked, and a set per protocol
+	// exists precisely so a tcp flood cannot lock a udp service on the same
+	// port number.
+	if strings.Contains(ruleset, "geo_lockdown_udp") {
+		t.Errorf("a udp lockdown set was generated with no udp auto lock:\n%s", ruleset)
+	}
+}
+
+// A lock with no threshold is unconditional, and must not gain the lockdown
+// machinery: the plain drop needs no dynamic set and no trigger.
+func TestAnUnconditionalLockHasNoLockdownMachinery(t *testing.T) {
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(geoCfg()))
+	for _, banned := range []string{"geo_lockdown", "limit rate", "geo-trip"} {
+		if strings.Contains(ruleset, banned) {
+			t.Errorf("an unconditional lock generated %q:\n%s", banned, ruleset)
+		}
+	}
+}
+
+// The release lag is configurable, and zero means the shipped minute - an
+// older blob predating the field must behave, not lock forever or not at all.
+func TestTheLockReleaseLagIsConfigurable(t *testing.T) {
+	cfg := geoCfg()
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoAutoPPS = 50000
+		}
+	}
+	cfg.Protect.GeoLockSeconds = 120
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+	if !strings.Contains(ruleset, "timeout 120s") {
+		t.Errorf("the configured release lag did not reach the ruleset:\n%s", ruleset)
+	}
+	if strings.Contains(ruleset, "timeout 60s") {
+		t.Errorf("the default lag appears beside the configured one:\n%s", ruleset)
+	}
+}
+
+// Region names become nftables identifiers. Validation refuses anything
+// outside the slug, but the ruleset must stay loadable whatever an older or
+// hand-edited blob carries - folded into shape, never handed to nft to refuse,
+// because nft refuses the whole table and every other limit with it.
+func TestRegionNamesAreFoldedToLoadableSetNames(t *testing.T) {
+	cfg := geoCfg()
+	cfg.Protect.Regions[0].Name = "South Pacific!"
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoRegions = []string{"South Pacific!"}
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+	if !strings.Contains(ruleset, "@geo_south_pacific_") {
+		t.Errorf("the name was not folded to an identifier:\n%s", ruleset)
+	}
+	if strings.Contains(ruleset, "South Pacific!") {
+		t.Errorf("the raw name reached the file:\n%s", ruleset)
+	}
+}
+
+// Two names the folding makes identical are one set to nft, and defining it
+// twice rejects the whole table - the exact failure the folding exists to
+// prevent, so the deduplication has to happen on the folded name. validate
+// refuses the collision at save; this is for the blob that predates it.
+func TestCollidingFoldedRegionNamesEmitOneSet(t *testing.T) {
+	cfg := geoCfg()
+	cfg.Protect.Regions = []model.GeoRegion{
+		{Name: "south pacific", CIDRs: []string{"1.128.0.0/11"}},
+		{Name: "south-pacific", CIDRs: []string{"49.224.0.0/14"}},
+	}
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoRegions = []string{"south pacific", "south-pacific"}
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	if got := strings.Count(ruleset, "set geo_south_pacific {"); got != 1 {
+		t.Errorf("the folded set is defined %d times; nft loads it once or not at all:\n%s", got, ruleset)
 	}
 }

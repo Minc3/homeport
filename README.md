@@ -329,6 +329,9 @@ problem if you ask for the feature.
 
 ## Documentation
 
+- **[deploy/SIMPLE-SETUP.md](deploy/SIMPLE-SETUP.md)** is the install in as
+  few words as it survives: shipped defaults, nothing optional, links back to
+  the full guide for anything that goes wrong.
 - **[REFERENCE.md](REFERENCE.md)** covers the full detail: how failover stays
   invisible, how health is measured, the selection policy, data quotas,
   outbound traffic, multi-host setups, the CLI and the safety behaviour.

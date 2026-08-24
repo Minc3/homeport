@@ -6,6 +6,8 @@ type or check.
 Nothing here explains how the system works or why it is built this way. That is
 [REFERENCE.md](../REFERENCE.md) for the behaviour and [CLAUDE.md](../CLAUDE.md)
 for the internals. If a step looks arbitrary, the reason is in one of those two.
+In a hurry, on the shipped defaults, with nothing optional?
+[SIMPLE-SETUP.md](SIMPLE-SETUP.md) is the same install in a tenth of the words.
 
 Done on Debian 13 and Ubuntu 24.04. Any other systemd distribution will
 probably work and has not been tried.
@@ -594,6 +596,41 @@ a connected player. **Ceiling pps** caps one service across every client.
 
 Every drop is counted, and the counters show in the portal beside the parked
 sources. Start loose and tighten while watching them.
+
+### Region locks
+
+Lock a published port to part of the world, `25565` to Oceania say. Protection
+must be enabled for any of this to exist.
+
+1. **Settings, Protection, Regions**: add a row, name it (`oceania`), enter
+   ISO country codes (`au, nz`) and click **Fetch**. The frontend downloads
+   the current aggregated lists into the box for you to review. Or paste
+   networks by hand, one per line; `deploy/geo-zones.sh au nz` prints the same
+   data offline.
+2. On the service row, set **Regions** to `oceania` and save. Everything
+   arriving from outside the region is now dropped before it is translated.
+3. Optional, instead of a permanent lock: set **Auto-lock pps** on the row.
+   The port stays open to the world until its traffic exceeds that rate; the
+   lock then engages in the kernel, holds while the flood lasts, and releases
+   about a minute after it stops (**Auto-lock release** tunes that). Set the
+   threshold above the busiest legitimate moment you have measured, because
+   in-region traffic counts towards it too. Engaged locks are announced on the
+   dashboard.
+
+It matches where an address is allocated, not where a player is: a VPN
+endpoint inside the region walks straight through. It keeps a server regional
+and thins a flood; it is not an access control.
+
+After the first save that uses a lock, parse-check the generated file once:
+
+```sh
+nft -c -f /var/lib/failover/protect.nft
+```
+
+Silence is a pass. It proves this host's nft accepts every construct the lock
+generates (the negated interval-set match and the dynamic port set), without
+touching the kernel. The file is written in observe mode too, so this works
+before arming.
 
 ---
 

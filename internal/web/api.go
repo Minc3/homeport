@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
@@ -413,6 +414,7 @@ func validate(cfg *model.Config) error {
 		{"packets per second", pr.PacketsPerSec},
 		{"queries per second", pr.QueriesPerSec},
 		{"block seconds", pr.BlockSeconds},
+		{"region lock seconds", pr.GeoLockSeconds},
 	} {
 		if v.n < 0 {
 			return fmt.Errorf("protection: %s cannot be negative", v.what)
@@ -422,6 +424,79 @@ func validate(cfg *model.Config) error {
 		if cfg.Services[i].CeilingPPS < 0 {
 			return fmt.Errorf("service %s has a negative packet ceiling", cfg.Services[i].Name)
 		}
+	}
+
+	// Regions. The names become nftables set names and the networks their
+	// elements, so both are held to what nft will load: a bad entry here is
+	// not cosmetic, it is the whole protection table refused at once, every
+	// limit included.
+	regionDefined := map[string]bool{}
+	regionNetworks := map[string]bool{}
+	seenRegionSet := map[string]string{}
+	for i := range pr.Regions {
+		rg := &pr.Regions[i]
+		rg.Name = trimmed(rg.Name)
+		if rg.Name == "" {
+			return errors.New("every protection region needs a name")
+		}
+		if len(rg.Name) > maxRegionName {
+			return fmt.Errorf("region name %q is %d bytes; keep it under %d", rg.Name, len(rg.Name), maxRegionName)
+		}
+		if bad := firstBadRegionRune(rg.Name); bad != "" {
+			return fmt.Errorf("region name %q contains %q; use lowercase letters, digits, hyphens and underscores, "+
+				"because the name becomes an nftables set name", rg.Name, bad)
+		}
+		// Uniqueness is measured on the set the name renders to, where a
+		// hyphen folds to an underscore: "south-america" and "south_america"
+		// would otherwise be one set defined twice, and nft refuses the table.
+		key := strings.ReplaceAll(rg.Name, "-", "_")
+		if other, dup := seenRegionSet[key]; dup {
+			return fmt.Errorf("regions %q and %q are the same name to nftables; rename one", other, rg.Name)
+		}
+		seenRegionSet[key] = rg.Name
+		regionDefined[rg.Name] = true
+
+		cleaned := make([]string, 0, len(rg.CIDRs))
+		for _, c := range rg.CIDRs {
+			c = trimmed(c)
+			if c == "" {
+				continue
+			}
+			// A bare address is a /32. The lists get pasted from country zone
+			// files, and refusing the odd single address in one would send
+			// somebody off to edit a thousand-line paste by hand.
+			if !strings.Contains(c, "/") {
+				c += "/32"
+			}
+			ip, netw, err := net.ParseCIDR(c)
+			if err != nil {
+				return fmt.Errorf("region %s: %q is not a network in CIDR form: %v", rg.Name, c, err)
+			}
+			if ip.To4() == nil {
+				return fmt.Errorf("region %s: %q is not IPv4; the ruleset is an ip table", rg.Name, c)
+			}
+			cleaned = append(cleaned, netw.String())
+		}
+		rg.CIDRs = cleaned
+		if len(cleaned) > 0 {
+			regionNetworks[rg.Name] = true
+		}
+
+		// The remembered fetch recipe. It generates nothing, but it is
+		// replayed into the fetch endpoint by the button, so it is held to
+		// the same shape the endpoint demands rather than left to fail there.
+		codes := rg.Countries[:0]
+		for _, cc := range rg.Countries {
+			cc = strings.ToLower(trimmed(cc))
+			if cc == "" {
+				continue
+			}
+			if bad := badCountryCode(cc); bad != "" {
+				return fmt.Errorf("region %s: country code %q: %s", rg.Name, cc, bad)
+			}
+			codes = append(codes, cc)
+		}
+		rg.Countries = codes
 	}
 
 	if cfg.Probe.ActiveIntervalMs < 50 {
@@ -510,8 +585,59 @@ func validate(cfg *model.Config) error {
 					sv.Name, sv.Target)
 			}
 		}
+
+		// Region locks fail closed the way Target does. A lock naming a region
+		// that does not exist, or one with nothing in it, would either silently
+		// not lock the port or silently drop everything arriving at it, and
+		// neither fault is visible from where it was made.
+		seenRef := map[string]bool{}
+		refs := sv.GeoRegions[:0]
+		for _, name := range sv.GeoRegions {
+			name = trimmed(name)
+			if name == "" || seenRef[name] {
+				continue
+			}
+			seenRef[name] = true
+			if !regionDefined[name] {
+				return fmt.Errorf("service %s is locked to region %q, which is not defined under Protection", sv.Name, name)
+			}
+			if !regionNetworks[name] {
+				return fmt.Errorf("service %s is locked to region %q, which has no networks in it: "+
+					"an empty allowlist would drop everything arriving at the port", sv.Name, name)
+			}
+			refs = append(refs, name)
+		}
+		sv.GeoRegions = refs
+		if sv.GeoAutoPPS < 0 {
+			return fmt.Errorf("service %s has a negative auto-lock threshold", sv.Name)
+		}
+		// A threshold with no regions has nothing to lock the port to, and the
+		// operator who set it believes a protection now exists.
+		if sv.GeoAutoPPS > 0 && len(sv.GeoRegions) == 0 {
+			return fmt.Errorf("service %s has an auto-lock threshold but no regions to lock to; "+
+				"name at least one region, or clear the threshold", sv.Name)
+		}
 	}
 	return nil
+}
+
+// maxRegionName bounds a protection region's name. It becomes an nftables set
+// name (geo_<name>) and part of a set comment, and nft bounds identifiers too;
+// 32 is far under either limit and long enough for any part of the world.
+const maxRegionName = 32
+
+// firstBadRegionRune returns the first character a region name cannot carry,
+// or "" when the name is safe. Stricter than a comment: the name becomes an
+// nftables set identifier, so it is held to the characters an identifier can
+// hold rather than folded into shape behind the operator's back.
+func firstBadRegionRune(s string) string {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return string(r)
+	}
+	return ""
 }
 
 // maxServiceName is a bound, not a style rule. nftables caps a rule comment at

@@ -222,7 +222,7 @@ td.num { font-variant-numeric: tabular-nums; }
    never engages. */
 #settings-form table { min-width: 1100px; }
 
-input, select {
+input, select, textarea {
   background: var(--bg);
   border: 1px solid var(--line);
   color: var(--text);
@@ -233,8 +233,12 @@ input, select {
   width: 100%;
 }
 
+/* The region network lists: long pastes of one CIDR per line, so a monospace
+   column that can grow but never widens its table cell. */
+textarea { font-family: ui-monospace, monospace; min-width: 260px; resize: vertical; }
+
 input[type="checkbox"] { width: auto; }
-input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent); outline-offset: -1px; }
+input:focus, select:focus, textarea:focus { outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent); outline-offset: -1px; }
 
 fieldset {
   /* A fieldset's UA min-width is min-content, so it refuses to shrink below

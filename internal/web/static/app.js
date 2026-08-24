@@ -258,7 +258,7 @@ function pathCard(p, pinned, shared) {
       block ? el('span', { class: 'badge ' + block[0], text: block[1] }) : null,
     ),
     el('div', { class: 'metrics' },
-      el('div', { class: 'metric' }, el('div', { class: 'k', text: 'rtt' }), el('div', { class: 'v', text: p.rtt_ms ? p.rtt_ms.toFixed(1) + ' ms' : '—' })),
+      el('div', { class: 'metric' }, el('div', { class: 'k', text: 'rtt' }), el('div', { class: 'v', text: p.rtt_ms ? p.rtt_ms.toFixed(1) + ' ms' : '-' })),
       el('div', { class: 'metric' }, el('div', { class: 'k', text: 'loss' }), el('div', { class: 'v', text: p.loss_pct.toFixed(1) + '%' })),
       el('div', { class: 'metric' }, el('div', { class: 'k', text: 'jitter' }), el('div', { class: 'v', text: p.jitter_ms.toFixed(1) + ' ms' })),
     ),
@@ -452,7 +452,10 @@ function renderProtect(p) {
   if (!counters.length) {
     body.append(el('p', { class: 'hint', text: 'Rules are loaded and nothing has been dropped yet.' }));
   } else {
-    const total = counters.reduce((n, c) => n + c.packets, 0);
+    // geo-trip counts packets over an auto-lock threshold, which are not
+    // themselves dropped (the drop is the geo counter beside it), so it is
+    // shown but kept out of a total labelled "dropped".
+    const total = counters.reduce((n, c) => n + (c.name.startsWith('geo-trip') ? 0 : c.packets), 0);
     body.append(el('div', { class: 'metrics' }, ...counters.map((c) => el('div', { class: 'metric' },
       el('div', { class: 'k', text: c.name }),
       el('div', { class: 'v', text: c.packets.toLocaleString() }),
@@ -460,6 +463,17 @@ function renderProtect(p) {
     body.append(el('p', { class: 'hint', text: total === 0
       ? 'Nothing dropped since the rules were last loaded.'
       : `${total.toLocaleString()} packets dropped since the rules were last loaded. Saving the configuration resets these.` }));
+  }
+
+  // Said loudly, because an engaged lock looks exactly like the service being
+  // down to everybody outside the region - this line is the only thing that
+  // separates "under attack, held" from "broken".
+  const locked = p.geo_locked || [];
+  for (const l of locked) {
+    body.append(el('div', { class: 'alert info' },
+      el('p', { text: `Region lock engaged on ${l.proto}/${l.port}: traffic to it exceeded the auto-lock threshold, and sources outside its allowed regions are being dropped. `
+        + (l.expires_sec ? `Releases in ${l.expires_sec}s unless the flood is still refreshing it.` : 'Releasing shortly.') }),
+    ));
   }
 
   if (blocked.length) {
@@ -483,10 +497,10 @@ function linkerCard(l) {
     el('div', { class: 'metrics' },
       el('div', { class: 'metric' },
         el('div', { class: 'k', text: 'host' }),
-        el('div', { class: 'v', text: l.hostname || '—' })),
+        el('div', { class: 'v', text: l.hostname || '-' })),
       el('div', { class: 'metric' },
         el('div', { class: 'k', text: 'build' }),
-        el('div', { class: 'v', text: l.version || '—' })),
+        el('div', { class: 'v', text: l.version || '-' })),
       // Two different questions, and only one of them is worth asking at a
       // time. While the host is connected, how long it has been is the useful
       // fact; once it is not, all that matters is how long it has been quiet -
@@ -727,7 +741,62 @@ function serviceRow(s, c, onRemove) {
     el('td', {}, hostSelect(s.target, c, (v) => (s.target = v))),
     el('td', {}, checkbox('', s.source_engine, (v) => (s.source_engine = v))),
     el('td', {}, num('', s.ceiling_pps, (v) => (s.ceiling_pps = v || 0), { min: 0, placeholder: '0 = off' })),
+    el('td', {}, field('', (s.geo_regions || []).join(', '), (v) => {
+      s.geo_regions = v.split(',').map((t) => t.trim()).filter(Boolean);
+    }, { placeholder: 'anywhere' })),
+    el('td', {}, num('', s.geo_auto_pps, (v) => (s.geo_auto_pps = v || 0), { min: 0, placeholder: '0 = always' })),
     el('td', {}, checkbox('', s.enabled, (v) => (s.enabled = v))),
+    el('td', {}, el('button', { class: 'btn danger', type: 'button', onclick: onRemove }, 'Remove')),
+  );
+}
+
+// A region is a name and a pile of networks, filled either way: the Fetch
+// button asks the frontend for the current lists for a set of country codes,
+// or a list is pasted by hand (one CIDR per line, the shape the aggregated
+// country files come in, so deploy/geo-zones.sh output pastes straight in).
+//
+// The fetch fills the form and nothing else. What came back is on screen, the
+// unsaved badge is lit, and it goes through Save and validation exactly like
+// something typed - the configuration is never touched by the fetch itself.
+function regionRow(r, onRemove) {
+  const ta = el('textarea', { rows: 4, placeholder: '1.128.0.0/11\n101.160.0.0/11\n…' });
+  ta.value = (r.cidrs || []).join('\n');
+  ta.addEventListener('input', () => {
+    r.cidrs = ta.value.split(/[\s,]+/).map((t) => t.trim()).filter(Boolean);
+  });
+
+  const codes = el('input', { type: 'text', placeholder: 'au, nz', value: (r.countries || []).join(', ') });
+  codes.addEventListener('input', () => {
+    r.countries = codes.value.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
+  });
+  const fetchBtn = el('button', {
+    class: 'btn', type: 'button',
+    onclick: async () => {
+      const countries = codes.value.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean);
+      if (!countries.length) { toast('Name the country codes to fetch, e.g. au, nz', true); return; }
+      fetchBtn.disabled = true;
+      fetchBtn.textContent = 'Fetching…';
+      try {
+        const res = await api('/api/geo/fetch', { method: 'POST', body: JSON.stringify({ countries }) });
+        ta.value = (res.cidrs || []).join('\n');
+        r.cidrs = res.cidrs || [];
+        r.countries = countries;
+        updateDirty();
+        const detail = (res.counts || []).map((c) => `${c.country} ${c.networks}`).join(', ');
+        toast(`Fetched ${r.cidrs.length} networks (${detail}). Review the list, then Save.`);
+      } catch (e) {
+        toast(e.message, true);
+      } finally {
+        fetchBtn.disabled = false;
+        fetchBtn.textContent = 'Fetch';
+      }
+    },
+  }, 'Fetch');
+
+  return el('tr', {},
+    el('td', {}, field('', r.name, (v) => (r.name = v), { placeholder: 'oceania' })),
+    el('td', {}, el('div', { class: 'row' }, codes, fetchBtn)),
+    el('td', {}, ta),
     el('td', {}, el('button', { class: 'btn danger', type: 'button', onclick: onRemove }, 'Remove')),
   );
 }
@@ -1162,6 +1231,14 @@ function renderSettings() {
         th('Ceiling pps', 'A cap on this service in total, across every client, in packets per second. 0 is off. '
           + 'Set it above the busiest legitimate moment you have measured and below what the active tunnel can carry: '
           + 'the point is that a flood is discarded here rather than filling a 20 Mbit LTE link and being billed to your quota.'),
+        th('Regions', 'Lock this port to the named regions, comma separated: everything arriving from outside them is dropped '
+          + 'before it is translated or sent down a tunnel. Blank means reachable from anywhere. The regions themselves are defined '
+          + 'in the Protection section below, and like everything there the lock only exists while protection is enabled.'),
+        th('Auto-lock pps', 'Leave 0 and the lock above is permanent. Set a packets-per-second threshold instead and the port stays '
+          + 'open to the world until its total traffic exceeds it: the lock then engages in the kernel at line rate, holds while the '
+          + 'flood lasts, and releases on its own once it stops. The threshold counts every packet to the row\'s ports together, '
+          + 'in-region traffic included, so it belongs above the busiest legitimate moment you have measured: a full server tripping '
+          + 'it costs out-of-region players their access.'),
         th('Enabled', 'Untick to stop publishing without losing the row. The rule disappears from the ruleset on the next save.'),
         el('th', {}),
       )),
@@ -1175,6 +1252,17 @@ function renderSettings() {
 
   if (!c.protect) c.protect = {};
   const pr = c.protect;
+  if (!pr.regions) pr.regions = [];
+
+  const regionBody = el('tbody', {});
+  const renderRegions = () => {
+    regionBody.textContent = '';
+    pr.regions.forEach((r, i) => regionBody.append(regionRow(r, () => {
+      pr.regions.splice(i, 1);
+      renderRegions();
+    })));
+  };
+  renderRegions();
 
   form.append(section('Protection (rate limiting and edge filtering)',
     // Stated before the switches, not after them. Everything in this section
@@ -1242,6 +1330,31 @@ function renderSettings() {
         + 'Leave it off if anything reaches this box\'s public interface from a private network.'),
     ),
     el('p', { class: 'hint', text: 'There is no SYN-proxy option, and that is not an omission. SYN proxying needs the handshake to be untracked, and this frontend has to track every connection in order to translate it, so the two cannot both be true. Per-source connection limiting above is what covers the same ground here.' }),
+
+    el('h3', { class: 'sub-head', text: 'Regions (for locking a port to part of the world)' }),
+    el('p', { class: 'hint', text: 'A region is a named list of source networks. A published service locked to one (the Regions column above) drops everything arriving from outside it, before anything is translated or sent down a tunnel; with an auto-lock threshold on the row, the drop instead engages only while the port is being flooded and releases on its own afterwards.' }),
+    el('p', { class: 'hint', text: 'Two ways to fill a region, same result. Fetch: enter ISO country codes and click Fetch, and this frontend downloads the current aggregated lists (from ipdeny.com, built from the RIR delegation statistics) into the box for you to review. By hand: paste any list of networks, one per line; deploy/geo-zones.sh prints the same data offline. Either way nothing applies until you Save, and the fetch is only ever a click, never a schedule: the running system does not depend on that site, and a stale list just misses a few newly allocated networks. Refreshing a couple of times a year is plenty.' }),
+    el('p', { class: 'hint', text: 'It matches where an address is allocated, not where a player is. A VPN endpoint inside an allowed region walks straight through, so this keeps a server regional and thins a flood; it is not an access control.' }),
+    el('div', { class: 'table-wrap' }, el('table', {},
+      el('thead', {}, el('tr', {},
+        th('Name', 'How service rows refer to this region, e.g. oceania. Lowercase letters, digits, hyphens and underscores only: it becomes an nftables set name.'),
+        th('Countries', 'ISO codes for the Fetch button, comma separated, e.g. au, nz. Fetch fills the Networks box with the current lists for them; the codes are remembered so a refresh is one click. Leave blank for a hand-maintained region.'),
+        th('Networks', 'The source networks the region admits, in CIDR form, one per line: what Fetch filled in, or your own paste. A bare address counts as a /32, and overlapping or duplicate entries are merged on save, so a generous paste is fine.'),
+        el('th', {}),
+      )),
+      regionBody)),
+    el('div', { class: 'row' }, el('button', {
+      class: 'btn', type: 'button',
+      onclick: () => { pr.regions.push({ name: '', cidrs: [] }); renderRegions(); },
+    }, 'Add region')),
+    el('div', { class: 'grid' },
+      num('Auto-lock release (s)', pr.geo_lock_seconds, (v) => (pr.geo_lock_seconds = v || 0), {
+        min: 0, placeholder: '0 = 60',
+        help: 'How long an automatic lock lingers once the flood that engaged it stops. While traffic stays over the threshold the lock '
+          + 'is refreshed continuously, so this is release lag, not a rearm interval. The default minute stops a flood pulsing on and off '
+          + 'from letting a burst through between pulses, without locking out-of-region players out for long after a false trip.',
+      }),
+    ),
     el('p', { class: 'hint', text: 'The counters reset whenever you save, because saving reloads the rules.' }),
   ));
 
