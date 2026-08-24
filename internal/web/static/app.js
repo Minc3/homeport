@@ -611,10 +611,34 @@ function markSaved() {
 }
 
 // Delegated, because renderSettings rebuilds everything inside the form.
+// updateGeoWarn says out loud that a region lock on a service row does not
+// exist while Protection is disabled. Nothing refuses that state on purpose:
+// unticking Protection has to stay the one-click way to back every filter out,
+// locks included, so the save is legal - which is exactly why it needs saying,
+// because a lock somebody believes is standing is worse than none. Driven by
+// the same delegated form events as the dirty badge, so it tracks the region
+// dropdowns, the row enable boxes and the Protection switch live.
+function updateGeoWarn() {
+  const w = document.getElementById('geo-warn');
+  if (!w || !config) return;
+  const locked = (config.services || [])
+    .filter((s) => s.enabled && (s.geo_regions || []).length)
+    .map((s) => s.name || '(unnamed)');
+  const show = locked.length > 0 && !(config.protect && config.protect.enabled);
+  w.classList.toggle('hidden', !show);
+  if (show) {
+    w.textContent = `Region lock${locked.length === 1 ? '' : 's'} on ${locked.join(', ')} will not exist: `
+      + 'Protection is disabled, and the locks live in its table. Nothing is being dropped for these rows. '
+      + 'Tick Enabled under Protection below to make them live, or set the row back to anywhere.';
+  }
+}
+
 // 'input' catches typing, 'change' the dropdowns and checkboxes, 'click' the
 // Add and Remove buttons.
 for (const evt of ['input', 'change', 'click']) {
-  document.getElementById('settings-form').addEventListener(evt, updateDirty);
+  const form = document.getElementById('settings-form');
+  form.addEventListener(evt, updateDirty);
+  form.addEventListener(evt, updateGeoWarn);
 }
 
 // Closing or reloading the page with edits pending gets the browser's own
@@ -1274,6 +1298,10 @@ function renderSettings() {
       onclick: () => { c.services.push({ name: 'new', proto: 'tcp', port: 5000, port_end: 0, enabled: true }); renderServices(); },
     }, 'Add service')),
     el('p', { class: 'hint', text: 'Destination NAT only. Source addresses are never rewritten, so the game server and the web server see real client IPs.' }),
+    // Filled by updateGeoWarn, which every form event runs: a region lock on a
+    // row does nothing while Protection is disabled, and a lock somebody
+    // believes exists is worse than none.
+    el('div', { class: 'alert warn hidden', id: 'geo-warn' }),
   ));
 
   if (!c.protect) c.protect = {};
@@ -1628,6 +1656,9 @@ async function loadSettings() {
     ]);
     renderSettings();
     markSaved();
+    // The form events keep it live from here; this covers a config loaded
+    // already carrying the mismatch.
+    updateGeoWarn();
   } catch (e) {
     toast(e.message, true);
   }
