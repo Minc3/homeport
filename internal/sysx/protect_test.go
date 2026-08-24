@@ -235,6 +235,10 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 			"elem": [{"elem": {"val": 27015, "expires": 42}}]}},
 		{"rule": {"chain": "filter", "comment": "packet-rate",
 			"expr": [{"match": {}}, {"counter": {"packets": 1200, "bytes": 96000}}, {"drop": null}]}},
+		{"rule": {"chain": "raw", "comment": "bogus-tcp",
+			"expr": [{"counter": {"packets": 3, "bytes": 180}}, {"drop": null}]}},
+		{"rule": {"chain": "raw", "comment": "bogus-tcp",
+			"expr": [{"counter": {"packets": 5, "bytes": 300}}, {"drop": null}]}},
 		{"rule": {"chain": "raw", "comment": "blocked",
 			"expr": [{"counter": {"packets": 4, "bytes": 240}}, {"drop": null}]}}
 	]}`
@@ -249,8 +253,11 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 	if len(locked) != 1 || locked[0].Proto != "udp" || locked[0].Port != 27015 || locked[0].ExpiresSec != 42 {
 		t.Errorf("engaged locks read as %+v, want udp/27015 releasing in 42s", locked)
 	}
-	if len(counters) != 2 {
-		t.Fatalf("read %d counters, want 2: %+v", len(counters), counters)
+	// One limit is often several rules - the bogus-TCP filter alone is seven -
+	// and they must come back as one figure per limit, not a card per rule:
+	// seven identical zero tiles is what this looked like before.
+	if len(counters) != 3 {
+		t.Fatalf("read %d counters, want 3 (one per distinct comment): %+v", len(counters), counters)
 	}
 	byName := map[string]int64{}
 	for _, c := range counters {
@@ -258,6 +265,9 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 	}
 	if byName["packet-rate"] != 1200 {
 		t.Errorf("packet-rate counter read as %d", byName["packet-rate"])
+	}
+	if byName["bogus-tcp"] != 8 {
+		t.Errorf("two bogus-tcp rules summed to %d packets, want 8", byName["bogus-tcp"])
 	}
 	if len(blocked) != 2 {
 		t.Fatalf("read %d blocked sources, want 2: %+v", len(blocked), blocked)

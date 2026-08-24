@@ -686,6 +686,13 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 	}
 
 	var counters []model.ProtectCounter
+	// Summed by comment, not listed by rule. One limit is often several
+	// rules: the bogus-TCP filter is seven flag combinations, and a block
+	// direction lock is a rule per region - and a tile per rule made the
+	// portal show seven identical "bogus-tcp" cards, which read as a bug.
+	// The comment is the limit's identity; the split into rules is a kernel
+	// detail nothing upstream should see.
+	counterIdx := map[string]int{}
 	var blocked []model.BlockedSource
 	var locked []model.GeoLockedPort
 	for _, item := range doc.Nftables {
@@ -699,9 +706,16 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 					Packets int64 `json:"packets"`
 					Bytes   int64 `json:"bytes"`
 				}
-				if json.Unmarshal(raw, &c) == nil {
-					counters = append(counters, model.ProtectCounter{Name: rule.Comment, Packets: c.Packets, Bytes: c.Bytes})
+				if json.Unmarshal(raw, &c) != nil {
+					continue
 				}
+				if i, ok := counterIdx[rule.Comment]; ok {
+					counters[i].Packets += c.Packets
+					counters[i].Bytes += c.Bytes
+					continue
+				}
+				counterIdx[rule.Comment] = len(counters)
+				counters = append(counters, model.ProtectCounter{Name: rule.Comment, Packets: c.Packets, Bytes: c.Bytes})
 			}
 		}
 		if set := item.Set; set != nil {

@@ -436,6 +436,32 @@ async function refreshStatus() {
   renderProtect(st.protect);
 }
 
+// counterInfo turns a rule comment into a readable label and an explanation.
+// The comments are the kernel's identifiers and stay terse on purpose (nft
+// bounds them in bytes); the place to be understood by a person is here.
+function counterInfo(name) {
+  const fixed = {
+    blocked: ['parked sources', 'Dropped on sight because the source tripped a limit earlier and is parked until its block expires.'],
+    invalid: ['invalid packets', 'Packets connection tracking could not place in any connection: late fragments, out-of-window segments, crafted floods.'],
+    'bogus-tcp': ['bogus TCP flags', 'Flag combinations no real stack sends: SYN+FIN, null and Xmas packets, port scans. Seven rules, counted together.'],
+    spoofed: ['spoofed sources', 'Source addresses that cannot legitimately arrive from the internet: private, loopback, link-local, multicast, reserved.'],
+    'conn-rate': ['connection rate', 'TCP connection attempts over the per-source rate. Established connections are never touched.'],
+    'conn-count': ['connections held', 'Connection attempts from sources already holding too many open connections.'],
+    'packet-rate': ['packet rate', 'UDP packets over the per-source rate to a published port.'],
+    'query-rate': ['query rate', 'Source-engine connectionless packets (A2S queries and connection attempts) over the per-source rate. Players in game never match.'],
+  };
+  if (fixed[name]) return fixed[name];
+  const i = name.indexOf(':');
+  if (i > 0) {
+    const kind = name.slice(0, i);
+    const svc = name.slice(i + 1);
+    if (kind === 'ceiling') return [`ceiling: ${svc}`, `Packets over that service's total cap, across every client.`];
+    if (kind === 'geo') return [`region lock: ${svc}`, `Packets dropped by that service's region lock.`];
+    if (kind === 'geo-trip') return [`auto-lock trips: ${svc}`, 'Packets over the auto-lock threshold. Not drops: each one engaged or refreshed the region lock.'];
+  }
+  return [name, ''];
+}
+
 // The counters are the whole reason any of this is reported. A limit that is
 // dropping traffic and a service that is broken look identical from outside, so
 // without these numbers a tuning mistake becomes an unexplained outage.
@@ -456,10 +482,14 @@ function renderProtect(p) {
     // themselves dropped (the drop is the geo counter beside it), so it is
     // shown but kept out of a total labelled "dropped".
     const total = counters.reduce((n, c) => n + (c.name.startsWith('geo-trip') ? 0 : c.packets), 0);
-    body.append(el('div', { class: 'metrics' }, ...counters.map((c) => el('div', { class: 'metric' },
-      el('div', { class: 'k', text: c.name }),
-      el('div', { class: 'v', text: c.packets.toLocaleString() }),
-      el('div', { class: 'hint', text: bytes(c.bytes) })))));
+    body.append(el('div', { class: 'metrics' }, ...counters.map((c) => {
+      const [label, tip] = counterInfo(c.name);
+      return el('div', { class: 'metric', title: tip },
+        el('div', { class: 'k', text: label }),
+        el('div', { class: 'v', text: c.packets.toLocaleString() }),
+        el('div', { class: 'hint', text: bytes(c.bytes) }));
+    })));
+    body.append(el('p', { class: 'hint', text: 'Hover a card for what its limit drops. Every figure is packets dropped by that limit, except auto-lock trips, which is the threshold being crossed.' }));
     body.append(el('p', { class: 'hint', text: total === 0
       ? 'Nothing dropped since the rules were last loaded.'
       : `${total.toLocaleString()} packets dropped since the rules were last loaded. Saving the configuration resets these.` }));
