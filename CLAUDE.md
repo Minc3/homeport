@@ -737,11 +737,14 @@ own copy, which made it the method every test in `internal/store` drove and the
 method nothing in production called: the saturating upsert, the floor under it
 and the `usage_samples` insert the portal's graph reads back were all pinned on
 a dead path, and dropping any of them from the live one left the suite green.
-`Engine.AddUsage` has the same shape for the same reason, and `addUsageBatch` is
-unexported because `usageSample` is - an exported method taking a type no other
-package can construct advertises a boundary that does not exist.
+`addUsageBatch` is unexported because `usageSample` is: an exported method
+taking a type no other package can construct advertises a boundary that does not
+exist. There was an exported single-delta wrapper beside it for one commit, kept
+on the store's reasoning, and that reasoning did not transfer - nothing called
+it and no test drove it, so it was a dead method carrying a claim about coverage
+it did not have.
 
-**`quota.Location` memoises, and the reason is the batching above.**
+**The zone is resolved once per batch, and not by a process-wide cache.**
 `time.LoadLocation` does not cache: it re-opens and re-parses the zoneinfo entry
 every call, about fifty microseconds. That was invisible at once per path per
 quota refresh and stopped being invisible the moment a batch became one
@@ -749,6 +752,15 @@ transaction, because `PeriodBounds` is called per delta - five hundred tzdata
 parses on the control read loop, which cannot answer a ping while it works. It
 was by a wide margin the most expensive thing left in a loop the batching change
 had just hoisted the cheap thing out of.
+
+The first fix for that was a memo inside `Location`, and it bought the saving by
+pinning every zone's rules for the life of the process. A frontend runs for
+months under `Restart=always`; a tzdata update carrying a rule change would then
+never be picked up, and the billing boundary would go on being drawn with the
+old offsets until somebody restarted the unit, with nothing reporting it. The
+problem is per-batch, so the fix belongs there: `quota.PeriodBoundsIn` takes the
+zone, `addUsageBatch` resolves it once, and every delta in a batch shares one
+path and therefore one zone anyway.
 
 What neither bounds is a sequence that has gone *backwards*, and that hole is
 open. A backend that loses `meter-state.json` restarts at 1, every delta is at
@@ -1159,6 +1171,25 @@ lose the usage that matters most.
 are down, the backend is unreachable by definition - and that is precisely when
 somebody needs to see why and click "use LTE2 anyway". The frontend is in a
 datacentre on independent internet, so the portal survives a total path outage.
+
+**A portal number field rounds unless its units are fractional.** Every numeric
+input coerces a cleared box to zero rather than to `NaN`, which JSON writes as
+`null` and Go decodes as a no-op, and rounds unless the call site says
+`float: true`. Both directions were reachable and neither was harmless: an empty
+`overhead_per_packet` stored 0, which is a legal "no per-packet overhead" and
+under-bills every metered byte by 5 to 15% in silence, while a decimal typed
+into any of the twenty-five fields `model.Config` declares as `int` failed the
+whole `PUT` with "cannot unmarshal number 90.5" and blocked every unrelated edit
+in the form until the operator found a field they may not have touched.
+
+Rounding is the default and the float is the opt-out, which is the way round it
+has to be. The first version was opt-in and reached four fields of the
+twenty-five, so it was an invariant stated in a comment and held in four places.
+The opt-out is about the units the *input* carries rather than the Go type
+behind it: the two quota caps are `int64` and are still float here, because the
+box is in GB and its handler multiplies, so rounding it turns anything under
+half a gigabyte into 0 and 0 is how a quota is disabled. Where the units and the
+type disagree, the units win.
 
 **The portal must never be able to take the agent down.** It binds an address on
 the admin tunnel, and that address does not exist until `wg-quick` has brought
@@ -2454,17 +2485,18 @@ where a subtle regression would be invisible in production until an outage:
 - `store/perms_test.go` - the database and its journal carry no group or world
   bits. They hold live session tokens, so this is the file mode standing
   between a local account and the portal.
-- `store/usage_saturation_test.go` also drives `AddUsageBatch` directly, ceiling
-  and floor in one transaction, and reads the graph back through `UsageHistory`.
-  The other cases here go through `AddUsage`, and that only covers the live path
-  while `AddUsage` remains a batch of one; for one commit it was not, and every
-  bound in this file was being pinned on a method nothing called.
 - `store/usage_saturation_test.go` - the ledger column survives at both ends:
   forty saturated deltas leave it readable and capped rather than promoted to a
   REAL, and a negative delta neither drives it below zero nor takes the packet
   column with it. The floor is pinned here rather than only in the engine
-  because `Engine.AddUsage` clamps first, so an engine-level test passes whether
-  or not this method holds its own bound.
+  because the engine clamps first, so an engine-level test passes whether or not
+  this method holds its own bound. It also drives `AddUsageBatch` directly, with
+  the ceiling and the floor in one transaction and the graph read back through
+  `UsageHistory` - enough entries to overflow an int64 `SUM`, because three of
+  them came to a quarter of that and pinned nothing. The other cases reach the
+  batch path only while `AddUsage` remains a batch of one; for one commit it was
+  not, and every bound in this file was being pinned on a method nothing
+  called.
 - `engine/quota_report_test.go` - a stored calibration outside the range this
   build accepts is named at load, with the path in the line, and a configuration
   the portal would accept produces no line at all. Zero is pinned as one of the

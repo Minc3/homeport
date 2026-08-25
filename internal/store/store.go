@@ -32,7 +32,8 @@ var ErrNotFound = errors.New("store: not found")
 // 2^60 is an exbibyte, so no real deployment approaches it and the cap never
 // bites anything honest. It is low enough that adding one more bounded delta to
 // a column already at the cap cannot overflow an int64, which is the property
-// that matters: see the note in AddUsage on what SQLite does with an overflow.
+// that matters: see the note in AddUsageBatch on what SQLite does with an
+// overflow.
 const MaxLedgerValue = 1 << 60
 
 // Store wraps the SQLite database.
@@ -326,6 +327,26 @@ func (s *Store) AddUsageBatch(pathID int, entries []UsageEntry, metaKey, metaVal
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Saturating in SQL, in both directions, and not merely bounded per delta
+	// by the caller.
+	//
+	// SQLite does not error on integer overflow: `bytes + excluded.bytes`
+	// silently becomes a REAL, and from then on every Scan into an int64
+	// returns "converting driver.Value type float64 to a int64". That is
+	// permanent, because the column now holds a float, and Engine.refreshQuota
+	// carries the previous verdict forward on a read error, so the path's quota
+	// freezes at whatever it last was and only editing the database clears it.
+	//
+	// A per-delta bound cannot prevent it, which is the trap: the callers bound
+	// one delta and this column accumulates them, so thirteen clamped deltas
+	// reach the overflow inside a single frame. The cap has to be on the sum,
+	// which is what MIN does here.
+	//
+	// MAX(..., 0) is the floor, and it matters more than the ceiling. This
+	// column accumulates, so a negative figure does not record a wrong number
+	// for one sample, it erases usage already billed - the silent direction, and
+	// the one the carrier's invoice is the first news of. Do not simplify either
+	// of these to a bare `+`.
 	ledger, err := tx.Prepare(
 		`INSERT INTO ledger (path_id, period_start, bytes, packets) VALUES (?, ?, ?, ?)
 		 ON CONFLICT(path_id, period_start) DO UPDATE SET
@@ -334,6 +355,9 @@ func (s *Store) AddUsageBatch(pathID int, entries []UsageEntry, metaKey, metaVal
 		return fmt.Errorf("ledger update: %w", err)
 	}
 	defer ledger.Close()
+	// The same values, so the same bounds. These rows looked like the harmless
+	// half of the pair and are not: the cap above bounds an accumulating
+	// column, and these accumulate inside a query instead. See UsageHistory.
 	sample, err := tx.Prepare(
 		`INSERT INTO usage_samples (ts, path_id, bytes, packets) VALUES (?, ?, ?, ?)`)
 	if err != nil {

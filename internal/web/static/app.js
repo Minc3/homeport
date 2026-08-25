@@ -735,8 +735,8 @@ function field(label, value, onInput, opts = {}) {
     max: opts.max,
     placeholder: opts.placeholder,
   });
-  // A number field never hands its callback a NaN, and an integer field never
-  // hands it a fraction. Both were reachable and neither was harmless.
+  // A number field never hands its callback a NaN, and it rounds unless the Go
+  // field behind it is a float. Both were reachable and neither was harmless.
   //
   // parseFloat('') is NaN, so clearing a box passed NaN straight into the
   // config; JSON.stringify writes that as null, and Go decodes null into a
@@ -751,11 +751,29 @@ function field(label, value, onInput, opts = {}) {
   // finds a field they may not have touched. Rounding here is the same
   // reasoning as declaring min and max: the form must not be able to build a
   // body the save endpoint refuses.
+  //
+  // Rounding is the default and `float: true` is the opt-out, which is the way
+  // round it has to be. The first version made it opt-in and reached four
+  // fields out of the twenty-five that are int in model.Config, so the same
+  // save-blocking decimal was still typeable into every probe interval, every
+  // threshold, every timeout, every service port and every protection limit -
+  // an invariant stated in a comment and held in four places. There are eight
+  // float fields in the whole configuration and they are named at their call
+  // sites; anything new is an int until somebody says otherwise, which fails
+  // in the direction that rounds a value rather than the one that refuses a
+  // save.
+  //
+  // The opt-out is about the units the *input* carries, not the Go type behind
+  // it. The two quota caps are int64 in model.Config and are still float here,
+  // because the box is in GB and its handler multiplies: rounding the box turns
+  // a 2.5 GB cap into 3, and anything under half a gigabyte into 0, which is
+  // how a quota is disabled. That is the silent direction, so where the units
+  // and the Go type disagree the units win.
   input.addEventListener('input', () => {
     if (opts.type !== 'number') return onInput(input.value);
     let v = parseFloat(input.value);
     if (!Number.isFinite(v)) v = 0;
-    return onInput(opts.int ? Math.round(v) : v);
+    return onInput(opts.float ? v : Math.round(v));
   });
   return el('label', { class: 'field' }, caption(label, opts.help), input);
 }
@@ -794,16 +812,16 @@ function pathRow(p) {
   return el('tr', {},
     el('td', {}, field('', p.name, (v) => (p.name = v), { placeholder: 'lte1' })),
     el('td', {}, field('', p.iface, (v) => (p.iface = v), { placeholder: 'wg-lte1' })),
-    el('td', {}, num('', p.priority, (v) => (p.priority = v), { int: true, min: 1, placeholder: '2' })),
-    el('td', {}, num('', p.table, (v) => (p.table = v), { int: true, min: 1, placeholder: '102' })),
+    el('td', {}, num('', p.priority, (v) => (p.priority = v), { min: 1, placeholder: '2' })),
+    el('td', {}, num('', p.table, (v) => (p.table = v), { min: 1, placeholder: '102' })),
     el('td', {}, field('', '0x' + (p.mark || 0).toString(16), (v) => (p.mark = parseInt(v, 16) || 0), { placeholder: '0x102' })),
     el('td', {}, checkbox('', p.enabled, (v) => (p.enabled = v))),
     el('td', {}, checkbox('', p.metered, (v) => (p.metered = v))),
-    el('td', {}, num('', (p.quota.limit_bytes || 0) / GB, (v) => (p.quota.limit_bytes = Math.round(v * GB)), { step: 1, min: 0, placeholder: '60' })),
-    el('td', {}, num('', (p.quota.ceiling_bytes || 0) / GB, (v) => (p.quota.ceiling_bytes = Math.round(v * GB)), { step: 1, min: 0, placeholder: '0' })),
-    el('td', {}, num('', p.shape.to_backend_mbit, (v) => (p.shape.to_backend_mbit = v || 0), { min: 0, step: 1, placeholder: '0 = off' })),
-    el('td', {}, num('', p.shape.to_frontend_mbit, (v) => (p.shape.to_frontend_mbit = v || 0), { min: 0, step: 1, placeholder: '0 = off' })),
-    el('td', {}, num('', p.quota.reset_day, (v) => (p.quota.reset_day = v), { int: true, min: 1, placeholder: '1' })),
+    el('td', {}, num('', (p.quota.limit_bytes || 0) / GB, (v) => (p.quota.limit_bytes = Math.round(v * GB)), { float: true, step: 1, min: 0, placeholder: '60' })),
+    el('td', {}, num('', (p.quota.ceiling_bytes || 0) / GB, (v) => (p.quota.ceiling_bytes = Math.round(v * GB)), { float: true, step: 1, min: 0, placeholder: '0' })),
+    el('td', {}, num('', p.shape.to_backend_mbit, (v) => (p.shape.to_backend_mbit = v || 0), { float: true, min: 0, step: 1, placeholder: '0 = off' })),
+    el('td', {}, num('', p.shape.to_frontend_mbit, (v) => (p.shape.to_frontend_mbit = v || 0), { float: true, min: 0, step: 1, placeholder: '0 = off' })),
+    el('td', {}, num('', p.quota.reset_day, (v) => (p.quota.reset_day = v), { min: 1, placeholder: '1' })),
     el('td', {}, field('', p.quota.timezone, (v) => (p.quota.timezone = v), { placeholder: 'Australia/Melbourne' })),
     // The bounds are quota.MinCalibration and quota.MaxCalibration, mirrored
     // here by hand because the page cannot call Go, exactly as the detection
@@ -811,14 +829,14 @@ function pathRow(p) {
     // the form accepts a figure PUT /api/config refuses outright, and the
     // refusal blocks the whole save, so an unrelated edit in this form cannot
     // be stored until a field the operator may never have touched is corrected.
-    el('td', {}, num('', p.quota.calibration, (v) => (p.quota.calibration = v), { step: 0.5, min: 10, max: 1000, placeholder: '100' })),
+    el('td', {}, num('', p.quota.calibration, (v) => (p.quota.calibration = v), { float: true, step: 0.5, min: 10, max: 1000, placeholder: '100' })),
     // Rendered for the same reason the bounds above are declared, and it was
     // the half that was missing. validate refuses an overhead outside 0 to
     // 65535, and this value had no input at all - it round-tripped from GET
     // straight back into the PUT body. A blob carrying one out of range
     // therefore failed every save, naming a field the operator could not see or
     // reach, and blocked every unrelated edit with it.
-    el('td', {}, num('', p.quota.overhead_per_packet, (v) => (p.quota.overhead_per_packet = v), { int: true, step: 1, min: 0, max: 65535, placeholder: '0 = none' })),
+    el('td', {}, num('', p.quota.overhead_per_packet, (v) => (p.quota.overhead_per_packet = v), { step: 1, min: 0, max: 65535, placeholder: '0 = none' })),
   );
 }
 
@@ -1308,7 +1326,7 @@ function renderSettings() {
         help: 'How many recent probes the loss, RTT and jitter figures on the dashboard are calculated over. '
           + '60 probes at 250ms is about the last 15 seconds. Minimum 5. Example: 60.',
       }),
-      num('Max loss %', c.probe.max_loss_pct, (v) => (c.probe.max_loss_pct = v), {
+      num('Max loss %', c.probe.max_loss_pct, (v) => (c.probe.max_loss_pct = v), { float: true,
         step: 0.5,
         placeholder: '15',
         help: 'Loss across that window above this figure blocks the path as degraded: it is answering, but too badly to carry a game. '
@@ -1370,26 +1388,26 @@ function renderSettings() {
     el('p', { class: 'hint', text: 'Priority order always uses the highest-priority path that works. Best measured fallback changes one thing: once the preferred path is out, it picks whichever remaining path is measuring best rather than simply the next one down the list.' }),
     el('p', { class: 'hint', text: 'The preferred path is never second-guessed: while it is usable it keeps the traffic whatever the numbers say, and it wins the traffic back on its clean streak alone. Priority order is the cost order here, and a link that is 10ms quicker is not a reason to sit on a metered one.' }),
     el('div', { class: 'grid' },
-      num('Loss weight (ms per 1%)', q.loss_weight, (v) => (q.loss_weight = v), {
+      num('Loss weight (ms per 1%)', q.loss_weight, (v) => (q.loss_weight = v), { float: true,
         step: 1,
         placeholder: '25',
         help: 'How many milliseconds of latency one percent of packet loss is treated as being worth. '
           + 'At 25, a link losing 1% has to be 25ms quicker just to draw level, which is right for a game server, where a clean 60ms path beats a lossy 30ms one. '
           + 'Cannot be negative.',
       }),
-      num('RTT weight', q.rtt_weight, (v) => (q.rtt_weight = v), {
+      num('RTT weight', q.rtt_weight, (v) => (q.rtt_weight = v), { float: true,
         step: 0.1,
         placeholder: '1',
         help: 'Multiplier on average round trip in the score. 1 means one millisecond of latency counts as one point, which is what makes the score read in milliseconds. '
           + 'Cannot be negative.',
       }),
-      num('Jitter weight', q.jitter_weight, (v) => (q.jitter_weight = v), {
+      num('Jitter weight', q.jitter_weight, (v) => (q.jitter_weight = v), { float: true,
         step: 0.1,
         placeholder: '3',
         help: 'Multiplier on jitter, how much the round trip varies. Weighted above plain latency because inconsistency is what players actually notice. '
           + 'Cannot be negative.',
       }),
-      num('Switch margin (%)', q.margin_pct, (v) => (q.margin_pct = v), {
+      num('Switch margin (%)', q.margin_pct, (v) => (q.margin_pct = v), { float: true,
         step: 1,
         placeholder: '25',
         help: 'How much better a candidate must score before it takes traffic off another fallback: 25 means it has to score at least 25% lower. '

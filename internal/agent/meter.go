@@ -193,14 +193,21 @@ func (m *Meter) PendingBatch(n int) []proto.UsageDelta {
 		return nil
 	}
 
-	// The ordinary site takes the flat prefix it always did, and finds that out
-	// without walking the backlog. A buffer holding one path cannot starve
-	// anything, so the whole apparatus below is provably a no-op for it - and
-	// paying a 50,000 entry walk plus a 50 KB allocation every ten seconds to
-	// discover that, under the lock persist and sample also want, is worse than
-	// what it replaced. The first version of this claimed the single-path case
-	// cost "a map walk and nothing else", which was both wrong and the wrong
-	// thing to be relaxed about.
+	// The ordinary site takes the flat prefix it always did. A buffer holding
+	// one path cannot starve anything, so the whole apparatus below is provably
+	// a no-op for it.
+	//
+	// What this costs on that site, stated exactly, because the last two
+	// versions of this comment both overclaimed: one walk of the backlog
+	// comparing an int per entry, and no allocation and no hashing. The walk
+	// does not end early on a single-path buffer, because what it is looking for
+	// is a path that differs and there is not one. That is the price of the
+	// guarantee below, and it is worth naming rather than rounding down to
+	// nothing: the first version said "a map walk and nothing else" while
+	// building a map and a 50,000 entry bitmap, and the second said this found
+	// its answer "without walking the backlog", which is the one thing it cannot
+	// do. Making it genuinely O(1) means carrying a live path count on the
+	// Meter, which is another invariant for sample, AckApplied and load to keep.
 	first := m.pending[0].PathID
 	shared := false
 	for _, d := range m.pending {

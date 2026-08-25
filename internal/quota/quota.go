@@ -11,7 +11,6 @@ package quota
 import (
 	"fmt"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
@@ -145,41 +144,39 @@ func Location(q model.Quota) *time.Location {
 	if q.Timezone == "" {
 		return time.UTC
 	}
-	if loc, ok := locations.Load(q.Timezone); ok {
-		return loc.(*time.Location)
-	}
 	loc, err := time.LoadLocation(q.Timezone)
 	if err != nil {
 		return time.UTC
 	}
-	locations.Store(q.Timezone, loc)
 	return loc
 }
-
-// locations memoises the zones this deployment actually uses.
-//
-// time.LoadLocation does not cache: it re-opens and re-parses the zoneinfo
-// entry on every call, which measures at about fifty microseconds. That was
-// invisible while it happened once per path per quota refresh and is not
-// invisible now that a usage batch is applied in one transaction: PeriodBounds
-// is called once per delta, so a five hundred delta backlog drain was five
-// hundred tzdata parses, synchronously, on the control read loop, which cannot
-// answer a ping while it works. It is by a wide margin the most expensive thing
-// in that loop, and the batching change hoisted the path lookup out of it while
-// leaving this behind.
-//
-// A *time.Location is immutable and safe to share. Only successful loads are
-// cached, so a zone that fails is retried rather than pinned as UTC for the
-// life of the process - web.validate refuses an unknown zone, so what reaches
-// this is a tzdata package that was not installed yet.
-var locations sync.Map
 
 // PeriodBounds returns the billing period containing now.
 //
 // ResetDay is clamped to the length of the month, so a carrier that resets on
 // the 31st still gets a sane boundary in February.
 func PeriodBounds(q model.Quota, now time.Time) (start, end time.Time) {
-	loc := Location(q)
+	return PeriodBoundsIn(q, Location(q), now)
+}
+
+// PeriodBoundsIn is PeriodBounds with the zone already resolved.
+//
+// It exists because time.LoadLocation does not cache: it re-opens and re-parses
+// the zoneinfo entry on every call, about fifty microseconds. That is nothing
+// at once per path per quota refresh, and it is not nothing once a usage batch
+// is applied in one transaction, because the caller then wants a period per
+// delta - five hundred tzdata parses on the control read loop, which cannot
+// answer a ping while it works.
+//
+// A caller resolving it once for a batch is the right depth for that fix. The
+// first attempt was a process-global memo inside Location, which bought the
+// same saving and quietly pinned every zone's rules for the life of the
+// process: a frontend runs for months under Restart=always, unattended-upgrades
+// installs a tzdata carrying a rule change, and the billing boundary goes on
+// being drawn with the old offsets until somebody restarts the unit. Every
+// delta in one batch shares one path and therefore one zone, so there is no
+// need to reach for process-wide state to say so.
+func PeriodBoundsIn(q model.Quota, loc *time.Location, now time.Time) (start, end time.Time) {
 	n := now.In(loc)
 
 	day := q.ResetDay

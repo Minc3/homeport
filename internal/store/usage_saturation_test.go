@@ -151,14 +151,23 @@ func TestTheBatchEntryPointCarriesTheSameBounds(t *testing.T) {
 
 	now := time.Now()
 	const perDelta = int64(720752316243935232)
-	entries := []store.UsageEntry{
-		{PeriodStart: now, At: now, Bytes: perDelta, Packets: perDelta},
-		{PeriodStart: now, At: now, Bytes: perDelta, Packets: perDelta},
-		{PeriodStart: now, At: now, Bytes: perDelta, Packets: perDelta},
-		// The floor, in the same transaction as the ceiling, because a batch is
-		// where the two can meet.
-		{PeriodStart: now, At: now, Bytes: -(600 << 30), Packets: -50_000},
+	// Enough entries that the usage_samples SUM overflows an int64, not merely
+	// enough that the ledger column saturates. The two are different hazards and
+	// the first version of this test only reached the second: three entries came
+	// to 2.16e18, comfortably inside int64, so the UsageHistory assertion below
+	// passed with or without the CAST that makes it safe. Twenty entries come to
+	// 1.4e19, which is past it.
+	var entries []store.UsageEntry
+	for i := 0; i < 20; i++ {
+		entries = append(entries, store.UsageEntry{
+			PeriodStart: now, At: now, Bytes: perDelta, Packets: perDelta,
+		})
 	}
+	// The floor, in the same transaction as the ceiling, because a batch is
+	// where the two can meet.
+	entries = append(entries, store.UsageEntry{
+		PeriodStart: now, At: now, Bytes: -(600 << 30), Packets: -50_000,
+	})
 	if err := st.AddUsageBatch(2, entries, "usage_seq:2", "9"); err != nil {
 		t.Fatalf("batch: %v", err)
 	}

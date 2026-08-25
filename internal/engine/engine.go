@@ -1530,33 +1530,24 @@ type usageSample struct {
 	At      time.Time
 }
 
-// AddUsage records a metering delta reported by the backend and advances the
-// caller's dedupe watermark (seqKey/seqVal) in the same transaction. It
-// reports whether both are durable, so the caller only acks once the bytes are
-// safely in the ledger - and the two cannot drift across a crash: a watermark
-// ahead of the ledger loses the bytes, one behind it double-bills a resend.
-//
-// A batch of one. Every bound and every conversion lives in addUsageBatch, so
-// the exported single-delta entry point cannot come to differ from the one the
-// control channel actually uses, which is what happened to the timestamp window
-// when this method held its own copy of it.
-func (e *Engine) AddUsage(pathID int, bytes, packets int64, at time.Time, seqKey, seqVal string) error {
-	return e.addUsageBatch(pathID, []usageSample{{Bytes: bytes, Packets: packets, At: at}}, seqKey, seqVal)
-}
-
 // addUsageBatch records a run of metering deltas for one path and advances that
 // path's dedupe watermark, all inside one transaction.
 //
-// The path is resolved once for the batch rather than once per delta. The
-// configuration is read under a lock on the control read loop, so a five
-// hundred delta batch was five hundred lock acquisitions and five hundred
-// linear scans of Paths to look up the same entry every time. quota.Location
-// memoises for the same reason, one layer down: PeriodBounds below is called
-// per delta and used to reparse the zoneinfo entry every time.
+// Two things are resolved once for the batch rather than once per delta, and
+// both were per-delta costs on the control read loop, which cannot answer a
+// ping while it works. The path, because PathByID takes its receiver by value,
+// so every call copied the whole configuration to read one entry. And the
+// timezone, which is the more expensive of the two by orders of magnitude:
+// time.LoadLocation re-parses the zoneinfo entry on every call, so a five
+// hundred delta batch was five hundred tzdata parses. Every delta here belongs
+// to one path and therefore to one zone.
 //
 // Unexported, because usageSample is: an exported method taking a type no other
-// package can construct advertises a boundary that does not exist. AddUsage is
-// the exported entry point and is a batch of one.
+// package can construct advertises a boundary that does not exist. There was an
+// exported single-delta wrapper here for one commit, kept on the reasoning that
+// the store's equivalent is what every test in that package drives. That
+// reasoning did not transfer - no test drove this one and nothing called it -
+// so it was a dead method carrying a claim about coverage it did not have.
 func (e *Engine) addUsageBatch(pathID int, samples []usageSample, seqKey, seqVal string) error {
 	e.mu.RLock()
 	p, ok := e.cfg.PathByID(pathID)
@@ -1569,6 +1560,7 @@ func (e *Engine) addUsageBatch(pathID int, samples []usageSample, seqKey, seqVal
 	}
 
 	now := time.Now()
+	loc := quota.Location(p.Quota)
 	entries := make([]store.UsageEntry, 0, len(samples))
 	for _, s := range samples {
 		// Clamped here as well as inside Metered, because the two columns must
@@ -1604,7 +1596,7 @@ func (e *Engine) addUsageBatch(pathID int, samples []usageSample, seqKey, seqVal
 		if at.After(now.Add(maxDeltaSkew)) || at.Before(now.Add(-maxDeltaAge)) {
 			at = now
 		}
-		start, _ := quota.PeriodBounds(p.Quota, at)
+		start, _ := quota.PeriodBoundsIn(p.Quota, loc, at)
 		entries = append(entries, store.UsageEntry{
 			PeriodStart: start,
 			At:          at,

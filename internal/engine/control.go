@@ -913,6 +913,17 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	// separate transactions cost every other reader in this process.
 	pending := map[int][]usageSample{}
 	keys := map[int]string{}
+	// Whether the configuration holds each id, memoised for the batch. HasPath
+	// takes the state lock and PathByID has a value receiver, so every call
+	// copies the whole configuration to read one entry - and this test runs
+	// before the per-path maps below are seeded, deliberately, so it cannot ride
+	// on them. A thousand deltas across three paths was a thousand of both, on
+	// the read loop that cannot answer a ping while it works and against the
+	// lock the decision loop wants every 500ms. The configuration cannot change
+	// under this batch in a way that matters: Reconfigure would have to land
+	// mid-frame, and a path removed or added halfway through one is exactly as
+	// arbitrary either way.
+	known := map[int]bool{}
 	// First-seen order, so the ledger is written in the order the backend sent
 	// rather than in map order.
 	order := []int{}
@@ -957,7 +968,12 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 		// without an ack would leave the backend resending them forever and
 		// that path's ledger at zero, which is the silent under-billing this
 		// whole check exists to prevent, reintroduced from the other side.
-		if !s.eng.HasPath(d.PathID) && (d.PathID <= 0 || d.PathID >= maxDeltaPathID) {
+		has, memo := known[d.PathID]
+		if !memo {
+			has = s.eng.HasPath(d.PathID)
+			known[d.PathID] = has
+		}
+		if !has && (d.PathID <= 0 || d.PathID >= maxDeltaPathID) {
 			if n := s.badPath.take(); n > 0 {
 				s.log.Error("usage delta names a path id that is neither configured nor in range; dropping it",
 					"path_id", d.PathID, "seq", d.Sequence, "limit", maxDeltaPathID, "dropped", n)
