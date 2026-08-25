@@ -432,6 +432,112 @@ because a deadline belongs to the connection and not to the write. The three
 handshake frames still set their own - they are written from one goroutine,
 before any session exists.
 
+**A frame is bounded before it is read, and the bound is the frontend's, not
+bufio's.** Every read here was `bufio.Reader.ReadBytes('\n')`, and the 4096-byte
+reader in front of it was doing none of the work it looked like it was doing:
+`ReadBytes` accumulates a line of any length into a fresh allocation, so a peer
+that simply never sent a newline was handed as much of the frontend's memory as
+it cared to ask for. On the frontend the first read happens *before* the
+handshake, so no credential was needed at all, and the positions that can reach
+that listener are exactly the ones `proto.Session` exists to defend against: a
+linker's first hop is plaintext TCP on somebody's LAN. The cheaper attack was
+one step ahead of the defence. `proto.MaxFrameBytes` and `proto.ReadFrame` are
+the fix, shared by all three agents rather than copied into each, and
+`Session.ReadFrame` reads through the same helper - the limit has to sit ahead
+of the MAC check, because a limit applied after the frame is read is a limit on
+memory already committed. A megabyte is about twenty times the largest frame
+this protocol produces, which is a 500-delta usage batch, and
+`proto_test.go` pins that ratio so shrinking one or growing the other has to be
+a decision.
+
+**The sender refuses an oversized frame too, and that is not symmetry for its
+own sake.** The receiver drops one and closes, which from the sending side is
+an ordinary disconnect - so a frame that outgrew the bound would present as a
+reconnect loop with nothing anywhere naming the cause, and since the session
+counter does not advance on a refused write, the reconnect would build the same
+frame again. Nothing reaches it today; it is there for the change that raises
+the usage batch's 500.
+
+**And the sender's refusal has to be said out loud, or it moves the silence
+rather than ending it.** Every writer here treats a failed write as an ordinary
+disconnect and redials, which is right for a broken connection and wrong for
+this one: the frame will never be deliverable, and since the session counter
+does not advance over a refused write, the next connection builds the identical
+frame and refuses it again. `ControlServer.warnUnsendable` and
+`Agent.warnUnsendable` are the two ends of that, on the four writes that carry
+anything an operator can grow - the config push, the linker push, the usage
+batch and the link report - and they log at `Error`, because nothing here
+recovers on its own.
+
+**And a bound per frame is a bound on one multiplier.** `maxControlConns`
+bounds the other: every accept used to start a goroutine with a reader behind
+it and nothing said no. Refusing is a close rather than a queue, because a
+caller made to wait is holding one of this host's sockets either way and every
+honest peer redials. Sixty-four is far above one backend plus one connection
+per linker, including the moment a silently dead session is still parked on its
+read deadline while its replacement dials in.
+
+**A total with nothing reserved in it is a pool the honest peer can lose,
+which is why `maxPerSource` bounds one address to four of those sixty-four.**
+Every connection claims from the pool before it has proved anything, so sixty-
+four sockets from one machine - opened and left silent, or churned as their
+ten-second handshake deadlines expire - held all of it, and the backend's
+redial was closed on sight. The position that can do that is the one
+`proto.Session` exists for: a linker reaches this listener as an ordinary LAN
+neighbour routed through the backend, so the first hop is plaintext TCP on
+somebody's office network, and the backend forwards the overlay range in both
+directions. What it costs is not a portal that looks wrong - no usage delta
+reaches the ledger, so LTE billing under-counts during exactly the window
+quota enforcement exists for, and no configuration reaches the backend. The
+per-address share is claimed before the pool slot, so a flood is turned away
+without taking one even momentarily, and `releaseSource` deletes an empty
+entry rather than leaving it at zero, because the keys are chosen by whoever
+dials and a map that only grew would be a second unbounded resource behind the
+limit meant to bound the first. It bounds one address and not an attacker with
+a subnet to spend; the total is still what covers that.
+
+That cap bounds how many connections are open at once and says nothing about
+how fast they can be cycled, which is why the three reports a peer can drive
+the rate of - rejected before authentication, no slot in the pool, one address
+over its share - all go through `ControlServer`'s `throttle` at one report per
+thirty seconds. A peer that cannot authenticate is a peer that redials, so one
+`Warn` per attempt was unbounded journal output driven by a party that has
+proved nothing, and pushing real entries out of the journal is a cheap way to
+hide something. Thirty seconds still surfaces the case the log exists for,
+because a genuinely misconfigured backend redials on a backoff that tops out at
+exactly that.
+
+**A throttle needs a trailing edge, and the first two hand-rolled copies of
+this did not have one.** Each counted an event, reported when the window had
+passed *since the last report*, and reset the counter - so a burst that stopped
+inside the window was never reported at all. Five hundred failed
+authentications over five seconds produced one line saying "1", and the other
+four hundred and ninety-nine were counted into a window that never emitted,
+because the peer driving it had stopped. The journal then records a single
+rejected connection for a flood of five hundred, which is the opposite of what
+the log is for. `throttle.flush`, ticked by `listen` for as long as the
+listener lives, is what names them; it returns zero when nothing is owing, so a
+quiet server still logs nothing. They are fields on the server rather than
+locals in the accept loop because `listen` is re-entered after a failed bind,
+and counters that reset there would forget a burst in progress.
+
+The rejection log is also where `proto.ErrFrameTooLarge` is finally
+distinguished from an authentication failure: the first read in `serve` used to
+return in silence, so the one rejection that means "somebody sent something no
+honest agent sends" produced no output at all.
+
+`ControlServer.listen` fills that channel in when it finds it nil, as its first
+statement and before the bind, and both halves are correctness rather than
+tidiness. A nil channel does not weaken a select with a default arm, it inverts
+it: the send never proceeds, `default` wins every time, and the server refuses
+every connection it is ever offered, silently and for the life of the process.
+`NewControlServer` sets it, but three tests build the struct literally, which is
+exactly how a future caller arrives at a server that accepts nothing while
+reporting itself healthy. Doing it ahead of the bind leaves no state of this
+server in which the accept loop is reachable without a limit, and it is what
+lets the test assert this without a sleep: once `listen` has returned, that
+statement has run, whether the bind succeeded, failed, or was never attempted.
+
 **Everything this key authenticates carries a label, because two of them used
 to be the same function.** The probe MAC covers the first 50 bytes of the
 packet; the handshake MAC covered a nonce string the peer supplied. Same key,
@@ -1197,6 +1303,77 @@ Breaking any of these is a correctness bug even if the tests pass.
     replied down another, with no counter or log to show for it, until a
     later switch moved the number on. The guard is `>=`, matching
     `applyDecision`; a real straggler is always strictly lower.
+
+    **And it is bounded above, because everything downstream compares
+    sequences only against each other.** A number planted near the top of a
+    uint64 is not a wrong decision that a right one corrects: it is a ceiling
+    no honest decision can ever clear again, so the frontend routes down one
+    tunnel while replies leave by another, all three paths go on measuring
+    perfectly, and only restarting the backend clears it, because `lastSeq`
+    lives in memory. It takes a peer holding the shared secret to send one
+    deliberately; the cheaper reason to bound it is that no attacker is
+    required, because the seed is a clock reading and a frontend booting with a
+    wildly wrong clock plants the same ceiling by accident.
+
+    **The backend's wall clock may widen that ceiling and may never narrow it,
+    and getting the direction wrong is worse than the attack.** The first
+    version of `plausibleDecisionSeq` compared against `time.Now()`
+    on the backend and nothing else. A host whose clock is behind then computes a ceiling below
+    every real sequence and refuses the lot - and such a host never installs a
+    return path at all, because `active` is not persisted and
+    `reassertReturnPath` returns early on zero, so the first accepted decision
+    is what installs it. The route to a stale clock is the exact scenario this
+    system exists for: the house loses power, comes back with every link down,
+    so there is no route to NTP, so the clock stays stale, so the decision that
+    would recover the site is refused. A hardening step must never be able to
+    hold the recovery shut. `seqBase` is the frontend's own first sequence and
+    `seqBaseAt` is a monotonic reading, so the ceiling grows at the rate real
+    time passes whatever either host believes the date to be, and the anchor is
+    never moved - re-anchoring on each decision would let a sequence walk the
+    ceiling upward a step at a time. `decisionSeqHorizonMs` is the one bound that
+    applies with no anchor yet, and it is deliberately absurd (the year 2100),
+    because the unanchored case is the first decision a backend ever sees and
+    refusing that one is refusing the thing that installs the return path.
+
+    **The anchor alone cannot bound a frontend restart, and the second version
+    found that out the hard way.** A sequence is `frontendStart << 16` plus one
+    per switch, so it tracks when the frontend *started* rather than the
+    passage of time, and a frontend that restarts reseeds by however long the
+    previous process had been up. The anchor was stamped with that previous
+    process's seed and this host has no idea how old it already was. So a
+    backend restarting while the frontend had been running longer than
+    `decisionSeqSkew` - which is `Restart=always` after a crash, and the
+    documented "upgrade the backend first" order - anchored a fortnight behind,
+    and when the frontend then restarted it refused every decision the new
+    process ever sent. Permanently: the ceiling grows only at the rate real
+    time passes, so catching up takes exactly the fortnight it is behind, and
+    nothing re-anchors. `active` stays zero, the return path stays wherever
+    `applyPlumbing` seeded it, all three paths measure perfectly, and one
+    throttled log line every thirty seconds is the whole of the evidence -
+    which is the failure this check exists to prevent, arrived at from the
+    other side.
+
+    The fix is to take the ceiling as the **higher** of two references: the
+    anchor plus elapsed time, and the backend's own clock. A restarted frontend
+    seeded itself from a clock no later than this host's, so the second
+    reference covers it. Taking the maximum is what stops that reintroducing
+    the fault it replaced: a clock that is behind loses to the anchor and can
+    refuse nothing, and a clock that is ahead only widens, which at worst
+    degrades the check to the horizon. There is no reading of this host's clock
+    that makes the bound stricter, and that - rather than not reading it at all
+    - is the property to preserve.
+
+    That reference is bounded by the same horizon the sequences are, because
+    the shift into the sequence's units can overflow. Past about the year 10889
+    `ms << 16` no longer fits in a uint64, and taking the maximum does not make
+    that safe: a low wrap harmlessly loses the comparison, but a high one
+    widens the ceiling by an arbitrary amount, and a clock at the year 300000
+    wraps to 7.6e18 - a ceiling that admits the very pin this refuses. A
+    reading outside the horizon is not a reference at all.
+
+    The refusal log names that ceiling. It used to blame "this host's clock" and
+    send the operator to compare the two hosts, which cannot be the cause and
+    whose second branch sent whoever read it hunting a forged-probe attack.
 12. **Revert must also disarm.** The decision loop runs every 500ms. Removing
     the rules without dropping to observe means the very next tick sees no
     active path, picks one, and reinstalls the route - leaving the host half
@@ -1638,6 +1815,37 @@ timestamps (`base`, `feedAt`) rather than the wall clock. Keep doing that.
 | `users`, `sessions` | Portal auth. PBKDF2-SHA256, 600k iterations. |
 | `meta` | Small key/value, e.g. `usage_seq:<pathID>` for delta dedupe. |
 
+**The state directory is 0700, and the database is 0600 inside it.** Session
+tokens are stored in the clear beside the password hashes, so a world-readable
+database is a world-readable login to the thing that arms the data plane,
+serves the shared secret over `/api/psk` and reverts the system: the credential
+is not the database, it is every credential in the system. SQLite creates its
+files honouring the umask, which under systemd is 022, so they landed at 0644
+in a directory systemd had made 0755. The mode is set in three places and none of them
+is redundant, because each covers a moment the others miss:
+`install-frontend.sh` creates the directory 0700 and, because `install -d`
+applies a mode to a directory that already exists, corrects an install made
+before this was understood; `StateDirectoryMode=0700` covers a directory
+systemd creates itself; and a `chmod` in `cmd/failover-frontend` covers every
+start after that. Beside them `store.restrict` takes the bits off the database,
+its WAL pair and its rollback journal, which catches a `db_path` pointed
+outside the state directory - while the directory mode is what covers those
+files whenever SQLite recreates them after a checkpoint. What it could not do
+is reported rather than swallowed (`Store.PermissionWarnings`, logged by
+`cmd/failover-frontend`): this is a security property, not a tidy-up, and a
+`chmod` that silently did nothing - a filesystem that ignores it, an export
+where this process does not own the file - leaves live thirty-day session
+tokens world-readable while the journal says the frontend started normally. It
+is still not fatal, because a database that opened is one the frontend can run
+on and refusing to start over a mode bit trades the hardening step for the
+outage it exists to prevent. `perms_test.go` runs on tmpfs, where the failure
+cannot happen, which is exactly why the warning has to exist. The backend's and the
+linker's state directories stay 0755 deliberately: they hold no secret, and
+narrowing them would be a change to behaviour with nothing behind it. Nothing outside the process reads any of
+it: the portal serves embedded assets, `ruleset.nft` is a record for somebody
+who is already root, and the failoverctl socket has its own 0700 directory
+below this one.
+
 Also on disk: `ruleset.nft` (the generated DNAT ruleset, left in place as a
 readable record), `egress.nft` (the source NAT for backend-originated traffic,
 written only when `Frontend.BackendEgress` is on), `protect.nft` (the rate
@@ -1847,6 +2055,57 @@ where a subtle regression would be invisible in production until an outage:
   comments cannot match each other; the backend egress SNAT stays ahead of
   Docker's masquerade and never fires off the tunnels; no two fwmarks collide;
   return marking is limited to connections that originated from a tunnel.
+- `proto/proto_test.go` also holds the size bound: an oversized frame is
+  refused rather than buffered, on the handshake reader and on the
+  session's alike, and refused with a bounded amount consumed rather than
+  merely refused eventually; the reader in that test is deliberately finite,
+  so reverting the bound fails the test instead of hanging it. Beside them,
+  that a full 500-delta usage batch - the largest frame this protocol
+  produces - fits inside the bound with an order of magnitude to spare, and
+  that a frame just under it still reads, because the check runs per chunk
+  and an off-by-one there rejects frames that fit.
+- `proto/proto_test.go` also holds the write side: a frame past the bound is
+  refused by its sender, nothing partial reaches the buffer, and the session
+  counter does not advance over the refusal - which matters because the peer
+  checks that number exactly, so a gap there would be read as tampering.
+- `engine/control_limit_test.go` - the connection limit admits to its bound,
+  refuses past it, and gives a slot back when a connection finishes (a limit
+  that never released one would refuse everything after the first sixty-four
+  callers, which is a worse outage than the one it prevents). And that `listen`
+  fills in a limit it was not given, driven through the real accept loop on
+  loopback: nil there would have refused every connection rather than erroring,
+  so this is pinned rather than left to the constructor. And that
+  pre-authentication rejections are throttled, counted through a log handler
+  rather than by reading the code, with the throttle proved to reopen after its
+  interval so a standing misconfiguration is not reported once and never again.
+  And its trailing edge: a burst that stops inside the window is still named
+  rather than swallowed, a flush inside the window adds no line, and a flush
+  with nothing owing is silent. And the per-address share: one address is
+  admitted to `maxPerSource` and refused past it while a second address is
+  unaffected, a finished connection gives its share back, and the map is empty
+  again once they have - the keys are chosen by whoever dials.
+- `store/perms_test.go` - the database and its journal carry no group or world
+  bits. They hold live session tokens, so this is the file mode standing
+  between a local account and the portal.
+- `agent/decision_test.go` also holds the sequence bound: an implausible
+  sequence is refused *and does not become the ceiling*, which is the half
+  that matters, while a real one still lands; the ceiling grows with elapsed
+  time from the anchor, so a frontend restart and a clock corrected days
+  forward both pass while a month-sized jump in a minute does not; the very
+  first decision is bounded only by the horizon, because there is nothing to
+  measure from and refusing it would refuse the decision that installs the
+  return path; that a frontend restarting after a fortnight of uptime is not
+  refused as a pin, which the anchor alone could not do and which left a
+  restarted backend unable to route a reply for as long as it ran; that a clock
+  past the horizon is ignored rather than trusted, since the shift into the
+  sequence's units wraps there and a high wrap would widen the ceiling to
+  admit anything, while a clock inside it widens without lifting the horizon
+  with it; and a wildly wrong wall clock cannot refuse a real decision,
+  which is the property the first version of this check got backwards.
+- `web/validate_test.go` also holds the public address: the wrong family is
+  refused, an IPv4-mapped one is flattened rather than refused - matching
+  `sysx.AddressLiteral`, since To4 on a bare address yields a usable dotted
+  quad where a mapped *network* would not - and a valid one saves normalised.
 - `web/password_test.go` - a password can be changed, doing so logs out every
   other session while keeping the caller signed in, the current password is
   required, an unauthenticated request cannot change one, the local socket can

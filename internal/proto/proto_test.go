@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
+	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -390,5 +393,174 @@ func TestEachFrameGetsItsOwnWriteDeadline(t *testing.T) {
 	var plain bytes.Buffer
 	if err := client.WriteFrame(&plain, MsgPing, nil); err != nil {
 		t.Fatalf("a plain writer should still work: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Frame size bound
+// ---------------------------------------------------------------------------
+
+// countingReader reports how much of a stream a reader actually consumed,
+// which is the property under test: refusing an oversized frame is worth
+// nothing if the refusal happens after the bytes have been buffered.
+type countingReader struct {
+	served int
+}
+
+// Deliberately finite. An endless reader would make a reverted bound hang the
+// test rather than fail it, and a regression test that hangs is one somebody
+// kills rather than reads. Four times the bound is far past anything a correct
+// implementation touches, so reaching the end is itself the failure.
+func (c *countingReader) Read(p []byte) (int, error) {
+	if c.served >= 4*MaxFrameBytes {
+		return 0, io.EOF
+	}
+	for i := range p {
+		p[i] = 'A' // no newline: the frame never ends
+	}
+	c.served += len(p)
+	return len(p), nil
+}
+
+// A frame is bounded before it is parsed, and on the frontend before the peer
+// has authenticated at all.
+//
+// bufio.Reader's buffer is not the bound it looks like: ReadBytes accumulates
+// a line of any length into a fresh allocation, so a 4096-byte reader will
+// return a 256 MB "line" to a caller that believed it was reading a frame.
+// The frontend's first read happens before the handshake, so a peer that
+// simply never sends a newline needed no credential to spend the frontend's
+// memory - and the positions that can reach that listener are the ones
+// Session was written to defend against, which put the cheaper attack one step
+// ahead of the defence.
+func TestAnOversizedFrameIsRefusedRatherThanBuffered(t *testing.T) {
+	c := &countingReader{}
+	_, err := ReadFrame(bufio.NewReader(c))
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("err = %v, want ErrFrameTooLarge", err)
+	}
+	// Bounded, not merely eventually refused. One buffer of slack, because the
+	// check runs per chunk and the chunk that crosses the line is read whole.
+	if limit := MaxFrameBytes + 64<<10; c.served > limit {
+		t.Fatalf("consumed %d bytes before refusing, want no more than %d", c.served, limit)
+	}
+}
+
+// The bound has to sit above every frame this protocol actually produces, or
+// it is an outage rather than a limit. The largest by a wide margin is a usage
+// batch: the backend ships at most 500 buffered deltas at a time, which is the
+// one frame whose size is driven by how long the channel was down rather than
+// by how the system is configured.
+func TestTheLargestHonestFrameFitsWellInsideTheBound(t *testing.T) {
+	deltas := make([]UsageDelta, 500)
+	for i := range deltas {
+		deltas[i] = UsageDelta{
+			PathID:   3,
+			Bytes:    9_223_372_036_854_775_807,
+			Packets:  9_223_372_036_854_775_807,
+			AtUnix:   time.Now().Unix(),
+			Sequence: ^uint64(0),
+		}
+	}
+	var buf bytes.Buffer
+	sess, err := NewSession([]byte("k"), RandomNonce(), RandomNonce(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.WriteFrame(&buf, MsgUsage, Usage{Deltas: deltas}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() >= MaxFrameBytes {
+		t.Fatalf("a full usage batch is %d bytes, at or over the %d byte bound", buf.Len(), MaxFrameBytes)
+	}
+	// The comment on MaxFrameBytes claims roughly twenty times the largest
+	// frame. Pinned so that shrinking the bound, or growing the batch, has to
+	// be a decision rather than a surprise.
+	if ratio := MaxFrameBytes / buf.Len(); ratio < 10 {
+		t.Fatalf("only %dx headroom over a full usage batch of %d bytes", ratio, buf.Len())
+	}
+}
+
+// The authenticated read is bounded too, and bounded *before* it authenticates.
+// A limit applied after the frame has been read is a limit applied to memory
+// that is already committed, so holding the MAC check as the gate would have
+// left the whole attack in place for anything past the handshake.
+func TestSessionReadFrameIsBoundedBeforeItAuthenticates(t *testing.T) {
+	sess, err := NewSession([]byte("k"), RandomNonce(), RandomNonce(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &countingReader{}
+	_, err = sess.ReadFrame(bufio.NewReader(c))
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("err = %v, want ErrFrameTooLarge", err)
+	}
+	if limit := MaxFrameBytes + 64<<10; c.served > limit {
+		t.Fatalf("consumed %d bytes before refusing, want no more than %d", c.served, limit)
+	}
+}
+
+// A frame that ends normally still reads, at any size up to the bound. The
+// refusal above must not be reachable by an honest peer sending a long but
+// legitimate frame, and ReadSlice's chunking is exactly where that would go
+// wrong: the bound is checked per chunk, so an off-by-one there rejects
+// frames that fit.
+func TestAFrameJustUnderTheBoundStillReads(t *testing.T) {
+	payload := strings.Repeat("x", MaxFrameBytes-4096)
+	var buf bytes.Buffer
+	if err := WriteFrame(&buf, "test", map[string]string{"pad": payload}); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() > MaxFrameBytes {
+		t.Fatalf("test built a %d byte frame, over the bound; adjust the padding", buf.Len())
+	}
+	env, err := ReadFrame(bufio.NewReader(&buf))
+	if err != nil {
+		t.Fatalf("a frame of %d bytes was refused: %v", buf.Len(), err)
+	}
+	if env.Type != "test" {
+		t.Fatalf("type = %q, want \"test\"", env.Type)
+	}
+}
+
+// The sender refuses a frame past the bound rather than letting the receiver
+// discover it.
+//
+// The peer drops an oversized frame and closes the connection, which from the
+// sending side is an ordinary disconnect - so a frame that outgrew the bound
+// would present as a reconnect loop with nothing anywhere naming the cause,
+// and because the session counter does not advance on a refused write, the
+// reconnect would build the same frame again. The sender is the end that knows
+// what it built.
+func TestWritingAFramePastTheBoundIsRefusedBySender(t *testing.T) {
+	huge := map[string]string{"pad": strings.Repeat("x", MaxFrameBytes)}
+
+	if err := WriteFrame(&bytes.Buffer{}, "test", huge); !errors.Is(err, ErrFrameTooLarge) {
+		t.Errorf("WriteFrame err = %v, want ErrFrameTooLarge", err)
+	}
+
+	sess, err := NewSession([]byte("k"), RandomNonce(), RandomNonce(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := sess.WriteFrame(&buf, MsgUsage, huge); !errors.Is(err, ErrFrameTooLarge) {
+		t.Errorf("Session.WriteFrame err = %v, want ErrFrameTooLarge", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("wrote %d bytes of a refused frame; a partial frame desynchronises the stream", buf.Len())
+	}
+	// The counter must not advance on a refused write, or the next frame is
+	// numbered past what the peer expects and every later one is read as
+	// tampering.
+	if err := sess.WriteFrame(&buf, MsgPing, nil); err != nil {
+		t.Fatalf("a normal frame after a refused one failed: %v", err)
+	}
+	var env Envelope
+	if err := json.Unmarshal(buf.Bytes()[:buf.Len()-1], &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Seq != 0 {
+		t.Errorf("sequence advanced to %d over a refused write; the peer checks it exactly", env.Seq)
 	}
 }

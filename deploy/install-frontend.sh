@@ -369,7 +369,16 @@ fi
 # ---------------------------------------------------------------------------
 
 say "Installing binaries and unit"
-install -d -m 0755 "$CONF_DIR" "$STATE_DIR"
+install -d -m 0755 "$CONF_DIR"
+# The state directory is 0700, unlike the backend's and the linker's, because
+# of what is in this one: failover.db holds portal session tokens in the clear
+# beside the password hashes, so anything able to read it has a thirty-day
+# login to the portal - which serves the shared secret, arms the data plane and
+# reverts it. `install -d` applies the mode to a directory that already exists,
+# so this corrects an install made before that was understood. The agent sets
+# the same mode on every start and the unit asks systemd for it; all three are
+# here because they cover different moments.
+install -d -m 0700 "$STATE_DIR"
 
 # A running binary cannot be overwritten in place, hence the .new dance.
 for cmd in failover-frontend failoverctl; do

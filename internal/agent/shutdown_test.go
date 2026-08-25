@@ -35,7 +35,7 @@ func TestControlSessionReturnsPromptlyWhenCancelled(t *testing.T) {
 			return
 		}
 		r := bufio.NewReader(server)
-		env, err := readFrame(r)
+		env, err := proto.ReadFrame(r)
 		if err != nil {
 			return
 		}
@@ -52,7 +52,7 @@ func TestControlSessionReturnsPromptlyWhenCancelled(t *testing.T) {
 		if err := proto.WriteFrame(server, proto.MsgAuthAck, proto.AuthAck{MAC: ack}); err != nil {
 			return
 		}
-		_, _ = readFrame(r) // hello
+		_, _ = proto.ReadFrame(r) // hello
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -139,7 +139,7 @@ func TestSessionRefusesAFrontendThatCannotProveItself(t *testing.T) {
 					return
 				}
 				r := bufio.NewReader(server)
-				env, err := readFrame(r)
+				env, err := proto.ReadFrame(r)
 				if err != nil {
 					return
 				}
@@ -160,7 +160,7 @@ func TestSessionRefusesAFrontendThatCannotProveItself(t *testing.T) {
 				}
 				// Anything at all arriving here means this end was told
 				// something before it had proved itself.
-				if _, err := readFrame(r); err == nil {
+				if _, err := proto.ReadFrame(r); err == nil {
 					close(sawHello)
 				}
 			}()

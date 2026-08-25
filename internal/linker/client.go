@@ -3,7 +3,6 @@ package linker
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -75,7 +74,7 @@ func (l *Linker) session(ctx context.Context) error {
 	r := bufio.NewReader(conn)
 
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	env, err := readFrame(r)
+	env, err := proto.ReadFrame(r)
 	if err != nil {
 		return fmt.Errorf("read challenge: %w", err)
 	}
@@ -104,7 +103,7 @@ func (l *Linker) session(ctx context.Context) error {
 	// Checked before the hello goes out, so a peer that cannot prove itself is
 	// not even told which overlay address this host holds.
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-	env, err = readFrame(r)
+	env, err = proto.ReadFrame(r)
 	if err != nil {
 		return fmt.Errorf("read auth ack: %w", err)
 	}
@@ -161,16 +160,4 @@ func (l *Linker) session(ctx context.Context) error {
 		}
 		l.applyEgress(sessCtx, cfg.EgressCIDRs)
 	}
-}
-
-func readFrame(r *bufio.Reader) (proto.Envelope, error) {
-	line, err := r.ReadBytes('\n')
-	if err != nil {
-		return proto.Envelope{}, err
-	}
-	var env proto.Envelope
-	if err := json.Unmarshal(line, &env); err != nil {
-		return proto.Envelope{}, err
-	}
-	return env, nil
 }

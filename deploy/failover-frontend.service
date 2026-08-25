@@ -20,6 +20,12 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes
 
 StateDirectory=failover
+# 0700 rather than the 0755 default: the database under here holds portal
+# session tokens in the clear beside the password hashes, and anything able to
+# read one has a thirty-day login to the portal - which serves the shared
+# secret and arms the data plane. The agent sets the same mode itself on every
+# start, because this line only applies to a directory systemd creates.
+StateDirectoryMode=0700
 ConfigurationDirectory=failover
 ProtectSystem=strict
 ReadWritePaths=/var/lib/failover

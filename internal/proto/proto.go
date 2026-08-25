@@ -485,9 +485,87 @@ func WriteFrame(w io.Writer, typ string, payload any) error {
 	if err != nil {
 		return err
 	}
+	if len(line)+1 > MaxFrameBytes {
+		return fmt.Errorf("%w: %d bytes", ErrFrameTooLarge, len(line)+1)
+	}
 	line = append(line, '\n')
 	_, err = w.Write(line)
 	return err
+}
+
+// MaxFrameBytes bounds one control frame, and it is the only thing standing
+// between a peer and the frontend's memory.
+//
+// bufio.Reader's buffer is not that bound, which is the trap this replaces:
+// ReadBytes accumulates a line of any length into a fresh allocation, so a
+// 4096-byte reader will happily return a 256 MB "line" to a caller that
+// believed it was reading a frame. On the frontend the first read happens
+// *before* the handshake, so a peer that never sends a newline needs no
+// credential at all - and the positions that can reach that listener are
+// exactly the ones Session exists to defend against, which puts the cheaper
+// attack one step ahead of the defence.
+//
+// A megabyte is roughly twenty times the largest frame this protocol
+// produces. The biggest is a usage batch, capped at 500 deltas of about a
+// hundred bytes each, so around 50 KB; a config push is a few kilobytes.
+// Generous enough that no honest frame can approach it, small enough that a
+// peer holding a connection open costs a megabyte rather than a machine.
+const MaxFrameBytes = 1 << 20
+
+// ErrFrameTooLarge is kept apart from ErrBadFrame on purpose. The two send an
+// operator to look at different things: one is a peer that cannot authenticate,
+// the other is a peer sending something no honest agent sends.
+var ErrFrameTooLarge = errors.New("proto: control frame is over the size limit")
+
+// readLine reads one newline-delimited frame, refusing anything past
+// MaxFrameBytes rather than growing to meet it.
+//
+// ReadSlice rather than ReadBytes: it returns what is in the buffer and says
+// whether the delimiter was found, so the length can be checked as the frame
+// accumulates instead of after it has already been allocated. The slice it
+// returns points into the reader's own buffer and is invalidated by the next
+// read, so it is copied out.
+//
+// An over-long frame returns immediately without draining the rest. Every
+// caller drops the connection on any error here, which is the right answer:
+// there is no framing left to resynchronise to, and reading the remainder
+// would be doing the work the limit exists to refuse.
+func readLine(r *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(line)+len(chunk) > MaxFrameBytes {
+			return nil, ErrFrameTooLarge
+		}
+		line = append(line, chunk...)
+		if err == nil {
+			return line, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		// Anything else, io.EOF included, means the frame never finished.
+		// A partial frame is not a frame.
+		return nil, err
+	}
+}
+
+// ReadFrame reads one unauthenticated envelope, bounded by MaxFrameBytes.
+//
+// This is the handshake's reader, and only the handshake's: the challenge, the
+// auth and the ack carry their own proofs and there is no session key to check
+// them against yet. Every frame after that goes through Session.ReadFrame,
+// which reads the same way and then authenticates.
+func ReadFrame(r *bufio.Reader) (Envelope, error) {
+	line, err := readLine(r)
+	if err != nil {
+		return Envelope{}, err
+	}
+	var env Envelope
+	if err := json.Unmarshal(line, &env); err != nil {
+		return Envelope{}, fmt.Errorf("bad control frame: %w", err)
+	}
+	return env, nil
 }
 
 // DecodeInto unmarshals an envelope's payload.
@@ -599,6 +677,19 @@ func (s *Session) WriteFrame(w io.Writer, typ string, payload any) error {
 	if err != nil {
 		return err
 	}
+	// Refused here rather than discovered at the far end. The peer drops a
+	// frame past the limit and closes, which from this side is an ordinary
+	// disconnect - so a frame that outgrew the bound would show up as a
+	// reconnect loop with nothing anywhere naming the cause, and the sequence
+	// counter would not advance, so the reconnect would do it again. The
+	// sender is the end that knows what it built.
+	//
+	// Nothing reaches this today: the largest frame is a usage batch, bounded
+	// at 500 deltas, and proto_test.go pins the headroom. It is here for the
+	// change that raises that number.
+	if len(line)+1 > MaxFrameBytes {
+		return fmt.Errorf("%w: %s frame of %d bytes", ErrFrameTooLarge, typ, len(line)+1)
+	}
 	if c, ok := w.(deadlineWriter); ok {
 		_ = c.SetWriteDeadline(time.Now().Add(WriteDeadline))
 	}
@@ -615,8 +706,12 @@ func (s *Session) WriteFrame(w io.Writer, typ string, payload any) error {
 var ErrBadFrame = errors.New("proto: unauthenticated control frame")
 
 // ReadFrame reads one envelope and authenticates it against this session.
+//
+// Bounded by MaxFrameBytes before a byte of it is parsed, and that ordering is
+// the point: authentication happens after the frame has been read, so a limit
+// applied any later is a limit applied to memory that is already committed.
 func (s *Session) ReadFrame(r *bufio.Reader) (Envelope, error) {
-	line, err := r.ReadBytes('\n')
+	line, err := readLine(r)
 	if err != nil {
 		return Envelope{}, err
 	}

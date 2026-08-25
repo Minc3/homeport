@@ -3,7 +3,7 @@ package agent
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -102,11 +102,29 @@ func (a *Agent) controlSession(ctx context.Context) error {
 
 // runSession is the session on an established connection, split out from the
 // dial so that its shutdown behaviour can be tested over a pipe.
+// warnUnsendable reports a frame this end refused to send. The reporting loop
+// treats every write error as an ordinary disconnect and redials, which is
+// right for a broken connection and silent in the one case that is not one:
+// proto.ErrFrameTooLarge means this host built a frame past the wire limit, and
+// since the session counter does not advance over a refused write, the next
+// connection builds the identical frame and refuses it again. The usage batch
+// is capped at 500 deltas so nothing reaches it today; it is here for the
+// change that raises that number, which is precisely the change that would
+// otherwise present as a reconnect loop with no cause anywhere in the journal.
+func (a *Agent) warnUnsendable(typ string, err error) {
+	if !errors.Is(err, proto.ErrFrameTooLarge) {
+		return // an ordinary disconnect; the redial is the whole story
+	}
+	a.log.Error("cannot send a control frame: it is past the wire size limit",
+		"type", typ, "limit", proto.MaxFrameBytes, "err", err,
+		"hint", "this agent reconnects and fails the same way until whatever grew the frame is reduced")
+}
+
 func (a *Agent) runSession(ctx context.Context, conn net.Conn, addr string) error {
 	// Closing the connection is the only thing that unblocks a read, and that
 	// has to be true from the first one, not from the end of the handshake.
 	//
-	// readFrame sits on the socket with nothing but a deadline behind it, and a
+	// proto.ReadFrame sits on the socket with nothing but a deadline behind it, and a
 	// silent-but-healthy channel is normal - the frontend only speaks when it
 	// has something to say. So a SIGTERM arriving mid-session left this
 	// goroutine parked for up to 45 seconds while systemd's TimeoutStopSec of
@@ -125,7 +143,7 @@ func (a *Agent) runSession(ctx context.Context, conn net.Conn, addr string) erro
 
 	r := bufio.NewReader(conn)
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-	env, err := readFrame(r)
+	env, err := proto.ReadFrame(r)
 	if err != nil {
 		return err
 	}
@@ -146,7 +164,7 @@ func (a *Agent) runSession(ctx context.Context, conn net.Conn, addr string) erro
 		return err
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-	env, err = readFrame(r)
+	env, err = proto.ReadFrame(r)
 	if err != nil {
 		return err
 	}
@@ -225,6 +243,7 @@ func (a *Agent) reportLoop(ctx context.Context, conn net.Conn, sess *proto.Sessi
 				continue
 			}
 			if err := sess.WriteFrame(conn, proto.MsgUsage, proto.Usage{Deltas: batch}); err != nil {
+				a.warnUnsendable(proto.MsgUsage, err)
 				return
 			}
 			// Deliberately not dropped here. A successful write is not delivery
@@ -255,20 +274,9 @@ func (a *Agent) reportLoop(ctx context.Context, conn net.Conn, sess *proto.Sessi
 				})
 			}
 			if err := sess.WriteFrame(conn, proto.MsgLink, report); err != nil {
+				a.warnUnsendable(proto.MsgLink, err)
 				return
 			}
 		}
 	}
-}
-
-func readFrame(r *bufio.Reader) (proto.Envelope, error) {
-	line, err := r.ReadBytes('\n')
-	if err != nil {
-		return proto.Envelope{}, err
-	}
-	var env proto.Envelope
-	if err := json.Unmarshal(line, &env); err != nil {
-		return proto.Envelope{}, fmt.Errorf("bad control frame: %w", err)
-	}
-	return env, nil
 }

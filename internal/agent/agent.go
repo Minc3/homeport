@@ -51,6 +51,23 @@ type Agent struct {
 	pending   pathDecision
 	wake      chan struct{}
 
+	// Sequence plausibility: the anchor the ceiling is measured from, and the
+	// throttle for reporting a refusal. See plausibleDecisionSeq.
+	//
+	// seqBaseAt is a monotonic reading deliberately, and seqBase is the
+	// frontend's own number rather than anything this host believes about the
+	// time. Neither is ever re-anchored: the ceiling grows with elapsed time
+	// on its own.
+	//
+	// The warning is throttled because it is reached from the probe read loop,
+	// which runs at the active cadence: unthrottled it would be the flood
+	// rather than a report of one.
+	seqMu           sync.Mutex
+	seqBase         uint64
+	seqBaseAt       time.Time
+	implausibleAt   time.Time
+	implausibleSeen int
+
 	// applyMu serialises the shell-outs that write routes, so only one
 	// goroutine is running `ip` at a time.
 	//
@@ -489,6 +506,26 @@ func (a *Agent) SetActivePath(ctx context.Context, pathID int, decisionSeq uint6
 	if pathID == 0 {
 		return // the frontend has not chosen anything yet
 	}
+	// Refused before it can become the high-water mark. Everything below only
+	// ever compares sequences against each other, so a single implausible one
+	// is not a bad decision that a good one corrects - it is a ceiling nothing
+	// legitimate can reach again, and the frontend then routes down one tunnel
+	// while replies leave by another with no counter or log to show for it,
+	// until this process restarts. See plausibleDecisionSeq.
+	now := time.Now()
+	base, baseAt := a.decisionSeqAnchor()
+	if !plausibleDecisionSeq(decisionSeq, base, baseAt, now) {
+		a.warnImplausibleSeq(pathID, decisionSeq)
+		return
+	}
+	if base == 0 {
+		// Only ever true once. anchorDecisionSeq re-checks under the lock, so
+		// skipping the call when an anchor is already recorded loses nothing
+		// and keeps the second lock off a path invariant 16 asks to stay free
+		// of avoidable work: this runs from the probe read loop, for all three
+		// paths, four times a second on the active one.
+		a.anchorDecisionSeq(decisionSeq, now)
+	}
 	a.mu.RLock()
 	active, lastSeq := a.active, a.lastSeq
 	a.mu.RUnlock()
@@ -522,6 +559,182 @@ func (a *Agent) SetActivePath(ctx context.Context, pathID int, decisionSeq uint6
 	case a.wake <- struct{}{}:
 	default: // a decision is already queued; the worker will read the newest
 	}
+}
+
+// The bound on a decision sequence.
+//
+// The frontend seeds decisionSeq from `UnixMilli() << 16` and increments it by
+// one per switch, so a legitimate sequence tracks real time in those units.
+// Everything downstream compares sequences only against each other, so a
+// number planted near the top of a uint64 is not a wrong decision that a right
+// one corrects: it is a ceiling no honest decision can ever clear again.
+// Replies keep leaving by the pinned tunnel while the frontend routes down
+// whichever one it chose, all three paths go on measuring perfectly, and only
+// restarting this process clears it, because lastSeq lives in memory.
+//
+// It takes a peer holding the shared secret to send one deliberately. The
+// cheaper reason to bound it is that no attacker is required: the seed is a
+// clock reading, so a frontend booting with a wildly wrong clock plants the
+// same ceiling by accident.
+//
+// **This host's wall clock may widen the ceiling and may never narrow it, and
+// that is the whole design rather than a detail.** The first version of this
+// check compared against `time.Now()` alone, and it was wrong in a way that
+// mattered far more than the attack: a backend whose clock
+// is behind computes a ceiling below every real sequence and refuses the lot.
+// That host then never installs a return path at all, because `active` is not
+// persisted and `reassertReturnPath` returns early on zero - the first accepted
+// decision is what installs it. And the way to arrive at a stale clock is the
+// exact scenario this system exists for: the house loses power, comes back with
+// every link down, so there is no route to NTP, so the clock stays stale, so the
+// decision that would recover the site is refused. A hardening step must not be
+// able to hold the recovery shut.
+//
+// Anchoring on elapsed time takes the wall clock out of that direction
+// entirely. seqBase is the frontend's own first sequence, seqBaseAt is a
+// monotonic reading, and the ceiling grows from there at the rate real time
+// passes. The clock is then admitted back on one side only, as a floor under
+// that ceiling, because the anchor alone cannot cover a frontend restart -
+// see plausibleDecisionSeq, which is where both halves are argued.
+const (
+	// decisionSeqSkew is how far past the elapsed-time ceiling a sequence may
+	// sit. Generous on purpose: a frontend whose own clock is corrected
+	// forward reseeds by the size of the correction, and that is a legitimate
+	// jump this must not refuse. A week bounds a pin to a week, which is the
+	// difference between an outage that ends and one that does not.
+	decisionSeqSkew = 7 * 24 * time.Hour
+
+	// decisionSeqHorizonMs is the absolute backstop, in the millisecond units
+	// the sequence carries: the year 2100. It is the only bound that applies
+	// to the very first decision, when there is no anchor yet, and it depends
+	// on nothing at all - so it can refuse 2^64-1 without any risk of refusing
+	// something real.
+	decisionSeqHorizonMs = 4102444800000 // 2100-01-01T00:00:00Z
+)
+
+// plausibleDecisionSeq reports whether a sequence could have come from the
+// frontend, given the anchor this host has established. See the constants
+// above; base of zero means no anchor yet.
+//
+// The ceiling is the higher of two references, and it is a maximum rather than
+// a choice between them because each covers the case the other gets wrong.
+//
+// The anchor reference - the first sequence this host accepted, plus the time
+// that has actually elapsed since - is what makes a stale wall clock harmless,
+// which is the property the whole check is built around: see the constants.
+//
+// The wall reference is what a legitimate frontend restart needs, and leaving
+// it out was a hole rather than a simplification. A sequence is
+// `frontendStart << 16` plus one per switch, so it tracks the frontend's *start*
+// and not the passage of time: a frontend that restarts reseeds by however long
+// the previous process had been running. The anchor cannot bound that, because
+// the anchor was stamped with the *previous* frontend's seed and this host has
+// no idea how old that process already was. So a backend restarting while the
+// frontend had been up longer than decisionSeqSkew, followed by the frontend
+// restarting - the documented upgrade order, and a crash under Restart=always -
+// anchored on a seed a fortnight behind and then refused every real decision
+// from the new process, permanently: the ceiling only grows at the rate real
+// time passes, so it would take that same fortnight to catch up. Nothing
+// corrects it, because the anchor is never re-established, and the symptom is
+// the one this check exists to prevent, reached from the other side. The
+// backend never queues a decision, `active` stays zero, the return path stays
+// where applyPlumbing seeded it, and all three paths measure perfectly while
+// replies leave by a tunnel the frontend abandoned.
+//
+// Taking the maximum is what keeps that fix from reintroducing the fault it
+// replaced. A wall clock that is behind loses to the anchor and can refuse
+// nothing; a wall clock that is ahead only ever widens the ceiling, which at
+// worst degrades this check to the horizon. There is no reading of this host's
+// clock that makes it stricter, which is the only property the clock was ever
+// dangerous for.
+func plausibleDecisionSeq(seq, base uint64, baseAt, now time.Time) bool {
+	// Applies always, anchor or not. No legitimate sequence reaches it this
+	// century, and it is what keeps the unanchored first decision from being
+	// a free pin.
+	if seq>>16 > decisionSeqHorizonMs {
+		return false
+	}
+	if base == 0 {
+		return true // nothing to measure from; the horizon is the only bound
+	}
+	elapsed := now.Sub(baseAt)
+	if elapsed < 0 {
+		// Reachable without a wrong clock, which is why it is a clamp rather
+		// than an assertion: the caller reads the time before it reads the
+		// anchor, so a caller preempted between the two can find an anchor
+		// stamped after its own `now`. Clamping costs at most the scheduling
+		// delay off a ceiling with seven days of slack in it.
+		elapsed = 0
+	}
+	ceiling := base + (uint64(elapsed.Milliseconds()) << 16)
+	// A frontend that restarted seeded itself from a clock no later than this
+	// host's own, whatever the two disagree about.
+	//
+	// Bounded by the same horizon the sequences are, because the shift can
+	// overflow. Past about the year 10889 `ms << 16` no longer fits in a
+	// uint64 and wraps to an unrelated number, which taking the maximum cannot
+	// make safe: it cannot narrow the ceiling, since a low wrap simply loses
+	// the comparison, but a high one widens it by an arbitrary amount. A clock
+	// at the year 300000 wraps to 7.6e18 and admits a sequence two months past
+	// the anchor, which is the pin this whole check exists to refuse, handed
+	// over by a number that means nothing. A reading outside the horizon is not
+	// a reference at all, and the anchor is still there to carry the decision.
+	// Below zero is a clock set before 1970, ignored for the same reason.
+	if ms := now.UnixMilli(); ms > 0 && ms <= decisionSeqHorizonMs && uint64(ms)<<16 > ceiling {
+		ceiling = uint64(ms) << 16
+	}
+	return seq <= ceiling+(uint64(decisionSeqSkew.Milliseconds())<<16)
+}
+
+// anchorDecisionSeq records the first sequence this host accepted, which every
+// later ceiling is measured from. Never re-anchored: the ceiling grows with
+// elapsed time on its own, and moving the anchor to each new decision would
+// let a sequence walk the ceiling upward a step at a time.
+func (a *Agent) anchorDecisionSeq(seq uint64, now time.Time) {
+	a.seqMu.Lock()
+	defer a.seqMu.Unlock()
+	if a.seqBase == 0 {
+		a.seqBase, a.seqBaseAt = seq, now
+	}
+}
+
+// decisionSeqAnchor reads the anchor for the check.
+func (a *Agent) decisionSeqAnchor() (uint64, time.Time) {
+	a.seqMu.Lock()
+	defer a.seqMu.Unlock()
+	return a.seqBase, a.seqBaseAt
+}
+
+// warnImplausibleSeq reports a refused sequence at a rate that cannot flood
+// the journal. Called from the probe read loop, so it does no work beyond a
+// mutex and a comparison in the common case.
+// The lock covers the counter and nothing else. Logging inside it would put a
+// write to the journal on the probe read loop's path, which is the one thing
+// invariant 16 asks this loop never to do: a slow or full journal would stall
+// replies on every path at once, and three tunnels going quiet together is
+// indistinguishable from three tunnels dying.
+func (a *Agent) warnImplausibleSeq(pathID int, seq uint64) {
+	a.seqMu.Lock()
+	a.implausibleSeen++
+	if time.Since(a.implausibleAt) < 30*time.Second {
+		a.seqMu.Unlock()
+		return
+	}
+	seen := a.implausibleSeen
+	base, baseAt := a.seqBase, a.seqBaseAt
+	a.implausibleAt = time.Now()
+	a.implausibleSeen = 0
+	a.seqMu.Unlock()
+
+	// Named for what the check actually measures. The first version of this
+	// message blamed "this host's clock" and sent the operator to compare the
+	// two hosts, which is the one thing plausibleDecisionSeq deliberately does
+	// not decide on: a stale clock here can only widen the ceiling. So the
+	// hint was pointing at something that could never be the cause, and its
+	// second branch sent whoever read it hunting an attack instead.
+	a.log.Warn("refusing a routing decision whose sequence is beyond the plausible ceiling",
+		"probes", seen, "path_id", pathID, "seq", seq, "anchor", base, "ceiling_from", baseAt,
+		"hint", "the ceiling is the frontend's first sequence this agent saw plus elapsed time, or this host's clock, whichever is higher, plus a week; if the frontend is healthy, restarting failover-backend re-anchors it, and if it recurs something holding the shared secret is forging probes")
 }
 
 // pathDecision is the frontend's choice, waiting to be applied.

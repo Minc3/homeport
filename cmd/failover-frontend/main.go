@@ -52,8 +52,24 @@ func run(log *slog.Logger, cfgPath, adminUser string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(boot.StateDir, 0o755); err != nil {
+	// 0700, because of what ends up in here rather than because of tidiness.
+	// The database holds portal session tokens in the clear beside the password
+	// hashes, so a world-readable state directory is a world-readable login to
+	// the thing that arms the data plane and serves the shared secret. Nothing
+	// outside this process reads any of it: the portal serves embedded assets,
+	// ruleset.nft is a record for whoever is already root, and the failoverctl
+	// socket has its own 0700 directory below this one.
+	//
+	// Chmod as well as MkdirAll, because MkdirAll does nothing to a directory
+	// that already exists and every deployment predating this has one at 0755.
+	// The unit file asks systemd for the same mode, which covers a first start;
+	// this covers every upgrade.
+	if err := os.MkdirAll(boot.StateDir, 0o700); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
+	}
+	if err := os.Chmod(boot.StateDir, 0o700); err != nil {
+		log.Warn("cannot restrict the state directory; it holds portal session tokens",
+			"dir", boot.StateDir, "err", err)
 	}
 
 	st, err := store.Open(boot.DBPath)
@@ -61,6 +77,16 @@ func run(log *slog.Logger, cfgPath, adminUser string) error {
 		return err
 	}
 	defer st.Close()
+	// Said out loud rather than swallowed. The database holds live session
+	// tokens beside the password hashes, so a chmod that quietly did nothing -
+	// a filesystem that ignores it, an export where this process does not own
+	// the file - leaves a world-readable login to the thing that arms the data
+	// plane, with nothing anywhere reporting it. Not fatal: a database that
+	// opened is one the frontend can run on, and refusing to start over a mode
+	// bit trades a hardening step for the outage it exists to prevent.
+	for _, w := range st.PermissionWarnings() {
+		log.Warn("cannot restrict a database file; it holds portal session tokens", "err", w)
+	}
 
 	// Asked before LoadConfig, which seeds the defaults and would make every
 	// start look like the first one.

@@ -113,8 +113,46 @@ func validate(cfg *model.Config) error {
 	if cfg.Frontend.BackendEgress && trimmed(cfg.Frontend.PublicIface) == "" {
 		return errors.New("backend egress needs the frontend's public interface set")
 	}
-	if cfg.Frontend.PublicIP != "" && net.ParseIP(cfg.Frontend.PublicIP) == nil {
-		return errors.New("frontend public IP is not a valid address")
+	// IPv4 specifically, for the reason parseIPv4Network exists a few hundred
+	// lines down: this value is rendered into `table ip failover` as `ip daddr`
+	// and into `table ip failover_egress` as `snat to`, and nft rejects a whole
+	// table over one address of the wrong family. A bare ParseIP accepted
+	// "2001:db8::1" and an IPv4-mapped "::ffff:203.0.113.7" alike, and stored
+	// each unchanged, so the first save carrying either took every published
+	// service off the air - the DNAT ruleset does not load at all, so it is not
+	// one broken rule, it is all of them. The lesson was learned twice already,
+	// for the region lists and for the egress sources; this field was simply
+	// not on either list.
+	//
+	// The two are answered differently, matching sysx.AddressLiteral rather
+	// than inventing a rule here: the wrong family is refused, while a mapped
+	// address is flattened to the dotted quad it denotes. Unlike a mapped
+	// *network*, whose mask stays 128 wide and renders a form nft refuses, To4
+	// on a bare address yields something the ruleset can carry.
+	//
+	// The gate is here rather than in the generator on purpose. A generator
+	// that dropped an address it could not use would drop the `ip daddr` match
+	// with it, publishing every service on every address this host holds -
+	// failing open in the one direction that must never happen. So the value is
+	// normalised at the boundary and the generator is not asked to second-guess
+	// it.
+	//
+	// What that leaves is a value an older build stored before this gate
+	// existed, which no save has ever been through. It is not silently carried:
+	// `nft -f` is atomic, so the table it renders is rejected whole and the
+	// working ruleset already loaded stays up with a loud error beside it,
+	// while this check refuses every save naming the field until the form is
+	// corrected. Loud in two places and open in neither is the right answer for
+	// a value only an operator can have typed - which is why there is no
+	// re-parse in the generator to match the ones on the pushed egress
+	// networks and overlay address. Those arrive from a socket; this one does
+	// not.
+	if cfg.Frontend.PublicIP != "" {
+		v, err := parseIPv4Address(cfg.Frontend.PublicIP)
+		if err != nil {
+			return fmt.Errorf("frontend public IP: %w", err)
+		}
+		cfg.Frontend.PublicIP = v
 	}
 	// An older portal, or a hand-written PUT, sends nothing for fields it does
 	// not know about. Treated the same as an older stored config.
@@ -652,6 +690,33 @@ func parseIPv4Network(c string) (string, error) {
 		return "", fmt.Errorf("%q is not IPv4; the ruleset is an ip table", c)
 	}
 	return netw.String(), nil
+}
+
+// parseIPv4Address is the single-address companion to parseIPv4Network, and it
+// exists for exactly the same reason: every address the portal accepts into an
+// ip-family table goes through here, so validation and generation cannot
+// disagree about what IPv4 means. To4 alone also admits an IPv4-mapped IPv6
+// address, which renders into the ruleset in its mapped form and takes the
+// whole table down with it.
+//
+// It calls sysx.AddressLiteral rather than restating it, which is what keeps
+// that from being a promise. The generator applies exactly this check to
+// whatever reaches it, and two hand-kept copies of the same rule drift in a way
+// that shows up as an agent reporting its rules installed and having none -
+// the empty file nft loads without complaint. model.ipv4Literal is a third copy
+// and has to be, because sysx imports model and the dependency cannot run the
+// other way; this one is on the same host as the generator and does not.
+//
+// The cost is one message where there were two. AddressLiteral answers with an
+// empty string whether the value is not an address at all or is an address of
+// the wrong family, and a portal message naming both is worth more than a
+// second definition of what IPv4 means on this host.
+func parseIPv4Address(a string) (string, error) {
+	v := sysx.AddressLiteral(a)
+	if v == "" {
+		return "", fmt.Errorf("%q is not an IPv4 address; the ruleset is an ip table", a)
+	}
+	return v, nil
 }
 
 // maxRegionName bounds a protection region's name. It becomes an nftables set

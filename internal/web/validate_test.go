@@ -389,3 +389,61 @@ func TestValidateBoundsPathIDs(t *testing.T) {
 		t.Fatalf("path id %d is inside the band and must be accepted: %v", sysx.ProbeDenyBandSize-1, err)
 	}
 }
+
+// The frontend's public address is held to IPv4, and normalised the way the
+// generator will see it.
+//
+// It is rendered into `table ip failover` as `ip daddr` and into
+// `table ip failover_egress` as `snat to`, and nft rejects a whole table over
+// one address of the wrong family. So this is not one broken rule: the DNAT
+// ruleset does not load at all, and every published service goes off the air
+// on the save. A bare net.ParseIP accepted both an IPv6 address and an
+// IPv4-mapped one - the same gap parseIPv4Network was written to close for the
+// region lists and the egress sources, on a field that was on neither list.
+func TestAPublicIPTheRulesetCannotCarryIsRefused(t *testing.T) {
+	for _, bad := range []string{
+		"2001:db8::1",    // plainly the wrong family
+		"203.0.113.0/24", // a network where an address belongs
+		"not-an-address",
+	} {
+		cfg := model.Defaults()
+		cfg.Frontend.PublicIP = bad
+		if err := validate(&cfg); err == nil {
+			t.Errorf("public IP %q was accepted; nft rejects the whole table over it", bad)
+		}
+	}
+}
+
+// And the ordinary value still saves, stored in the form the generator emits.
+// A check that refused a working address would be the same outage arrived at
+// from the other direction.
+func TestAValidPublicIPSavesNormalised(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"203.0.113.7", "203.0.113.7"},
+		{"  203.0.113.7  ", "203.0.113.7"}, // a pasted value carrying whitespace
+		// An IPv4-mapped address is accepted and flattened rather than
+		// refused, because that is what sysx.AddressLiteral does with it and
+		// the two must not disagree. Unlike the network case, where the mask
+		// stays 128 wide and renders a form nft rejects, To4 on a bare address
+		// yields an ordinary dotted quad, so the mapped form never reaches the
+		// ruleset.
+		{"::ffff:203.0.113.7", "203.0.113.7"},
+	} {
+		cfg := model.Defaults()
+		cfg.Frontend.PublicIP = c.in
+		if err := validate(&cfg); err != nil {
+			t.Errorf("public IP %q was refused: %v", c.in, err)
+			continue
+		}
+		if cfg.Frontend.PublicIP != c.want {
+			t.Errorf("public IP %q stored as %q, want %q", c.in, cfg.Frontend.PublicIP, c.want)
+		}
+	}
+	// Empty stays empty: the field is optional, and the egress rule falls back
+	// to a masquerade without it.
+	cfg := model.Defaults()
+	cfg.Frontend.PublicIP = ""
+	if err := validate(&cfg); err != nil {
+		t.Fatalf("an empty public IP was refused: %v", err)
+	}
+}

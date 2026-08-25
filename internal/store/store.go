@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -28,6 +30,10 @@ var ErrNotFound = errors.New("store: not found")
 // Store wraps the SQLite database.
 type Store struct {
 	db *sql.DB
+
+	// permIssues records what restrict could not do at open, for the caller to
+	// report. See PermissionWarnings.
+	permIssues []error
 }
 
 const schema = `
@@ -118,7 +124,66 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, permIssues: restrict(path)}, nil
+}
+
+// PermissionWarnings reports files whose mode could not be tightened, so the
+// caller can say so.
+//
+// Returning them rather than swallowing them is the point. restrict is a
+// security property, not a tidy-up: a chmod that silently did nothing leaves
+// live thirty-day session tokens world-readable beside the password hashes,
+// and the journal says the frontend started normally. That is reachable
+// without anything exotic - a filesystem that ignores chmod, or an export
+// where this process is not the file's owner - and the test beside this runs
+// on tmpfs, where it can never happen. A hardening step that can fail in
+// silence is a hardening step nobody knows they have lost.
+func (s *Store) PermissionWarnings() []error { return s.permIssues }
+
+// restrict takes the group and world bits off the database and its journal.
+//
+// SQLite creates these honouring the umask, which under systemd is 022 - so
+// they land at 0644 in a state directory that is itself 0755, and this file
+// holds portal session tokens in the clear alongside the password hashes.
+// Anything able to read it can lift a live thirty-day cookie, and the portal
+// behind that cookie will hand over the shared secret, arm the data plane or
+// revert it. The credential is not the database, it is every credential in the
+// system.
+//
+// Belt and braces with the state directory's own mode, which is set in three
+// places because each covers a moment the others miss: install-frontend.sh
+// creates it 0700 and corrects an existing one, StateDirectoryMode covers a
+// directory systemd creates itself, and the agent chmods it on every start for
+// the deployments that predate both. The directory is what covers the -wal and
+// -shm files whenever SQLite recreates them after a checkpoint; this covers a
+// db_path pointed somewhere else entirely.
+//
+// Failures are returned for the caller to report rather than being fatal. A
+// database that opened is a database the frontend can run on, and refusing to
+// start over a mode bit would trade a hardening step for the outage it exists
+// to prevent - but they are returned rather than dropped, because a mode this
+// file's contents depend on must not be able to fail without saying so. See
+// Store.PermissionWarnings.
+func restrict(path string) []error {
+	var issues []error
+	// The rollback journal is on the list beside the WAL pair because WAL is
+	// requested rather than guaranteed: a filesystem that cannot support it
+	// leaves SQLite in journal mode, and that file holds the same pages.
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+		if _, err := os.Stat(p); err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				// Not created yet is the ordinary case and says nothing; being
+				// unable to tell is not the same answer and must not read as
+				// one, because the file may well be there at 0644.
+				issues = append(issues, fmt.Errorf("cannot inspect %s: %w", p, err))
+			}
+			continue
+		}
+		if err := os.Chmod(p, 0o600); err != nil {
+			issues = append(issues, fmt.Errorf("cannot restrict %s to 0600: %w", p, err))
+		}
+	}
+	return issues
 }
 
 // Close closes the database.

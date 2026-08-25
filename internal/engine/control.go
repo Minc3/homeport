@@ -3,11 +3,12 @@ package engine
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
@@ -29,16 +30,228 @@ type ControlServer struct {
 	log  *slog.Logger
 	psk  []byte
 	addr string
+
+	// slots bounds how many connections are being served at once. See
+	// maxControlConns.
+	slots chan struct{}
+
+	// perSource bounds how many of those one address may hold. See
+	// maxPerSource; empty entries are deleted so a churn of addresses cannot
+	// grow this map.
+	srcMu     sync.Mutex
+	perSource map[string]int
+
+	// The throttles for the three reports a peer can drive the rate of. They
+	// are fields rather than locals because listen is re-entered after a failed
+	// bind, and counters that reset there would forget a burst in progress.
+	rejected   throttle // dropped before authentication
+	refused    throttle // no slot in the pool
+	oversubbed throttle // one address holding its share
+}
+
+// throttleWindow is how often any one of those reports may reach the journal.
+//
+// Thirty seconds still surfaces the case they exist for: a genuinely
+// misconfigured backend redials on a backoff that tops out at exactly that, so
+// an operator with a mismatched secret sees it about as often as it happens.
+const throttleWindow = 30 * time.Second
+
+// throttle collapses a burst of one kind of report into a bounded number of
+// journal entries. The first event is reported at once and everything counted
+// behind it is reported when the window closes.
+//
+// That second half is what both hand-rolled copies of this got wrong. Each
+// counted an event, reported when the window had passed *since the last
+// report*, and reset the counter - so a burst that stopped inside the window
+// was never reported at all. Five hundred failed authentications over five
+// seconds produced one line saying "1", and the other four hundred and
+// ninety-nine were counted into a window that never emitted, because the peer
+// driving it had stopped. A throttle on this log exists to bound how loud a
+// flood can be, not to hide that one happened.
+type throttle struct {
+	mu   sync.Mutex
+	at   time.Time
+	seen int
+}
+
+// take counts one event and reports how many this report should name, or zero
+// when the window is still open and this one is only counted.
+func (t *throttle) take() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.seen++
+	if time.Since(t.at) < throttleWindow {
+		return 0
+	}
+	n := t.seen
+	t.at, t.seen = time.Now(), 0
+	return n
+}
+
+// flush reports what has been counted since the last report, once the window
+// has closed. This is the trailing edge: it is what makes a burst that stops
+// get reported rather than swallowed, and it returns zero when there is
+// nothing owing, so a quiet server logs nothing at all.
+func (t *throttle) flush() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.seen == 0 || time.Since(t.at) < throttleWindow {
+		return 0
+	}
+	n := t.seen
+	t.at, t.seen = time.Now(), 0
+	return n
+}
+
+// warnRejected reports connections dropped before authentication, at a rate
+// that cannot flood the journal.
+//
+// Every other noise report in this system is throttled - the responder's three
+// counters, the accept loop's refusals - and this was the exception. A peer
+// that cannot authenticate is a peer that redials, so an attacker churning
+// connections produced one Warn per attempt, unbounded: the connection limit
+// caps how many are open at once and says nothing about how fast they can be
+// cycled. Pushing real entries out of the journal is a cheap way to hide
+// something, and journald's own rate limiting would be the thing deciding what
+// survived.
+//
+// See throttle for the window and for why a burst that stops is still counted.
+func (s *ControlServer) warnRejected(remote, why string, err error) {
+	if seen := s.rejected.take(); seen > 0 {
+		s.log.Warn("control connection rejected before authentication",
+			"reason", why, "attempts", seen, "remote", remote, "err", err,
+			"hint", "is the shared secret identical, and is that host running this build?")
+	}
+}
+
+// flushThrottles reports what each throttle has counted since it last spoke.
+// Run on a ticker for as long as the listener lives, because otherwise a burst
+// that ends inside a window is never reported - see throttle.
+func (s *ControlServer) flushThrottles() {
+	if n := s.rejected.flush(); n > 0 {
+		s.log.Warn("further control connections rejected before authentication",
+			"attempts", n, "since", throttleWindow,
+			"hint", "is the shared secret identical, and is that host running this build?")
+	}
+	if n := s.refused.flush(); n > 0 {
+		s.log.Warn("further control connections refused; the concurrency limit was full",
+			"refused", n, "limit", maxControlConns, "since", throttleWindow)
+	}
+	if n := s.oversubbed.flush(); n > 0 {
+		s.log.Warn("further control connections refused; one address held its whole share",
+			"refused", n, "per_source", maxPerSource, "since", throttleWindow)
+	}
+}
+
+// warnUnsendable reports a frame this end refused to send, and exists because
+// every writer here treats a failed write as an ordinary disconnect.
+//
+// That is right for a broken connection and silent in the one case that is not
+// one. proto.ErrFrameTooLarge means the frame this host built is past the wire
+// limit, so no amount of reconnecting will deliver it: the session counter does
+// not advance over a refused write, so the next connection builds the identical
+// frame and refuses it again. Left unlogged, the sender-side check turns a
+// wordless reconnect loop at the far end into a wordless reconnect loop at this
+// one, which is the fault it was added to prevent rather than a fix for it.
+//
+// Error rather than Warn: nothing here recovers on its own, and the
+// configuration has to shrink before this peer is ever configured again.
+func (s *ControlServer) warnUnsendable(typ, peer string, err error) {
+	if !errors.Is(err, proto.ErrFrameTooLarge) {
+		return // an ordinary disconnect; the redial is the whole story
+	}
+	s.log.Error("cannot send a control frame: it is past the wire size limit",
+		"type", typ, "peer", peer, "limit", proto.MaxFrameBytes, "err", err,
+		"hint", "this peer reconnects and fails the same way until whatever grew the frame is reduced; the egress source list is the part of the pushed configuration that can grow without bound")
+}
+
+// maxControlConns bounds concurrent control connections, authenticated or not.
+//
+// A frame is bounded by proto.MaxFrameBytes, which settles what one connection
+// can cost; this settles how many of them there can be. Without it every accept
+// started a goroutine with a reader behind it and nothing said no, so the
+// per-frame limit would have been a limit on one multiplier of a product.
+//
+// The legitimate population is one backend plus one connection per linker, and
+// a session whose TCP connection died silently stays parked until
+// proto.ControlDeadline retires it - so a reconnect can briefly double the
+// count. Sixty-four is far above any real deployment and far below a number
+// that costs the frontend anything.
+const maxControlConns = 64
+
+// maxPerSource bounds how many of those one address may hold.
+//
+// The total on its own is a pool with nothing reserved in it, and every
+// connection claims from it before proving anything - so sixty-four sockets
+// from one machine, opened and left silent or churned as their ten-second
+// handshake deadlines expire, hold the whole pool indefinitely and the
+// backend's redial is closed on sight. The position that can do it is the one
+// proto.Session was written for: a linker reaches this listener as an ordinary
+// LAN neighbour routed through the backend, so the first hop is plaintext TCP
+// on somebody's office network, and the backend forwards the overlay range in
+// both directions.
+//
+// The cost of losing that race is not a portal that looks wrong. No usage
+// delta reaches the ledger, so LTE billing under-counts during exactly the
+// window quota enforcement exists for, and no configuration reaches the
+// backend. The honest peer is the one that loses, because nothing distinguished
+// an authenticated session's slot from a socket that had said nothing.
+//
+// Four is above anything honest: one backend or one linker holds a single
+// connection, and a silently dead session parked on its read deadline while its
+// replacement dials in briefly doubles that. It bounds one address, not an
+// attacker with a subnet to spend - that is what the total is still for - but
+// it is what keeps a flood from one place out of every other peer's way.
+const maxPerSource = 4
+
+// sourceIP is the key perSource counts against: the address without the
+// ephemeral port, since a flood is one host opening many sockets.
+func sourceIP(conn net.Conn) string {
+	remote := conn.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		return host
+	}
+	return remote
+}
+
+// claimSource reserves one of an address's connections, or reports that it
+// already holds its share.
+func (s *ControlServer) claimSource(ip string) bool {
+	s.srcMu.Lock()
+	defer s.srcMu.Unlock()
+	if s.perSource == nil {
+		s.perSource = make(map[string]int)
+	}
+	if s.perSource[ip] >= maxPerSource {
+		return false
+	}
+	s.perSource[ip]++
+	return true
+}
+
+// releaseSource gives one back. The entry is deleted rather than left at zero,
+// because the addresses this counts are chosen by whoever dials: a map that
+// only ever grew would be a second unbounded resource behind the limit meant
+// to bound the first.
+func (s *ControlServer) releaseSource(ip string) {
+	s.srcMu.Lock()
+	defer s.srcMu.Unlock()
+	if s.perSource[ip] <= 1 {
+		delete(s.perSource, ip)
+		return
+	}
+	s.perSource[ip]--
 }
 
 // NewControlServer builds the server.
 func NewControlServer(eng *Engine, psk []byte) *ControlServer {
 	cfg := eng.Config()
 	return &ControlServer{
-		eng:  eng,
-		log:  eng.Logger().With("component", "control"),
-		psk:  psk,
-		addr: net.JoinHostPort(cfg.Overlay.FrontendIP, strconv.Itoa(cfg.Overlay.ControlPort)),
+		eng:   eng,
+		log:   eng.Logger().With("component", "control"),
+		psk:   psk,
+		addr:  net.JoinHostPort(cfg.Overlay.FrontendIP, strconv.Itoa(cfg.Overlay.ControlPort)),
+		slots: make(chan struct{}, maxControlConns),
 	}
 }
 
@@ -68,6 +281,22 @@ func (s *ControlServer) Run(ctx context.Context) error {
 }
 
 func (s *ControlServer) listen(ctx context.Context) error {
+	// First, before the bind, and that ordering is deliberate rather than
+	// tidy: it makes the limit exist whether or not this attempt gets a
+	// listener, so there is no state of this server in which the accept loop
+	// could be reached without one.
+	//
+	// A nil channel would not degrade the limit, it would invert it: a send on
+	// one never proceeds, so the select below takes `default` every time and
+	// this server refuses every connection it is ever offered, silently and
+	// for good. NewControlServer fills it in, but three tests build this
+	// struct literally, and the day one of them reaches for listen is not the
+	// day to discover that. Safe without a lock because Run is the only caller
+	// and calls this one at a time.
+	if s.slots == nil {
+		s.slots = make(chan struct{}, maxControlConns)
+	}
+
 	// The listener carries the control mark, which routes its packets - the
 	// SYN-ACK included, and every accepted connection inherits it - through
 	// the control table rather than the frontend's public interface.
@@ -84,6 +313,22 @@ func (s *ControlServer) listen(ctx context.Context) error {
 		_ = ln.Close()
 	}()
 
+	// The trailing edge of the three throttles. Without it a burst that stops
+	// inside a window is counted and never reported, which is the half of a
+	// throttle that says a flood happened at all.
+	flush := time.NewTicker(throttleWindow)
+	defer flush.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-flush.C:
+				s.flushThrottles()
+			}
+		}
+	}()
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -93,7 +338,42 @@ func (s *ControlServer) listen(ctx context.Context) error {
 			s.log.Warn("control accept failed", "err", err)
 			continue
 		}
-		go s.serve(ctx, conn)
+		// Both limits are claimed here rather than inside serve, because a
+		// goroutine that has already started is the thing being bounded.
+		// Refusing is a close, not a queue: a caller made to wait for a slot is
+		// holding one of this host's sockets either way, and the honest peers
+		// all redial.
+		//
+		// The per-address share is claimed first, so a flood is turned away
+		// before it can take a slot out of the pool even momentarily.
+		ip := sourceIP(conn)
+		if !s.claimSource(ip) {
+			_ = conn.Close()
+			if n := s.oversubbed.take(); n > 0 {
+				s.log.Warn("refusing control connections; one address is holding its whole share",
+					"remote", ip, "refused", n, "per_source", maxPerSource,
+					"hint", "one connection per peer is normal; several from one address that never authenticate is somebody knocking")
+			}
+			continue
+		}
+		select {
+		case s.slots <- struct{}{}:
+			go func() {
+				defer func() {
+					<-s.slots
+					s.releaseSource(ip)
+				}()
+				s.serve(ctx, conn)
+			}()
+		default:
+			s.releaseSource(ip)
+			_ = conn.Close()
+			if n := s.refused.take(); n > 0 {
+				s.log.Warn("refusing control connections; the concurrency limit is full",
+					"refused", n, "limit", maxControlConns,
+					"hint", "one backend and one connection per linker is normal; anything else is somebody knocking")
+			}
+		}
 	}
 }
 
@@ -109,15 +389,24 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 
 	r := bufio.NewReader(conn)
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	env, err := readFrame(r)
+	env, err := proto.ReadFrame(r)
 	if err != nil {
+		// Said out loud rather than dropped in silence, which is what this did
+		// before. An oversized frame is the one rejection here that is not a
+		// peer failing to prove itself: proto.ErrFrameTooLarge means somebody
+		// sent something no honest agent sends, and separating it from an
+		// authentication failure is the whole reason it is its own error.
+		why := "unreadable first frame"
+		if errors.Is(err, proto.ErrFrameTooLarge) {
+			why = "first frame over the size limit"
+		}
+		s.warnRejected(remote, why, err)
 		return
 	}
 	var auth proto.Auth
 	if env.Type != proto.MsgAuth || proto.DecodeInto(env, &auth) != nil ||
 		!proto.VerifyAuth(s.psk, nonce, auth.Nonce, auth.MAC) {
-		s.log.Warn("control authentication failed", "remote", remote,
-			"hint", "is the shared secret identical, and is that host running this build?")
+		s.warnRejected(remote, "the peer could not prove it holds the shared secret", nil)
 		return
 	}
 
@@ -131,7 +420,7 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 	// the egress networks - which the linker loads into nftables as root.
 	proof, err := proto.SignAuthAck(s.psk, nonce, auth.Nonce)
 	if err != nil {
-		s.log.Warn("control authentication failed", "remote", remote, "err", err)
+		s.warnRejected(remote, "cannot sign this end's proof", err)
 		return
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
@@ -145,7 +434,7 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 	// ends authenticate and then inject its own frames. See proto.Session.
 	sess, err := proto.NewSession(s.psk, nonce, auth.Nonce, false)
 	if err != nil {
-		s.log.Warn("control authentication failed", "remote", remote, "err", err)
+		s.warnRejected(remote, "cannot establish a session", err)
 		return
 	}
 
@@ -301,6 +590,7 @@ func (s *ControlServer) pushLoop(ctx context.Context, conn net.Conn, sess *proto
 			}
 			pushed, first = v, false
 			if err := sess.WriteFrame(conn, proto.MsgConfig, backendConfig(s.eng.Config())); err != nil {
+				s.warnUnsendable(proto.MsgConfig, conn.RemoteAddr().String(), err)
 				return
 			}
 		case <-ka.C:
@@ -358,18 +648,6 @@ func backendConfig(cfg model.Config) proto.BackendConfig {
 		}
 	}
 	return bc
-}
-
-func readFrame(r *bufio.Reader) (proto.Envelope, error) {
-	line, err := r.ReadBytes('\n')
-	if err != nil {
-		return proto.Envelope{}, err
-	}
-	var env proto.Envelope
-	if err := json.Unmarshal(line, &env); err != nil {
-		return proto.Envelope{}, fmt.Errorf("bad control frame: %w", err)
-	}
-	return env, nil
 }
 
 // serveLinker handles a control connection from an extra host.
@@ -447,6 +725,7 @@ func (s *ControlServer) pushLinkerLoop(ctx context.Context, conn net.Conn, sess 
 		pushed, first = v, false
 		cfg := s.eng.LinkerConfigFor(overlayIP)
 		if err := sess.WriteFrame(conn, proto.MsgLinkerConfig, cfg); err != nil {
+			s.warnUnsendable(proto.MsgLinkerConfig, overlayIP, err)
 			return false
 		}
 		s.log.Info("pushed configuration to linker",
