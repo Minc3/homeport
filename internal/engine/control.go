@@ -794,7 +794,7 @@ const (
 // clampCounts brings a delta's two counts inside the bounds above and names
 // what it moved.
 //
-// One definition, called from checkDelta and from Engine.AddUsage. It was
+// One definition, called from checkDelta and from Engine.addUsageBatch. It was
 // written out twice, and the two agreed only because they happened to name the
 // same constants: a change to the shape of the rule, a floor other than zero or
 // a different answer for one of the four cases, had two places to be found and
@@ -914,12 +914,19 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	pending := map[int][]usageSample{}
 	keys := map[int]string{}
 	// Whether the configuration holds each id, memoised for the batch. HasPath
-	// takes the state lock and PathByID has a value receiver, so every call
-	// copies the whole configuration to read one entry - and this test runs
-	// before the per-path maps below are seeded, deliberately, so it cannot ride
-	// on them. A thousand deltas across three paths was a thousand of both, on
-	// the read loop that cannot answer a ping while it works and against the
-	// lock the decision loop wants every 500ms. The configuration cannot change
+	// takes the state lock and PathByID has a value receiver, so every call is a
+	// lock round trip plus a 560 byte struct copy plus a scan of Paths - and
+	// this test runs before the per-path maps below are seeded, deliberately, so
+	// it cannot ride on them. A thousand deltas across three paths was a
+	// thousand of each, on the read loop that cannot answer a ping while it
+	// works and against the lock the decision loop wants every 500ms.
+	//
+	// The copy is a fixed 560 bytes rather than the whole deployment: Paths,
+	// Services, Linkers and the rest are slice headers, so a site with thirty
+	// services copies exactly what a bare one does. Worth saying, because an
+	// earlier version of this comment said "copies the whole configuration",
+	// which points whoever reads it at a pointer receiver for a win that is not
+	// there. What this removes is the lock traffic and the scans. The configuration cannot change
 	// under this batch in a way that matters: Reconfigure would have to land
 	// mid-frame, and a path removed or added halfway through one is exactly as
 	// arbitrary either way.

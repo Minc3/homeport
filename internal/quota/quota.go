@@ -156,10 +156,20 @@ func Location(q model.Quota) *time.Location {
 // ResetDay is clamped to the length of the month, so a carrier that resets on
 // the 31st still gets a sane boundary in February.
 func PeriodBounds(q model.Quota, now time.Time) (start, end time.Time) {
-	return PeriodBoundsIn(q, Location(q), now)
+	return PeriodBoundsIn(q.ResetDay, Location(q), now)
 }
 
 // PeriodBoundsIn is PeriodBounds with the zone already resolved.
+//
+// It takes the reset day rather than the whole Quota, so there is no
+// q.Timezone sitting in the signature for it to ignore. Written the other way
+// it accepted both and used only one of them, which is a trap rather than a
+// convenience: the natural next optimisation is a caller resolving one zone
+// outside a loop over paths, and a path whose own zone differs would then have
+// every billing boundary drawn in somebody else's, its rows landing under a
+// period_start up to eleven hours off, its current period reading short, and
+// its quota tripping late or not at all. Nothing reports that. A signature that
+// cannot express the mismatch is the cheapest place to stop it.
 //
 // It exists because time.LoadLocation does not cache: it re-opens and re-parses
 // the zoneinfo entry on every call, about fifty microseconds. That is nothing
@@ -176,10 +186,18 @@ func PeriodBounds(q model.Quota, now time.Time) (start, end time.Time) {
 // being drawn with the old offsets until somebody restarts the unit. Every
 // delta in one batch shares one path and therefore one zone, so there is no
 // need to reach for process-wide state to say so.
-func PeriodBoundsIn(q model.Quota, loc *time.Location, now time.Time) (start, end time.Time) {
+func PeriodBoundsIn(day int, loc *time.Location, now time.Time) (start, end time.Time) {
+	// now.In(nil) and time.Date(..., nil) both panic, and this runs on the
+	// control read loop: a nil here is a crash under Restart=always, the backend
+	// resending the same buffered batch on reconnect, and a crash loop driven by
+	// data the peer keeps sending. Location never returns nil today, which makes
+	// this latent rather than absent, and the fallback is the same one Location
+	// itself uses for a zone it cannot load.
+	if loc == nil {
+		loc = time.UTC
+	}
 	n := now.In(loc)
 
-	day := q.ResetDay
 	if day < 1 {
 		day = 1
 	}
@@ -243,6 +261,17 @@ type Decision struct {
 // runaway cannot cost unbounded money no matter what was clicked at 2am.
 func Evaluate(p model.PathConfig, used int64, grant store.Grant, hasGrant bool, now time.Time) Decision {
 	start, end := PeriodBounds(p.Quota, now)
+	return EvaluateIn(p, used, grant, hasGrant, now, start, end)
+}
+
+// EvaluateIn is Evaluate with the billing period already worked out.
+//
+// Its caller has almost always just computed the same bounds for the same path
+// at the same instant: Engine.refreshQuota did exactly that, on consecutive
+// statements, so every path paid two time.LoadLocation calls per tick where one
+// would do. That is about fifty microseconds each and it is on the engine's own
+// goroutine, which is the one that has to make a failover decision every 500ms.
+func EvaluateIn(p model.PathConfig, used int64, grant store.Grant, hasGrant bool, now, start, end time.Time) Decision {
 	d := Decision{
 		Used:        used,
 		Limit:       p.Quota.LimitBytes,

@@ -1484,7 +1484,10 @@ func (e *Engine) refreshQuota(now time.Time) {
 
 	decisions := map[int]quota.Decision{}
 	for _, p := range cfg.Paths {
-		start, _ := quota.PeriodBounds(p.Quota, now)
+		// Once per path, not twice: Evaluate below used to work the same
+		// bounds out again from the same quota and the same instant, and each
+		// pass is a real tzdata parse.
+		start, end := quota.PeriodBounds(p.Quota, now)
 		used, err := e.st.Usage(p.ID, start)
 		if err != nil {
 			// Carry the last known verdict forward rather than omitting the
@@ -1498,7 +1501,7 @@ func (e *Engine) refreshQuota(now time.Time) {
 			continue
 		}
 		g, has := grants[p.ID]
-		decisions[p.ID] = quota.Evaluate(p, used, g, has, now)
+		decisions[p.ID] = quota.EvaluateIn(p, used, g, has, now, start, end)
 	}
 
 	e.mu.Lock()
@@ -1535,9 +1538,10 @@ type usageSample struct {
 //
 // Two things are resolved once for the batch rather than once per delta, and
 // both were per-delta costs on the control read loop, which cannot answer a
-// ping while it works. The path, because PathByID takes its receiver by value,
-// so every call copied the whole configuration to read one entry. And the
-// timezone, which is the more expensive of the two by orders of magnitude:
+// ping while it works. The path, because HasPath locks and PathByID takes its
+// receiver by value, so every call was a lock round trip plus a 560 byte struct
+// copy plus a scan. And the timezone, which is the more expensive of the two by
+// orders of magnitude:
 // time.LoadLocation re-parses the zoneinfo entry on every call, so a five
 // hundred delta batch was five hundred tzdata parses. Every delta here belongs
 // to one path and therefore to one zone.
@@ -1567,9 +1571,12 @@ func (e *Engine) addUsageBatch(pathID int, samples []usageSample, seqKey, seqVal
 		// not be able to disagree. Metered clamps its own copy, so a negative
 		// packet count produced zero metered bytes and was then handed to the
 		// ledger unchanged, where it decremented the period's packet total.
-		// checkDelta covers the control path, and this is an exported entry
-		// point: a caller three files away is not the place its guarantees
-		// live.
+		// checkDelta covers the control path, and covering it there is not the
+		// same as holding it here. This is the last thing between a delta and
+		// the ledger, and the two columns are written from one call, so the
+		// bound belongs where the write is rather than at whichever caller
+		// happens to exist today - which is exactly how the two copies of the
+		// timestamp rule came to disagree about an overflowing stamp.
 		bytes, packets, _ := clampCounts(s.Bytes, s.Packets)
 		// The stamp too, for the reason the counts are. PeriodBounds takes
 		// whatever it is handed, and a stamp outside the window puts the bytes
@@ -1596,7 +1603,7 @@ func (e *Engine) addUsageBatch(pathID int, samples []usageSample, seqKey, seqVal
 		if at.After(now.Add(maxDeltaSkew)) || at.Before(now.Add(-maxDeltaAge)) {
 			at = now
 		}
-		start, _ := quota.PeriodBoundsIn(p.Quota, loc, at)
+		start, _ := quota.PeriodBoundsIn(p.Quota.ResetDay, loc, at)
 		entries = append(entries, store.UsageEntry{
 			PeriodStart: start,
 			At:          at,

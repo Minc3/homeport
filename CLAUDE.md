@@ -754,13 +754,30 @@ was by a wide margin the most expensive thing left in a loop the batching change
 had just hoisted the cheap thing out of.
 
 The first fix for that was a memo inside `Location`, and it bought the saving by
-pinning every zone's rules for the life of the process. A frontend runs for
+pinning every zone's rules for the life of the process, which is worse than it
+sounds in one specific way: it also masked the silent fallback below. A frontend runs for
 months under `Restart=always`; a tzdata update carrying a rule change would then
 never be picked up, and the billing boundary would go on being drawn with the
 old offsets until somebody restarted the unit, with nothing reporting it. The
 problem is per-batch, so the fix belongs there: `quota.PeriodBoundsIn` takes the
 zone, `addUsageBatch` resolves it once, and every delta in a batch shares one
-path and therefore one zone anyway.
+path and therefore one zone anyway. `PeriodBoundsIn` takes the reset day rather
+than the whole `Quota`, so there is no `Timezone` in the signature for it to
+ignore: written the other way, a caller resolving one zone outside a loop over
+paths would draw every boundary in somebody else's, with the rows landing under
+a `period_start` up to eleven hours off and nothing reporting it.
+
+**The frontend carries its own copy of the timezone database.** `quota.Location`
+answers a zone it cannot load with `time.UTC`, silently, and that answer decides
+which billing period every metered byte lands in. A host whose
+`/usr/share/zoneinfo` goes away mid-life - a rebuilt image, a minimal container -
+therefore starts drawing the boundary eleven hours from where the carrier draws
+it, reads the current period as empty because the rows are under a different
+`period_start`, and never trips a quota again. `web.validate` cannot catch it,
+because it runs at save time on a host that still had the file. `time/tzdata` in
+`cmd/failover-frontend` costs about 450 KB in an eleven megabyte static binary,
+and the standard library prefers the system copy whenever there is one, so a
+host with tzdata behaves exactly as it did.
 
 What neither bounds is a sequence that has gone *backwards*, and that hole is
 open. A backend that loses `meter-state.json` restarts at 1, every delta is at
@@ -1178,18 +1195,26 @@ input coerces a cleared box to zero rather than to `NaN`, which JSON writes as
 `float: true`. Both directions were reachable and neither was harmless: an empty
 `overhead_per_packet` stored 0, which is a legal "no per-packet overhead" and
 under-bills every metered byte by 5 to 15% in silence, while a decimal typed
-into any of the twenty-five fields `model.Config` declares as `int` failed the
-whole `PUT` with "cannot unmarshal number 90.5" and blocked every unrelated edit
-in the form until the operator found a field they may not have touched.
+into any of the thirty-four fields `model.Config` declares as an integer failed
+the whole `PUT` with "cannot unmarshal number 90.5" and blocked every unrelated
+edit in the form until the operator found a field they may not have touched.
 
 Rounding is the default and the float is the opt-out, which is the way round it
-has to be. The first version was opt-in and reached four fields of the
-twenty-five, so it was an invariant stated in a comment and held in four places.
-The opt-out is about the units the *input* carries rather than the Go type
-behind it: the two quota caps are `int64` and are still float here, because the
-box is in GB and its handler multiplies, so rounding it turns anything under
-half a gigabyte into 0 and 0 is how a quota is disabled. Where the units and the
-type disagree, the units win.
+has to be: thirty-four integer fields against eight float ones, and the first
+version was opt-in and reached four, so it was an invariant stated in a comment
+and held in four places. The opt-out is about the units the *input* carries
+rather than the Go type behind it: the two quota caps are `int64` and are still
+float here, because the box is in GB and its handler multiplies, so rounding it
+turns anything under half a gigabyte into 0 and 0 is how a quota is disabled.
+Where the units and the type disagree, the units win.
+
+`web.TestEveryFractionalPortalInputOptsOutOfRounding` is what holds it, and it
+takes the float list from `model.Config` by reflection rather than from a copy,
+so a field added tomorrow is covered the day it is added. Both directions are
+silent for a while: a float that loses its opt-out turns 0.4 into 0, and on a
+quality weight that stops the selector counting latency with nothing in the
+portal saying so, because `Normalise` repairs that group only when every weight
+in it is zero.
 
 **The portal must never be able to take the agent down.** It binds an address on
 the admin tunnel, and that address does not exist until `wg-quick` has brought
@@ -2485,6 +2510,14 @@ where a subtle regression would be invisible in production until an outage:
 - `store/perms_test.go` - the database and its journal carry no group or world
   bits. They hold live session tokens, so this is the file mode standing
   between a local account and the portal.
+- `store/ledger_floor_test.go` - the SQL floor, reached the only way it can be:
+  a ledger row seeded negative by hand, which is what a build predating
+  `clampLedger` leaves behind, is lifted rather than left to under-report the
+  period. It writes that row through the package's own handle because no
+  exported method can produce one any more, and it lives in `package store` for
+  that reason. Without it `MAX(..., 0)` could be deleted with the whole suite
+  staying green, which is what the comment beside that SQL tells a reader not to
+  do.
 - `store/usage_saturation_test.go` - the ledger column survives at both ends:
   forty saturated deltas leave it readable and capped rather than promoted to a
   REAL, and a negative delta neither drives it below zero nor takes the packet
@@ -2534,6 +2567,13 @@ where a subtle regression would be invisible in production until an outage:
   refused, an IPv4-mapped one is flattened rather than refused - matching
   `sysx.AddressLiteral`, since To4 on a bare address yields a usable dotted
   quad where a mapped *network* would not - and a valid one saves normalised.
+- `web/portal_numeric_test.go` - every number input in the portal rounds unless
+  the value behind it holds fractions, checked against `model.Config` by
+  reflection rather than against a list kept here, and in both directions: a
+  float field that lost its opt-out, an integer field that gained one, and the
+  two quota caps whose boxes are in gigabytes while their fields are `int64`.
+  It is the only thing holding a rule that spans thirty call sites in a file
+  with no test framework of its own.
 - `web/password_test.go` - a password can be changed, doing so logs out every
   other session while keeping the caller signed in, the current password is
   required, an unauthenticated request cannot change one, the local socket can

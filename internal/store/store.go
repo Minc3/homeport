@@ -355,9 +355,15 @@ func (s *Store) AddUsageBatch(pathID int, entries []UsageEntry, metaKey, metaVal
 		return fmt.Errorf("ledger update: %w", err)
 	}
 	defer ledger.Close()
-	// The same values, so the same bounds. These rows looked like the harmless
-	// half of the pair and are not: the cap above bounds an accumulating
-	// column, and these accumulate inside a query instead. See UsageHistory.
+	// The same values, and their bounds are the clampLedger call in the loop
+	// below plus the CAST in UsageHistory - there is deliberately no MIN or MAX
+	// here, because a row is written once and never accumulated into.
+	//
+	// That is what makes these look like the harmless half of the pair, and they
+	// are not: the cap above bounds an accumulating column, and these accumulate
+	// inside a query instead. An overflowing SUM does not promote the way a bare
+	// + does, it fails the statement, and the portal's graph for that path is
+	// then off the air until the rows age out thirteen months later.
 	sample, err := tx.Prepare(
 		`INSERT INTO usage_samples (ts, path_id, bytes, packets) VALUES (?, ?, ?, ?)`)
 	if err != nil {

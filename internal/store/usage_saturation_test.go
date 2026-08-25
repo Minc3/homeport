@@ -90,7 +90,7 @@ func TestOrdinaryUsageIsUnaffectedBySaturation(t *testing.T) {
 // own bounds when it enforced half of them. The floor matters more than the
 // ceiling does: this column accumulates, so a negative figure does not record a
 // wrong number for one sample, it erases usage already billed and the first
-// anybody hears of it is the carrier's invoice. Engine.AddUsage clamps before
+// anybody hears of it is the carrier's invoice. the engine clamps before
 // it calls this, which is exactly why the omission survived - the guarantee was
 // living in a caller three files away.
 func TestTheLedgerCannotBeDrivenBelowZero(t *testing.T) {
@@ -134,7 +134,7 @@ func TestTheLedgerCannotBeDrivenBelowZero(t *testing.T) {
 }
 
 // The saturation tests above drive Store.AddUsage, and for a while that was the
-// method nothing in production called: Engine.AddUsage had been rewritten to go
+// method nothing in production called: the engine had been rewritten to go
 // through AddUsageBatch, which held its own copy of the same SQL. So every
 // bound this file exists to pin was pinned on a dead path, and dropping the
 // floor or the ceiling from the live one left the suite green.
@@ -182,8 +182,19 @@ func TestTheBatchEntryPointCarriesTheSameBounds(t *testing.T) {
 	// The graph half, which no engine-level test reaches: these rows accumulate
 	// inside a query rather than in a column, and an overflowing SUM fails the
 	// statement outright rather than being promoted.
-	if _, err := st.UsageHistory(2, now.Add(-time.Hour), 3600); err != nil {
+	points, err := st.UsageHistory(2, now.Add(-time.Hour), 3600)
+	if err != nil {
 		t.Errorf("the portal's usage graph is broken: %v", err)
+	}
+	// Not merely that the query ran. The float branch that reads the sum back
+	// could be replaced by a bare int64(sum) and the query would still succeed,
+	// handing the graph a bucket that overflowed on conversion - so the value
+	// has to be asserted, not just the absence of an error.
+	for _, pt := range points {
+		if pt.Bytes < 0 || pt.Bytes > store.MaxLedgerValue {
+			t.Errorf("usage graph bucket = %d bytes, want it clamped into [0, %d]",
+				pt.Bytes, int64(store.MaxLedgerValue))
+		}
 	}
 	// The watermark rides the same transaction, or a crash between them bills
 	// the resend twice.

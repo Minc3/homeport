@@ -114,7 +114,7 @@ func TestANegativeUsageDeltaCannotCreditTheLedger(t *testing.T) {
 		t.Errorf("ledger is at %d bytes after a negative delta; recorded usage was erased", used)
 	}
 	// Both columns, because only one of them could be read back before and the
-	// packets one is the specific regression Engine.AddUsage's clamp names:
+	// packets one is the specific regression the clamp in Engine.addUsageBatch names:
 	// quota.Metered clamps its own copy, so a negative packet count produced
 	// zero metered bytes and was then handed to the ledger unchanged, where it
 	// decremented the period's packet total. It is held at two layers now,

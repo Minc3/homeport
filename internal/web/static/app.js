@@ -753,15 +753,19 @@ function field(label, value, onInput, opts = {}) {
   // body the save endpoint refuses.
   //
   // Rounding is the default and `float: true` is the opt-out, which is the way
-  // round it has to be. The first version made it opt-in and reached four
-  // fields out of the twenty-five that are int in model.Config, so the same
-  // save-blocking decimal was still typeable into every probe interval, every
-  // threshold, every timeout, every service port and every protection limit -
-  // an invariant stated in a comment and held in four places. There are eight
-  // float fields in the whole configuration and they are named at their call
-  // sites; anything new is an int until somebody says otherwise, which fails
-  // in the direction that rounds a value rather than the one that refuses a
-  // save.
+  // round it has to be. model.Config holds thirty-four integer fields against
+  // eight float ones, and the first version of this made rounding opt-in and
+  // reached four of them, so the same save-blocking decimal was still typeable
+  // into every probe interval, every threshold, every timeout, every service
+  // port and every protection limit: an invariant stated in a comment and held
+  // in four places. The minority is the one worth naming at the call site.
+  //
+  // Neither direction is safe enough to leave to memory, which is why
+  // web.TestEveryFractionalPortalInputOptsOutOfRounding reads this file and
+  // takes the float list from model.Config by reflection. A float field that
+  // loses its opt-out turns a typed 0.4 into 0, and on a quality weight that
+  // stops the selector counting latency while model.Normalise leaves it alone,
+  // because it only repairs that group when every weight in it is zero.
   //
   // The opt-out is about the units the *input* carries, not the Go type behind
   // it. The two quota caps are int64 in model.Config and are still float here,
