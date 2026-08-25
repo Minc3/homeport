@@ -132,3 +132,53 @@ func TestTheLedgerCannotBeDrivenBelowZero(t *testing.T) {
 		t.Errorf("ledger = %d bytes (err %v), want 8 GiB", used, err)
 	}
 }
+
+// The saturation tests above drive Store.AddUsage, and for a while that was the
+// method nothing in production called: Engine.AddUsage had been rewritten to go
+// through AddUsageBatch, which held its own copy of the same SQL. So every
+// bound this file exists to pin was pinned on a dead path, and dropping the
+// floor or the ceiling from the live one left the suite green.
+//
+// AddUsage is a batch of one now, so those tests cover both. This one drives
+// the batch entry point directly, because "both" is only true while that
+// remains a fact about the code rather than about this comment.
+func TestTheBatchEntryPointCarriesTheSameBounds(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now()
+	const perDelta = int64(720752316243935232)
+	entries := []store.UsageEntry{
+		{PeriodStart: now, At: now, Bytes: perDelta, Packets: perDelta},
+		{PeriodStart: now, At: now, Bytes: perDelta, Packets: perDelta},
+		{PeriodStart: now, At: now, Bytes: perDelta, Packets: perDelta},
+		// The floor, in the same transaction as the ceiling, because a batch is
+		// where the two can meet.
+		{PeriodStart: now, At: now, Bytes: -(600 << 30), Packets: -50_000},
+	}
+	if err := st.AddUsageBatch(2, entries, "usage_seq:2", "9"); err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+
+	used, err := st.Usage(2, now)
+	if err != nil {
+		t.Fatalf("the ledger column is unreadable, so the sum was promoted to a REAL: %v", err)
+	}
+	if used != store.MaxLedgerValue {
+		t.Errorf("ledger = %d, want it saturated at %d", used, int64(store.MaxLedgerValue))
+	}
+	// The graph half, which no engine-level test reaches: these rows accumulate
+	// inside a query rather than in a column, and an overflowing SUM fails the
+	// statement outright rather than being promoted.
+	if _, err := st.UsageHistory(2, now.Add(-time.Hour), 3600); err != nil {
+		t.Errorf("the portal's usage graph is broken: %v", err)
+	}
+	// The watermark rides the same transaction, or a crash between them bills
+	// the resend twice.
+	if got := st.Meta("usage_seq:2"); got != "9" {
+		t.Errorf("watermark = %q, want 9 written inside the batch transaction", got)
+	}
+}

@@ -735,7 +735,28 @@ function field(label, value, onInput, opts = {}) {
     max: opts.max,
     placeholder: opts.placeholder,
   });
-  input.addEventListener('input', () => onInput(opts.type === 'number' ? parseFloat(input.value) : input.value));
+  // A number field never hands its callback a NaN, and an integer field never
+  // hands it a fraction. Both were reachable and neither was harmless.
+  //
+  // parseFloat('') is NaN, so clearing a box passed NaN straight into the
+  // config; JSON.stringify writes that as null, and Go decodes null into a
+  // numeric field as a no-op, leaving whatever the zero value is. On
+  // overhead_per_packet that is 0, which validate accepts and Metered reads as
+  // "no per-packet overhead", so every metered byte on that path is under-counted
+  // by 5 to 15% with the placeholder still suggesting 60 and nothing warning.
+  //
+  // The fraction is the louder half: a decimal typed into a field Go declares
+  // as int fails the whole PUT with "cannot unmarshal number 60.5", so an
+  // unrelated edit elsewhere in the form cannot be saved until the operator
+  // finds a field they may not have touched. Rounding here is the same
+  // reasoning as declaring min and max: the form must not be able to build a
+  // body the save endpoint refuses.
+  input.addEventListener('input', () => {
+    if (opts.type !== 'number') return onInput(input.value);
+    let v = parseFloat(input.value);
+    if (!Number.isFinite(v)) v = 0;
+    return onInput(opts.int ? Math.round(v) : v);
+  });
   return el('label', { class: 'field' }, caption(label, opts.help), input);
 }
 
@@ -773,8 +794,8 @@ function pathRow(p) {
   return el('tr', {},
     el('td', {}, field('', p.name, (v) => (p.name = v), { placeholder: 'lte1' })),
     el('td', {}, field('', p.iface, (v) => (p.iface = v), { placeholder: 'wg-lte1' })),
-    el('td', {}, num('', p.priority, (v) => (p.priority = v), { min: 1, placeholder: '2' })),
-    el('td', {}, num('', p.table, (v) => (p.table = v), { min: 1, placeholder: '102' })),
+    el('td', {}, num('', p.priority, (v) => (p.priority = v), { int: true, min: 1, placeholder: '2' })),
+    el('td', {}, num('', p.table, (v) => (p.table = v), { int: true, min: 1, placeholder: '102' })),
     el('td', {}, field('', '0x' + (p.mark || 0).toString(16), (v) => (p.mark = parseInt(v, 16) || 0), { placeholder: '0x102' })),
     el('td', {}, checkbox('', p.enabled, (v) => (p.enabled = v))),
     el('td', {}, checkbox('', p.metered, (v) => (p.metered = v))),
@@ -782,7 +803,7 @@ function pathRow(p) {
     el('td', {}, num('', (p.quota.ceiling_bytes || 0) / GB, (v) => (p.quota.ceiling_bytes = Math.round(v * GB)), { step: 1, min: 0, placeholder: '0' })),
     el('td', {}, num('', p.shape.to_backend_mbit, (v) => (p.shape.to_backend_mbit = v || 0), { min: 0, step: 1, placeholder: '0 = off' })),
     el('td', {}, num('', p.shape.to_frontend_mbit, (v) => (p.shape.to_frontend_mbit = v || 0), { min: 0, step: 1, placeholder: '0 = off' })),
-    el('td', {}, num('', p.quota.reset_day, (v) => (p.quota.reset_day = v), { min: 1, placeholder: '1' })),
+    el('td', {}, num('', p.quota.reset_day, (v) => (p.quota.reset_day = v), { int: true, min: 1, placeholder: '1' })),
     el('td', {}, field('', p.quota.timezone, (v) => (p.quota.timezone = v), { placeholder: 'Australia/Melbourne' })),
     // The bounds are quota.MinCalibration and quota.MaxCalibration, mirrored
     // here by hand because the page cannot call Go, exactly as the detection
@@ -797,7 +818,7 @@ function pathRow(p) {
     // straight back into the PUT body. A blob carrying one out of range
     // therefore failed every save, naming a field the operator could not see or
     // reach, and blocked every unrelated edit with it.
-    el('td', {}, num('', p.quota.overhead_per_packet, (v) => (p.quota.overhead_per_packet = v), { step: 1, min: 0, max: 65535, placeholder: '60' })),
+    el('td', {}, num('', p.quota.overhead_per_packet, (v) => (p.quota.overhead_per_packet = v), { int: true, step: 1, min: 0, max: 65535, placeholder: '0 = none' })),
   );
 }
 
@@ -1184,7 +1205,8 @@ function renderSettings() {
         + 'After a month of comparison: if this portal says 50 GB and the carrier says 55, set 110. Range 10 to 1000, because a factor of ten either way is a typo '
         + 'rather than a calibration. Below is the dangerous direction: it under-bills every metered byte and the quota never trips.'),
       th('Overhead B/pkt', 'What each packet costs on the WAN over the payload the tunnel counters see: WireGuard, UDP and IP together, about 60. '
-        + 'The carrier bills the encapsulated datagram, so counting payload alone undercounts by 5 to 15%. 0 to 65535.'),
+        + 'The carrier bills the encapsulated datagram, so counting payload alone undercounts by 5 to 15%. 0 to 65535, and 0 really does mean none: '
+        + 'an empty box stores 0, not the 60 a fresh install ships with.'),
     )),
     el('tbody', {}, c.paths.map(pathRow)),
   );

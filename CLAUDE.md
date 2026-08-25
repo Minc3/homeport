@@ -708,6 +708,18 @@ alternative to. `PendingBatch` now takes an equal share per path first and fills
 the remainder from the front, so a single-path backlog still drains at the full
 rate and the ordinary site is unchanged.
 
+**The jump bounds one frame, and that is where the line is drawn.** `base` is
+re-read from the database at the top of every batch, so a peer sending frame
+after frame can advance the watermark by a jump each time and reach
+`maxDeltaSequence` in about eight thousand of them. That is deliberate rather
+than overlooked, and it is the same line already drawn for `maxDeltaBytes`: what
+keeps a hostile peer away from the ledger is `KnownBackend`, not these. These
+exist for a meter that has lost its state, and a corrupted `meter-state.json`
+emits one wrong sequence, not eight thousand escalating frames. Closing the
+cross-frame direction means anchoring to elapsed monotonic time the way
+`plausibleDecisionSeq` does on the backend, with the re-anchoring hazard
+invariant 11 spends four paragraphs on. Not done, and not an oversight.
+
 **One transaction per path per batch, not one per delta.** SQLite defaults to
 `synchronous=FULL`, so every commit fsyncs the WAL, and `Store.Open` holds
 `MaxOpenConns` at 1: a five hundred delta backlog was five hundred fsyncs with
@@ -718,6 +730,25 @@ portal. `store.AddUsageBatch` writes the rows and the watermark in one
 transaction, which also replaces the `stalled` map the per-delta loop needed: if
 one delta in a path's batch cannot be written, none of them is and the watermark
 does not move, so the backend resends the lot.
+
+`Store.AddUsage` is a batch of one rather than a second copy of that SQL, and
+that is a testing property as much as a tidiness one. For one commit it held its
+own copy, which made it the method every test in `internal/store` drove and the
+method nothing in production called: the saturating upsert, the floor under it
+and the `usage_samples` insert the portal's graph reads back were all pinned on
+a dead path, and dropping any of them from the live one left the suite green.
+`Engine.AddUsage` has the same shape for the same reason, and `addUsageBatch` is
+unexported because `usageSample` is - an exported method taking a type no other
+package can construct advertises a boundary that does not exist.
+
+**`quota.Location` memoises, and the reason is the batching above.**
+`time.LoadLocation` does not cache: it re-opens and re-parses the zoneinfo entry
+every call, about fifty microseconds. That was invisible at once per path per
+quota refresh and stopped being invisible the moment a batch became one
+transaction, because `PeriodBounds` is called per delta - five hundred tzdata
+parses on the control read loop, which cannot answer a ping while it works. It
+was by a wide margin the most expensive thing left in a loop the batching change
+had just hoisted the cheap thing out of.
 
 What neither bounds is a sequence that has gone *backwards*, and that hole is
 open. A backend that loses `meter-state.json` restarts at 1, every delta is at
@@ -2423,6 +2454,11 @@ where a subtle regression would be invisible in production until an outage:
 - `store/perms_test.go` - the database and its journal carry no group or world
   bits. They hold live session tokens, so this is the file mode standing
   between a local account and the portal.
+- `store/usage_saturation_test.go` also drives `AddUsageBatch` directly, ceiling
+  and floor in one transaction, and reads the graph back through `UsageHistory`.
+  The other cases here go through `AddUsage`, and that only covers the live path
+  while `AddUsage` remains a batch of one; for one commit it was not, and every
+  bound in this file was being pinned on a method nothing called.
 - `store/usage_saturation_test.go` - the ledger column survives at both ends:
   forty saturated deltas leave it readable and capped rather than promoted to a
   REAL, and a negative delta neither drives it below zero nor takes the packet
@@ -2437,7 +2473,10 @@ where a subtle regression would be invisible in production until an outage:
   negative value is pinned beside it for a sharper reason: `validate` normalises
   anything at or below zero to 100 before its range check, so it saves cleanly,
   and the first version of this report fired on it with a hint saying the form
-  would refuse to save.
+  would refuse to save. And NaN, which is the trap that fix walked into: every
+  ordered comparison against it is false, so tightening the guard from `!= 0` to
+  `> 0` short-circuited before the `IsNaN` branch beside it and made the one case
+  `Metered` silently turns into 100 unreportable.
 - `agent/meter_buffer_test.go` also holds the batch's fair share: a path with
   thousands of unackable deltas at the front of the buffer cannot crowd two
   other paths out of a batch, the leftover is still filled from it so a genuine

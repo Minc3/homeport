@@ -273,67 +273,17 @@ func (s *Store) SaveConfig(cfg model.Config) error {
 // for good (the ack tells the backend to drop its copy); written second, a
 // crash has the backend resend a delta the watermark no longer filters, and
 // the same LTE bytes are billed twice.
+//
+// A batch of one, and that is not tidiness. When this held its own copy of the
+// SQL, it was the method every test in this package drove and the method
+// nothing in production called, so the bounds the batch path actually uses -
+// the saturating ledger upsert, the floor under it, the usage_samples insert
+// the portal's graph reads back - were pinned only on the dead copy. Dropping
+// the floor from the live one left the suite green.
 func (s *Store) AddUsage(pathID int, periodStart time.Time, bytes, packets int64, at time.Time, metaKey, metaValue string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Both directions, on the parameters and again on the sum below.
-	//
-	// The ceiling was here first and the floor is not symmetry for its own
-	// sake: this column accumulates, so a negative delta does not record a
-	// wrong figure for one sample, it erases usage already billed. That is the
-	// silent direction, and the one the carrier's invoice is the first news of.
-	// Engine.AddUsage clamps before it calls this, which is what makes the
-	// omission easy to miss - the guarantee was living in a caller three files
-	// away while this method advertised a bound of its own and enforced half of
-	// it. A method one call from the ledger is not the place to leave that for
-	// whoever adds the second caller, which is the reasoning saturatingAdd
-	// carries in quota for the same reason.
-	bytes = clampLedger(bytes)
-	packets = clampLedger(packets)
-	// Saturating in SQL, not merely bounded per delta by the caller.
-	//
-	// SQLite does not error on integer overflow: `bytes + excluded.bytes`
-	// silently becomes a REAL, and from then on every Scan into an int64
-	// returns "converting driver.Value type float64 to a int64". That is
-	// permanent, because the column now holds a float, and Engine.refreshQuota
-	// carries the previous verdict forward on a read error, so the path's quota
-	// freezes at whatever it last was and only editing the database clears it.
-	//
-	// A per-delta bound cannot prevent it, which is the trap: the callers bound
-	// one delta and this column accumulates them, so thirteen clamped deltas
-	// reach the overflow inside a single frame. The cap has to be on the sum.
-	//
-	// MAX(..., 0) for the same reason the parameters have a floor: the sum is
-	// where a negative would land, and a row driven below zero under-reports
-	// the month for as long as the period lasts.
-	if _, err := tx.Exec(
-		`INSERT INTO ledger (path_id, period_start, bytes, packets) VALUES (?, ?, ?, ?)
-		 ON CONFLICT(path_id, period_start) DO UPDATE SET
-		     bytes = MAX(MIN(bytes + excluded.bytes, ?), 0), packets = MAX(MIN(packets + excluded.packets, ?), 0)`,
-		pathID, periodStart.Unix(), bytes, packets, int64(MaxLedgerValue), int64(MaxLedgerValue)); err != nil {
-		return fmt.Errorf("ledger update: %w", err)
-	}
-	// The same values, so the same ceiling. This row is only ever read back
-	// through UsageHistory for the portal's graph, which made it look like the
-	// harmless half of the pair and it is not: the cap on `ledger` above bounds
-	// an accumulating column, and these rows accumulate inside a query instead.
-	if _, err := tx.Exec(
-		`INSERT INTO usage_samples (ts, path_id, bytes, packets) VALUES (?, ?, ?, ?)`,
-		at.Unix(), pathID, bytes, packets); err != nil {
-		return fmt.Errorf("usage sample: %w", err)
-	}
-	if metaKey != "" {
-		if _, err := tx.Exec(
-			`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-			metaKey, metaValue); err != nil {
-			return fmt.Errorf("usage watermark: %w", err)
-		}
-	}
-	return tx.Commit()
+	return s.AddUsageBatch(pathID, []UsageEntry{{
+		PeriodStart: periodStart, At: at, Bytes: bytes, Packets: packets,
+	}}, metaKey, metaValue)
 }
 
 // UsageEntry is one metered delta as the ledger takes it: already converted,

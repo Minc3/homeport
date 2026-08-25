@@ -1536,22 +1536,28 @@ type usageSample struct {
 // safely in the ledger - and the two cannot drift across a crash: a watermark
 // ahead of the ledger loses the bytes, one behind it double-bills a resend.
 //
-// A batch of one. Every bound and every conversion lives in AddUsageBatch, so
+// A batch of one. Every bound and every conversion lives in addUsageBatch, so
 // the exported single-delta entry point cannot come to differ from the one the
 // control channel actually uses, which is what happened to the timestamp window
 // when this method held its own copy of it.
 func (e *Engine) AddUsage(pathID int, bytes, packets int64, at time.Time, seqKey, seqVal string) error {
-	return e.AddUsageBatch(pathID, []usageSample{{Bytes: bytes, Packets: packets, At: at}}, seqKey, seqVal)
+	return e.addUsageBatch(pathID, []usageSample{{Bytes: bytes, Packets: packets, At: at}}, seqKey, seqVal)
 }
 
-// AddUsageBatch records a run of metering deltas for one path and advances that
+// addUsageBatch records a run of metering deltas for one path and advances that
 // path's dedupe watermark, all inside one transaction.
 //
 // The path is resolved once for the batch rather than once per delta. The
 // configuration is read under a lock on the control read loop, so a five
 // hundred delta batch was five hundred lock acquisitions and five hundred
-// linear scans of Paths to look up the same entry every time.
-func (e *Engine) AddUsageBatch(pathID int, samples []usageSample, seqKey, seqVal string) error {
+// linear scans of Paths to look up the same entry every time. quota.Location
+// memoises for the same reason, one layer down: PeriodBounds below is called
+// per delta and used to reparse the zoneinfo entry every time.
+//
+// Unexported, because usageSample is: an exported method taking a type no other
+// package can construct advertises a boundary that does not exist. AddUsage is
+// the exported entry point and is a batch of one.
+func (e *Engine) addUsageBatch(pathID int, samples []usageSample, seqKey, seqVal string) error {
 	e.mu.RLock()
 	p, ok := e.cfg.PathByID(pathID)
 	e.mu.RUnlock()
@@ -1645,8 +1651,15 @@ func (e *Engine) AddUsageBatch(pathID int, samples []usageSample, seqKey, seqVal
 // the same reason from the other side.
 func reportQuotaSubstitutions(log *slog.Logger, cfg model.Config) {
 	for _, p := range cfg.Paths {
+		// NaN outside the ordered test rather than inside it. Every ordered
+		// comparison against NaN is false, so `cal > 0` short-circuits and the
+		// IsNaN branch beside it is never evaluated: written as one condition,
+		// tightening the guard from `!= 0` to `> 0` silently made the NaN case
+		// unreachable, and a NaN is exactly what Metered turns into 100 with
+		// nothing said. It is the ordering trap this whole function exists to
+		// report, reintroduced inside the report.
 		cal := p.Quota.Calibration
-		if cal > 0 && (math.IsNaN(cal) || cal < quota.MinCalibration || cal > quota.MaxCalibration) {
+		if math.IsNaN(cal) || (cal > 0 && (cal < quota.MinCalibration || cal > quota.MaxCalibration)) {
 			log.Warn("stored calibration is outside the range this build accepts; billing at 100% instead",
 				"path", p.Name, "stored", cal, "billing_at", 100.0,
 				"min", quota.MinCalibration, "max", quota.MaxCalibration,

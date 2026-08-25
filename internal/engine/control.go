@@ -699,11 +699,27 @@ const (
 	// with nothing acked, which no outage reaches, while still being four
 	// orders of magnitude tighter than the absolute bound beside it.
 	//
-	// Both are needed and neither subsumes the other. This one cannot apply to
-	// the first delta a path ever sees, because there is no watermark to
-	// measure from, and refusing that one refuses the delta that starts the
-	// path's accounting - so the absolute bound covers the unanchored case,
-	// exactly as decisionSeqHorizonMs does for the agent's decision sequence.
+	// It applies to every delta, the first one a path ever sends included,
+	// where the base is zero and the ceiling is this value outright. The first
+	// version guarded it with `last > 0`, reasoning that the unanchored case had
+	// nothing to measure from and that refusing it would refuse the delta that
+	// starts a path's accounting. That handed a fresh database maxDeltaSequence
+	// as its only protection, which is the poisoned state itself. Zero is a
+	// perfectly good base: it says a path may arrive already forty years of
+	// sampling deep and no further, which is not a restriction any real backend
+	// notices. Do not put that guard back.
+	//
+	// What it bounds is one frame. base is re-read from the database at the top
+	// of every batch, so a peer sending frame after frame may advance the
+	// watermark by this much each time and reach maxDeltaSequence in about
+	// eight thousand of them. That is deliberate rather than overlooked, and it
+	// is the same line CLAUDE.md already draws for maxDeltaBytes: what keeps a
+	// hostile peer away from the ledger is KnownBackend, not these. These exist
+	// for a meter that has lost its state, and a corrupted meter-state.json
+	// emits one wrong sequence, not eight thousand escalating frames. Closing
+	// the cross-frame direction means anchoring to elapsed monotonic time the
+	// way plausibleDecisionSeq does on the backend, with the re-anchoring
+	// hazard that carries; it is not free and it is not what this is for.
 	maxSequenceJump = 1 << 27
 
 	// maxDeltaSkew is how far ahead of this host's clock a delta may be
@@ -897,7 +913,6 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	// separate transactions cost every other reader in this process.
 	pending := map[int][]usageSample{}
 	keys := map[int]string{}
-	high := map[int]uint64{}
 	// First-seen order, so the ledger is written in the order the backend sent
 	// rather than in map order.
 	order := []int{}
@@ -1008,7 +1023,6 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 		// Bounded before it is billed, not after. See checkDelta.
 		d = s.checkDelta(d, now)
 		seen[d.PathID] = d.Sequence
-		high[d.PathID] = d.Sequence
 		pending[d.PathID] = append(pending[d.PathID], usageSample{
 			Bytes: d.Bytes, Packets: d.Packets, At: time.Unix(d.AtUnix, 0),
 		})
@@ -1030,12 +1044,18 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 		if len(pending[id]) == 0 {
 			continue
 		}
-		if err := s.eng.AddUsageBatch(id, pending[id], keys[id], strconv.FormatUint(high[id], 10)); err != nil {
+		// seen[id] is the watermark this batch reached, which for a path with
+		// anything in `pending` is the last sequence it accepted. It was
+		// carried in a second map for a while, assigned the identical value on
+		// the line below its own: two maps that can only ever differ if a
+		// future edit advances one on a path the other does not take, and the
+		// direction that loses metered bytes is the silent one.
+		if err := s.eng.addUsageBatch(id, pending[id], keys[id], strconv.FormatUint(seen[id], 10)); err != nil {
 			s.log.Warn("usage batch not recorded, holding back this path's watermark",
-				"path_id", id, "deltas", len(pending[id]), "seq", high[id], "err", err)
+				"path_id", id, "deltas", len(pending[id]), "seq", seen[id], "err", err)
 			continue
 		}
-		ack.Seqs[id] = high[id]
+		ack.Seqs[id] = seen[id]
 	}
 	return ack
 }

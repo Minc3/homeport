@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"log/slog"
+	"math"
 	"strings"
 	"testing"
 
@@ -33,6 +34,12 @@ func TestAnOutOfRangeStoredCalibrationIsReportedAtLoad(t *testing.T) {
 		// twentyfold and the quota never trips.
 		{"below the floor", 5},
 		{"above the ceiling", quota.MaxCalibration + 1},
+		// Every ordered comparison against NaN is false, so a guard written as
+		// `cal > 0 && (math.IsNaN(cal) || ...)` short-circuits before the IsNaN
+		// branch is ever reached and this case goes silent. That is how
+		// tightening the zero guard broke it once already, and Metered turns a
+		// NaN into 100 without a word.
+		{"not a number at all", math.NaN()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig()

@@ -11,6 +11,7 @@ package quota
 import (
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
@@ -144,12 +145,34 @@ func Location(q model.Quota) *time.Location {
 	if q.Timezone == "" {
 		return time.UTC
 	}
+	if loc, ok := locations.Load(q.Timezone); ok {
+		return loc.(*time.Location)
+	}
 	loc, err := time.LoadLocation(q.Timezone)
 	if err != nil {
 		return time.UTC
 	}
+	locations.Store(q.Timezone, loc)
 	return loc
 }
+
+// locations memoises the zones this deployment actually uses.
+//
+// time.LoadLocation does not cache: it re-opens and re-parses the zoneinfo
+// entry on every call, which measures at about fifty microseconds. That was
+// invisible while it happened once per path per quota refresh and is not
+// invisible now that a usage batch is applied in one transaction: PeriodBounds
+// is called once per delta, so a five hundred delta backlog drain was five
+// hundred tzdata parses, synchronously, on the control read loop, which cannot
+// answer a ping while it works. It is by a wide margin the most expensive thing
+// in that loop, and the batching change hoisted the path lookup out of it while
+// leaving this behind.
+//
+// A *time.Location is immutable and safe to share. Only successful loads are
+// cached, so a zone that fails is retried rather than pinned as UTC for the
+// life of the process - web.validate refuses an unknown zone, so what reaches
+// this is a tzdata package that was not installed yet.
+var locations sync.Map
 
 // PeriodBounds returns the billing period containing now.
 //

@@ -162,8 +162,14 @@ func (m *Meter) Pending() []proto.UsageDelta {
 	return out
 }
 
-// PendingBatch returns a copy of at most n buffered deltas, oldest first, with
-// no one path allowed more than its share of them.
+// PendingBatch returns a copy of at most n buffered deltas, with no one path
+// allowed more than its share of them.
+//
+// Order is preserved *within* a path, which is what the frontend's watermark
+// requires: applyUsage takes a per-path high-water mark and skips anything not
+// strictly newer. The slice as a whole is not in buffer order, because the
+// share is taken per path - do not read it as a chronological stream. It used
+// to say "oldest first" and that is no longer the guarantee.
 //
 // The share is the whole point and a flat prefix of the buffer was the bug.
 // `pending` is one FIFO across every path, so a path whose deltas the frontend
@@ -177,13 +183,6 @@ func (m *Meter) Pending() []proto.UsageDelta {
 // The frontend's refusals are per-path and deliberate: a stalled path with an
 // Error beside it is meant to be recoverable. This is what keeps that stall
 // from being deployment-wide.
-//
-// Two passes. The first takes up to an equal share from each path, in buffer
-// order, which is what guarantees a stuck path cannot crowd the others out. The
-// second fills whatever is left over from the front, so a genuine single-path
-// backlog still drains at the full rate and the common case is unchanged.
-// Order within a path is preserved in both, because the frontend's watermark
-// requires it.
 func (m *Meter) PendingBatch(n int) []proto.UsageDelta {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -194,24 +193,49 @@ func (m *Meter) PendingBatch(n int) []proto.UsageDelta {
 		return nil
 	}
 
+	// The ordinary site takes the flat prefix it always did, and finds that out
+	// without walking the backlog. A buffer holding one path cannot starve
+	// anything, so the whole apparatus below is provably a no-op for it - and
+	// paying a 50,000 entry walk plus a 50 KB allocation every ten seconds to
+	// discover that, under the lock persist and sample also want, is worse than
+	// what it replaced. The first version of this claimed the single-path case
+	// cost "a map walk and nothing else", which was both wrong and the wrong
+	// thing to be relaxed about.
+	first := m.pending[0].PathID
+	shared := false
+	for _, d := range m.pending {
+		if d.PathID != first {
+			shared = true
+			break
+		}
+	}
+	if !shared {
+		out := make([]proto.UsageDelta, n)
+		copy(out, m.pending[:n])
+		return out
+	}
+
 	paths := map[int]bool{}
 	for _, d := range m.pending {
 		paths[d.PathID] = true
 	}
-	// One path in the buffer means the share is the whole batch, so this costs
-	// a map walk and nothing else on the ordinary site.
 	share := n / len(paths)
 	if share < 1 {
 		share = 1
 	}
 
+	// Two passes. The first takes up to an equal share from each path, in
+	// buffer order, which is what guarantees a stuck path cannot crowd the
+	// others out. The second fills whatever is left from the front, so a
+	// backlog that is mostly one path still drains at close to the full rate.
+	//
+	// Pass one always takes a contiguous prefix of each path's subsequence, so
+	// "already taken" is one index per path rather than a bitmap over the whole
+	// buffer: pass two skips an entry when its path's counter has not yet
+	// reached it.
 	out := make([]proto.UsageDelta, 0, n)
 	taken := make(map[int]int, len(paths))
-	// Which entries went in, so the second pass does not send one twice. Indexed
-	// rather than compared, because two deltas for one path are distinguishable
-	// only by sequence and the buffer is not a set.
-	used := make([]bool, len(m.pending))
-	for i, d := range m.pending {
+	for _, d := range m.pending {
 		if len(out) == n {
 			break
 		}
@@ -219,14 +243,15 @@ func (m *Meter) PendingBatch(n int) []proto.UsageDelta {
 			continue
 		}
 		taken[d.PathID]++
-		used[i] = true
 		out = append(out, d)
 	}
-	for i, d := range m.pending {
+	seen := make(map[int]int, len(paths))
+	for _, d := range m.pending {
 		if len(out) == n {
 			break
 		}
-		if used[i] {
+		seen[d.PathID]++
+		if seen[d.PathID] <= taken[d.PathID] {
 			continue
 		}
 		out = append(out, d)
