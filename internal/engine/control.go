@@ -799,6 +799,34 @@ const (
 // same constants: a change to the shape of the rule, a floor other than zero or
 // a different answer for one of the four cases, had two places to be found and
 // nothing to make the second one fail.
+// clampStamp brings a delta's timestamp inside the window, and names the
+// direction it came from.
+//
+// One definition, called from checkDelta and from Engine.addUsageBatch, for the
+// reason clampCounts is: it was written out twice in two different shapes, and
+// engine.go's own copy carried a comment saying the two had already come to
+// disagree about an overflowing stamp. A change to the window - a different age,
+// a floor other than now, a third direction - had two places to be found and
+// nothing to make the second one fail.
+//
+// The comparison is on raw seconds rather than on time.Time, and that is the
+// correct way round rather than the obvious one. time.Unix overflows at both
+// extremes and lands both in the same place: MinInt64 and MaxInt64 alike render
+// as the year 292277026596, and both compare as *before* now. A time.Time
+// comparison therefore misses MaxInt64 in the future branch entirely and catches
+// it in the past branch, reporting a stamp tens of billions of years ahead as
+// one too far in the past to bill. Seconds do not wrap.
+func clampStamp(atUnix int64, now time.Time) (int64, string) {
+	newest, oldest := now.Add(maxDeltaSkew).Unix(), now.Add(-maxDeltaAge).Unix()
+	switch {
+	case atUnix > newest:
+		return now.Unix(), "a timestamp in the future"
+	case atUnix < oldest:
+		return now.Unix(), "a timestamp too far in the past to bill"
+	}
+	return atUnix, ""
+}
+
 func clampCounts(bytes, packets int64) (int64, int64, []string) {
 	var why []string
 	if bytes < 0 {
@@ -834,23 +862,8 @@ func (s *ControlServer) checkDelta(d proto.UsageDelta, now time.Time) proto.Usag
 	out := d
 	var why []string
 	out.Bytes, out.Packets, why = clampCounts(out.Bytes, out.Packets)
-	// Both directions, compared as raw seconds against raw bounds rather than
-	// as time.Time values, and that is the correct way round rather than the
-	// obvious one.
-	//
-	// time.Unix overflows at both extremes, and it overflows to the same place:
-	// MinInt64 and MaxInt64 both render as the year 292277026596, and both
-	// compare as *before* now. So a time.Time comparison misses MaxInt64 in the
-	// future branch entirely and catches it in the past branch, which then
-	// reports a stamp tens of billions of years ahead as one too far in the
-	// past to bill, sending whoever reads the journal after the wrong fault.
-	// Seconds do not wrap, so comparing them classifies both extremes
-	// correctly and needs no reasoning about the wrap at all.
-	newest, oldest := now.Add(maxDeltaSkew).Unix(), now.Add(-maxDeltaAge).Unix()
-	if out.AtUnix > newest {
-		out.AtUnix, why = now.Unix(), append(why, "a timestamp in the future")
-	} else if out.AtUnix < oldest {
-		out.AtUnix, why = now.Unix(), append(why, "a timestamp too far in the past to bill")
+	if at, reason := clampStamp(out.AtUnix, now); reason != "" {
+		out.AtUnix, why = at, append(why, reason)
 	}
 	if len(why) == 0 {
 		return out

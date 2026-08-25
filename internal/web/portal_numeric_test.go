@@ -66,9 +66,18 @@ func TestEveryFractionalPortalInputOptsOutOfRounding(t *testing.T) {
 			"and every assertion below is passing without looking at anything", len(calls))
 	}
 
+	// Sorted once for the scan rather than rebuilt on every lookup: the set is
+	// loop-invariant, and the determinism the order buys is a property of the
+	// caller rather than something to re-establish thirty times.
+	tags := make([]string, 0, len(fractional))
+	for tag := range fractional {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
 	matched := map[string]bool{}
 	for _, call := range calls {
-		tag, ok := boundTag(call, fractional)
+		tag, ok := boundTag(call, tags)
 		if !ok {
 			// A call bound to something that is not a fractional field. It must
 			// not opt out: that is the direction that refuses the save.
@@ -241,16 +250,10 @@ func isWord(b byte) bool {
 // boundTag reports which fractional field a call assigns to, if any. It matches
 // on the assignment rather than anywhere in the call, so a placeholder or a
 // label mentioning a name is not mistaken for a binding.
-// It iterates in sorted order rather than over the map, because Go randomises
-// map iteration: a call binding two fractional fields would otherwise name a
-// different one on each run, and a failure message that changes between runs is
-// a failure message nobody trusts.
-func boundTag(call string, fractional map[string]bool) (string, bool) {
-	tags := make([]string, 0, len(fractional))
-	for tag := range fractional {
-		tags = append(tags, tag)
-	}
-	sort.Strings(tags)
+// The tags arrive sorted, because Go randomises map iteration: a call binding
+// two fractional fields would otherwise name a different one on each run, and a
+// failure message that changes between runs is a failure message nobody trusts.
+func boundTag(call string, tags []string) (string, bool) {
 	for _, tag := range tags {
 		if strings.Contains(call, "."+tag+" =") {
 			return tag, true

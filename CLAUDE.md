@@ -611,6 +611,14 @@ of it. There is no interval here to multiply a line rate by, and a bound
 derived from one would refuse exactly the delta that exists to survive a long
 outage.
 
+**The stamp window has one definition, `clampStamp`, for the reason `clampCounts`
+does.** It was written out twice in two different shapes, seconds in one and
+`time.Time` in the other, and only the seconds comparison classifies an
+overflowing `time.Unix` correctly - so the two agreed on the outcome and not on
+the reasoning, and the copy in `engine.go` carried a comment admitting they had
+already disagreed once. A change to the window had two places to be found and
+nothing to make the second one fail.
+
 **The stamp is bounded in both directions, and the past side is the one that
 happens by accident.** `AddUsage` picks the billing period from it, so a stamp
 outside the window writes the bytes to a period nothing reads while the current
@@ -856,7 +864,7 @@ upward, and the parameter check tested only the high side, so a negative delta
 decremented a column that accumulates. That does not record a wrong figure for
 one sample, it erases usage already billed, which is the silent direction and
 the one the carrier's invoice is the first news of. Nothing reached it, because
-The engine clamps first, and that is exactly what made it easy to miss:
+the engine clamps first, and that is exactly what made it easy to miss:
 the guarantee was living in a caller three files away while this method looked
 complete. `clampLedger` and `MAX(MIN(...), 0)` make it total, on the parameters
 and on the sum, for the reason `quota.saturatingAdd` carries the same note.
@@ -1245,7 +1253,8 @@ float here, because the box is in GB and its handler multiplies, so rounding it
 turns anything under half a gigabyte into 0 and 0 is how a quota is disabled.
 Where the units and the type disagree, the units win.
 
-The range half was declared and not implemented for a commit. `min` and `max` on
+The range half was declared and not implemented for a commit, and then
+implemented only where a call site happened to declare a bound. `min` and `max` on
 the element are advisory: `saveSettings` posts with `fetch`, so the browser never
 runs constraint validation, and nothing clamped - so typing 5000 into Calibration
 stored 5000 and every later save was refused, blocking unrelated edits, which is
@@ -1254,7 +1263,23 @@ the exact failure declaring the bounds was meant to close. The clamp runs on
 operator: typing "1" toward "100" in a field with a floor of 10 would snap to 10
 under their cursor. An empty box still reads as 0, and a value that parses to
 `Infinity` - a pasted 309-digit figure - goes to the field's ceiling rather than
-to 0, because 0 in a quota box is how a quota is disabled.
+to the end of the range it overflowed towards, because 0 in a quota box is how a
+quota is disabled and a pasted `-1e400` sent to the *ceiling* is Calibration
+1000, over-billing tenfold.
+
+The bounds have to be the ones `validate` actually enforces, or the clamp is
+decoration: the five probe inputs and the four quality weights declared none, so
+typing 10 into "Active interval (ms)" or 150 into "Switch margin (%)" still built
+a body the endpoint refuses. They carry `validate`'s own floors now, and the two
+quota boxes carry a ceiling of 2^30 GiB, which is `store.MaxLedgerValue` and also
+what keeps `v * GB` inside an int64.
+
+What none of this fixes is an empty box meaning zero. A cleared Overhead box
+stored 0 before this change too, because JSON `null` onto a zero field and a
+literal 0 are the same thing to Go's decoder - the comment claiming otherwise has
+been corrected. What coercion buys is that the model always holds a number, which
+is what stopped the detection hint quoting a figure for a form `validate`
+refuses. The under-billing is a separate hole and is still open.
 
 `web.TestEveryFractionalPortalInputOptsOutOfRounding` is what holds it, and it
 takes the float list from `model.Config` by reflection rather than from a copy,
@@ -2636,7 +2661,9 @@ where a subtle regression would be invisible in production until an outage:
   ok; and balancing parens without regard for string literals meant one
   unbalanced paren in a label would swallow the calls after it. It scans both
   names now, counts what it found, and requires every fractional field to have
-  been matched by something. The definition guard is `function num(` exactly, for
+  been matched by something, and `engine/usage_bounds_test.go` drives `clampStamp`
+  from both directions including the two overflowing extremes, which is the case
+  the `time.Time` shape gets backwards. The definition guard is `function num(` exactly, for
   the same reason: a forty-character lookback for `function`, `const`, `let` or a
   trailing `=` skipped real call sites, so `const autoPPS = num(...)` was
   silently outside the scan along with anything that had an unrelated `const`

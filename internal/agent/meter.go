@@ -189,22 +189,32 @@ func (m *Meter) PendingBatch(n int) []proto.UsageDelta {
 	if n > len(m.pending) {
 		n = len(m.pending)
 	}
-	if n == 0 {
+	// <= rather than ==, because the multi-path branch below reaches
+	// make([]proto.UsageDelta, 0, n), and a negative capacity panics on the
+	// report goroutine. The only caller passes a constant today; a guard that
+	// reads as covering this and stops one notch short is worse than no guard.
+	if n <= 0 {
 		return nil
 	}
 
-	// One walk to learn which paths are in the buffer, and the answer to "is
-	// there only one" falls out of it. The previous version walked once looking
-	// for a differing path id and then again to build the set, which was two
-	// passes over up to maxBuffered entries to learn the same thing.
+	// What this costs, stated once and plainly, because three earlier versions
+	// of this comment each got it wrong in the optimistic direction.
 	//
-	// The single-path branch below is the rare case, not the ordinary one, and
-	// that is the third time this comment has had to be corrected downward. The
-	// shipped configuration meters two paths, and Meter.sample emits a delta for
-	// every metered path with traffic in the same pass, so an ordinary
-	// deployment always has at least two ids buffered and always takes the
-	// shared branch. What the single-path branch is actually for is a site with
-	// one metered link, or a buffer that has drained to one path's backlog.
+	// Three passes over the buffer at worst: one to learn which paths are in it,
+	// then the share pass and the fill pass, each of which stops once it has n.
+	// At maxBuffered that is 150,000 iterations of an integer compare every ten
+	// seconds, under a lock sample and AckApplied also want, which measures in
+	// the low hundreds of microseconds. It could be made O(1) by carrying a
+	// live per-path count on the Meter, and that is not worth another invariant
+	// for sample, AckApplied and load to keep in step - the same trade
+	// quota.EvaluateIn was deleted over, at a similar size.
+	//
+	// The single-path branch is the rare case, not the ordinary one. The shipped
+	// configuration meters two paths and Meter.sample emits a delta for every
+	// metered path with traffic in the same pass, so an ordinary deployment
+	// always has at least two ids buffered and always takes the shared branch.
+	// The branch is for a site with one metered link, or a backlog that has
+	// drained to one path.
 	paths := map[int]bool{}
 	for _, d := range m.pending {
 		paths[d.PathID] = true

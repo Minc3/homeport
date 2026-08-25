@@ -1575,35 +1575,18 @@ func (e *Engine) addUsageBatch(pathID int, samples []usageSample, seqKey, seqVal
 		// happens to exist today - which is exactly how the two copies of the
 		// timestamp rule came to disagree about an overflowing stamp.
 		bytes, packets, _ := clampCounts(s.Bytes, s.Packets)
-		// The stamp too, for the reason the counts are. PeriodBounds takes
-		// whatever it is handed, and a stamp outside the window puts the bytes
-		// in a period nothing ever reads while the current one stays at zero
-		// and the quota never trips.
-		//
-		// One test for both directions, and clamped to now rather than to
-		// either edge, which is what checkDelta does with the same value. The
-		// first version of this guard clamped to now+skew and tested only
-		// at.After, so it caught nothing at all: an overflowed time.Unix
-		// compares as *before* now whichever end it came from, an ordinary
-		// stale stamp is in the past, and clamping a genuine future stamp to
-		// now+skew can still land it in the next billing period when the batch
-		// is processed near a reset day.
-		//
-		// The shape differs from checkDelta's deliberately. That one holds the
-		// raw int64 and has to name the direction in a log, so it compares
-		// seconds, which do not wrap. Here the seconds are already
-		// unrecoverable - a time.Time built from an overflowing value does not
-		// report it back - and there is no message to get right, only a value
-		// to refuse. Both extremes land on the same side of this comparison, so
-		// one test covers them.
-		at := s.At
-		if at.After(now.Add(maxDeltaSkew)) || at.Before(now.Add(-maxDeltaAge)) {
-			at = now
-		}
-		start, _ := quota.PeriodBoundsIn(p.Quota.ResetDay, loc, at)
+		// The stamp too, for the reason the counts are, and through the same
+		// single definition. PeriodBounds takes whatever it is handed, so a
+		// stamp outside the window puts the bytes in a period nothing ever
+		// reads while the current one stays at zero and the quota never trips.
+		// The reason clampStamp returns is discarded here and logged by
+		// checkDelta on the control path, which is the only path that has a peer
+		// to blame.
+		at, _ := clampStamp(s.At.Unix(), now)
+		start, _ := quota.PeriodBoundsIn(p.Quota.ResetDay, loc, time.Unix(at, 0))
 		entries = append(entries, store.UsageEntry{
 			PeriodStart: start,
-			At:          at,
+			At:          time.Unix(at, 0),
 			Bytes:       quota.Metered(bytes, packets, p.Quota),
 			Packets:     packets,
 		})

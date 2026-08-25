@@ -670,3 +670,48 @@ func TestAMultiPathBatchAcksEachPathAtItsOwnHighWaterMark(t *testing.T) {
 		}
 	}
 }
+
+// One definition of the stamp window, driven from both entry points.
+//
+// checkDelta held the rule and Engine.addUsageBatch held a second copy of it in
+// a different shape, comparing time.Time where the other compared raw seconds -
+// and only the seconds comparison classifies an overflowing time.Unix correctly,
+// because MinInt64 and MaxInt64 both render as the year 292277026596 and both
+// compare as before now. They agreed on the outcome and not on the reasoning,
+// which is the state clampCounts was extracted to end for the counts beside
+// them.
+func TestBothUsageEntryPointsShareOneStampWindow(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name string
+		at   int64
+		want string
+	}{
+		{"an ordinary stamp is untouched", now.Unix(), ""},
+		{"an hour ahead is inside the window", now.Add(30 * time.Minute).Unix(), ""},
+		{"a day ahead is not", now.Add(24 * time.Hour).Unix(), "a timestamp in the future"},
+		{"a month back is not", now.Add(-30 * 24 * time.Hour).Unix(), "a timestamp too far in the past to bill"},
+		// The two the time.Time shape gets wrong, and in opposite directions.
+		{"MaxInt64 is the future", math.MaxInt64, "a timestamp in the future"},
+		{"MinInt64 is the past", math.MinInt64, "a timestamp too far in the past to bill"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			at, reason := clampStamp(tc.at, now)
+			if reason != tc.want {
+				t.Fatalf("reason = %q, want %q", reason, tc.want)
+			}
+			if tc.want == "" {
+				if at != tc.at {
+					t.Errorf("an in-window stamp was moved from %d to %d", tc.at, at)
+				}
+				return
+			}
+			// Clamped to now rather than to either edge: clamping a future
+			// stamp to now+skew can still land it in the next billing period
+			// when the batch is processed near a reset day.
+			if at != now.Unix() {
+				t.Errorf("clamped to %d, want now (%d)", at, now.Unix())
+			}
+		})
+	}
+}

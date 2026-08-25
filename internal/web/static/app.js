@@ -1,6 +1,14 @@
 'use strict';
 
 const GB = 1024 * 1024 * 1024;
+// The largest figure a quota box may hold, in GB.
+//
+// 2^30 GiB is 2^60 bytes, which is store.MaxLedgerValue: the ledger column
+// saturates there, so a cap above it can never be reached and is not a cap. It
+// is also what keeps `v * GB` inside an int64 - without a ceiling here, a box
+// overflowed to MAX_SAFE_INTEGER multiplies to 9.67e24, which Go's decoder
+// refuses outright, and that then blocks every later save of the whole form.
+const MAX_QUOTA_GB = 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -740,10 +748,17 @@ function field(label, value, onInput, opts = {}) {
   //
   // parseFloat('') is NaN, so clearing a box passed NaN straight into the
   // config; JSON.stringify writes that as null, and Go decodes null into a
-  // numeric field as a no-op, leaving whatever the zero value is. On
-  // overhead_per_packet that is 0, which validate accepts and Metered reads as
-  // "no per-packet overhead", so every metered byte on that path is under-counted
-  // by 5 to 15% with the placeholder still suggesting 60 and nothing warning.
+  // numeric field as a no-op, leaving whatever the zero value is.
+  //
+  // Be exact about what that does and does not fix, because the first version
+  // of this comment was not. The delivered configuration is identical either
+  // way - a null onto a zero field and a literal 0 both store 0 - so clearing
+  // the Overhead box still means "no per-packet overhead" and still under-counts
+  // that path by 5 to 15%. What it buys is that the model always holds a number,
+  // so nothing downstream has to reason about a NaN leaking into arithmetic,
+  // which is how the detection hint below came to quote a figure for an
+  // unsavable form. The under-billing is a separate hole and is still open; the
+  // placeholder reading "0 = none" is the whole of what warns about it.
   //
   // The fraction is the louder half: a decimal typed into a field Go declares
   // as int fails the whole PUT with "cannot unmarshal number 60.5", so an
@@ -779,16 +794,28 @@ function field(label, value, onInput, opts = {}) {
   // 1e400 - and folding that into the same branch as an empty box wrote 0,
   // which in a quota box is how a quota is disabled and in a shape box is how
   // shaping is turned off: the silent direction, reached by a value the
-  // operator can see in front of them. It goes to the field's ceiling instead,
-  // or to MAX_SAFE_INTEGER where there is none, so it is refused loudly rather
-  // than accepted quietly.
+  // operator can see in front of them.
+  //
+  // It goes to the end of the field's own range that it overflowed towards, so
+  // it is refused or corrected rather than accepted quietly. The sign matters
+  // and the first version ignored it: -1e400 is -Infinity, and sending that to
+  // the *ceiling* turned a pasted negative into Calibration 1000, over-billing
+  // tenfold, or into a quota box with no ceiling at MAX_SAFE_INTEGER, whose
+  // `v * GB` is 9.67e24 and fails the whole PUT as an int64. clamp() below is
+  // what settles it back inside the range; this only has to pick the right end.
   const read = () => {
     const raw = input.value.trim();
     if (raw === '') return 0;
     const v = parseFloat(raw);
     if (Number.isNaN(v)) return 0;
-    if (!Number.isFinite(v)) return opts.max === undefined ? Number.MAX_SAFE_INTEGER : opts.max;
+    if (v === Infinity) return opts.max === undefined ? Number.MAX_SAFE_INTEGER : opts.max;
+    if (v === -Infinity) return opts.min === undefined ? -Number.MAX_SAFE_INTEGER : opts.min;
     return v;
+  };
+  const clamp = (v) => {
+    if (opts.min !== undefined && v < opts.min) v = opts.min;
+    if (opts.max !== undefined && v > opts.max) v = opts.max;
+    return opts.float ? v : Math.round(v);
   };
   input.addEventListener('input', () => {
     if (opts.type !== 'number') return onInput(input.value);
@@ -812,10 +839,7 @@ function field(label, value, onInput, opts = {}) {
   if (opts.type === 'number' && (opts.min !== undefined || opts.max !== undefined)) {
     input.addEventListener('change', () => {
       if (input.value.trim() === '') return;
-      let v = read();
-      if (opts.min !== undefined && v < opts.min) v = opts.min;
-      if (opts.max !== undefined && v > opts.max) v = opts.max;
-      if (!opts.float) v = Math.round(v);
+      const v = clamp(read());
       input.value = String(v);
       onInput(v);
     });
@@ -862,8 +886,8 @@ function pathRow(p) {
     el('td', {}, field('', '0x' + (p.mark || 0).toString(16), (v) => (p.mark = parseInt(v, 16) || 0), { placeholder: '0x102' })),
     el('td', {}, checkbox('', p.enabled, (v) => (p.enabled = v))),
     el('td', {}, checkbox('', p.metered, (v) => (p.metered = v))),
-    el('td', {}, num('', (p.quota.limit_bytes || 0) / GB, (v) => (p.quota.limit_bytes = Math.round(v * GB)), { float: true, step: 1, min: 0, placeholder: '60' })),
-    el('td', {}, num('', (p.quota.ceiling_bytes || 0) / GB, (v) => (p.quota.ceiling_bytes = Math.round(v * GB)), { float: true, step: 1, min: 0, placeholder: '0' })),
+    el('td', {}, num('', (p.quota.limit_bytes || 0) / GB, (v) => (p.quota.limit_bytes = Math.round(v * GB)), { float: true, step: 1, min: 0, max: MAX_QUOTA_GB, placeholder: '60' })),
+    el('td', {}, num('', (p.quota.ceiling_bytes || 0) / GB, (v) => (p.quota.ceiling_bytes = Math.round(v * GB)), { float: true, step: 1, min: 0, max: MAX_QUOTA_GB, placeholder: '0' })),
     el('td', {}, num('', p.shape.to_backend_mbit, (v) => (p.shape.to_backend_mbit = v || 0), { float: true, min: 0, step: 1, placeholder: '0 = off' })),
     el('td', {}, num('', p.shape.to_frontend_mbit, (v) => (p.shape.to_frontend_mbit = v || 0), { float: true, min: 0, step: 1, placeholder: '0 = off' })),
     el('td', {}, num('', p.quota.reset_day, (v) => (p.quota.reset_day = v), { min: 1, placeholder: '1' })),
@@ -1301,12 +1325,20 @@ function renderSettings() {
     presetNote.textContent = m ? m.note
       : 'Custom numbers. Faster detection is bought with false failovers on any link that drops bursts of packets, and each one of those '
         + 'parks players on a metered path until the failback hold-down clears. Keep the timeout above the worst round trip on the slowest link.';
-    // Mirrors ProbeConfig.DetectMs in Go. A field that is blank or not a
-    // number gives NaN here and blanks the line, rather than quoting a figure
-    // for numbers that cannot be saved.
+    // Mirrors ProbeConfig.DetectMs in Go, and blanks rather than quoting a
+    // figure for numbers that cannot be saved.
+    //
+    // It reads the boxes rather than the model to decide that. It used to rely
+    // on a blank box reaching the model as NaN, which is what parseFloat gave
+    // it; a cleared box now coerces to 0, deliberately and for reasons that
+    // have nothing to do with this line, so that test became unreachable and
+    // the hint started quoting "condemned in about 0.8s" for a form validate
+    // refuses. The isFinite guard stays for a value that is not blank and not a
+    // number.
     const p = c.probe;
+    const blank = Object.values(probeInputs).some((i) => i && i.value.trim() === '');
     const ms = (Math.max(p.fail_threshold, 1) - 1) * p.active_interval_ms + p.timeout_ms;
-    detectLine.textContent = Number.isFinite(ms)
+    detectLine.textContent = !blank && Number.isFinite(ms)
       ? `With these numbers a dead active path is condemned in about ${Math.round(ms / 100) / 10}s. Players feel a freeze of roughly that long, `
         + 'plus a moment for the switch, and a link that goes quiet for that long without being dead moves traffic too.'
       : '';
@@ -1341,32 +1373,37 @@ function renderSettings() {
     detectLine,
     el('div', { class: 'grid' },
       probeField('active_interval_ms', 'Active interval (ms)', c.probe.active_interval_ms, (v) => (c.probe.active_interval_ms = v), {
+        min: 50,
         placeholder: '250',
         help: 'How often the path currently carrying traffic is probed. Detection time is this times one less than losses-before-down, plus the timeout, '
           + 'so 250 × 7 + 800 is about 2.6 seconds. Minimum 50. Example: 250.',
       }),
       probeField('standby_interval_ms', 'Standby interval (ms)', c.probe.standby_interval_ms, (v) => (c.probe.standby_interval_ms = v), {
+        min: 50,
         placeholder: '5000',
         help: 'How often the idle paths are probed. Slower on purpose: they only need to be known-good, and on LTE every probe costs data. '
           + 'Cannot be shorter than the active interval. Example: 5000.',
       }),
       probeField('timeout_ms', 'Timeout (ms)', c.probe.timeout_ms, (v) => (c.probe.timeout_ms = v), {
+        min: 50,
         placeholder: '800',
         help: 'How long an unanswered probe waits before it counts as lost. Keep it comfortably above the worst round trip you expect '
           + 'on the slowest link, or a healthy path logs losses that are really just late replies. A reply slower than this is never measured, '
           + 'so a Max RTT above the timeout can never trip. Minimum 50. Example: 800.',
       }),
       probeField('fail_threshold', 'Losses before down', c.probe.fail_threshold, (v) => (c.probe.fail_threshold = v), {
+        min: 1,
         placeholder: '8',
         help: 'Consecutive unanswered probes before a path is condemned and traffic moves. '
           + 'One loss only makes it "suspect", which stays selectable: LTE drops the odd packet routinely and that must not move traffic. Example: 8.',
       }),
-      num('Successes before up', c.probe.recover_threshold, (v) => (c.probe.recover_threshold = v), {
+      num('Successes before up', c.probe.recover_threshold, (v) => (c.probe.recover_threshold = v), { min: 1,
         placeholder: '10',
         help: 'Consecutive good probes before a condemned path counts as healthy again. It still has to serve the failback hold-down below '
           + 'before it is given traffic back. Example: 10.',
       }),
       probeField('window_size', 'Window size', c.probe.window_size, (v) => (c.probe.window_size = v), {
+        min: 5,
         placeholder: '60',
         help: 'How many recent probes the loss, RTT and jitter figures on the dashboard are calculated over. '
           + '60 probes at 250ms is about the last 15 seconds. Minimum 5. Example: 60.',
@@ -1433,33 +1470,33 @@ function renderSettings() {
     el('p', { class: 'hint', text: 'Priority order always uses the highest-priority path that works. Best measured fallback changes one thing: once the preferred path is out, it picks whichever remaining path is measuring best rather than simply the next one down the list.' }),
     el('p', { class: 'hint', text: 'The preferred path is never second-guessed: while it is usable it keeps the traffic whatever the numbers say, and it wins the traffic back on its clean streak alone. Priority order is the cost order here, and a link that is 10ms quicker is not a reason to sit on a metered one.' }),
     el('div', { class: 'grid' },
-      num('Loss weight (ms per 1%)', q.loss_weight, (v) => (q.loss_weight = v), { float: true,
+      num('Loss weight (ms per 1%)', q.loss_weight, (v) => (q.loss_weight = v), { min: 0, float: true,
         step: 1,
         placeholder: '25',
         help: 'How many milliseconds of latency one percent of packet loss is treated as being worth. '
           + 'At 25, a link losing 1% has to be 25ms quicker just to draw level, which is right for a game server, where a clean 60ms path beats a lossy 30ms one. '
           + 'Cannot be negative.',
       }),
-      num('RTT weight', q.rtt_weight, (v) => (q.rtt_weight = v), { float: true,
+      num('RTT weight', q.rtt_weight, (v) => (q.rtt_weight = v), { min: 0, float: true,
         step: 0.1,
         placeholder: '1',
         help: 'Multiplier on average round trip in the score. 1 means one millisecond of latency counts as one point, which is what makes the score read in milliseconds. '
           + 'Cannot be negative.',
       }),
-      num('Jitter weight', q.jitter_weight, (v) => (q.jitter_weight = v), { float: true,
+      num('Jitter weight', q.jitter_weight, (v) => (q.jitter_weight = v), { min: 0, float: true,
         step: 0.1,
         placeholder: '3',
         help: 'Multiplier on jitter, how much the round trip varies. Weighted above plain latency because inconsistency is what players actually notice. '
           + 'Cannot be negative.',
       }),
-      num('Switch margin (%)', q.margin_pct, (v) => (q.margin_pct = v), { float: true,
+      num('Switch margin (%)', q.margin_pct, (v) => (q.margin_pct = v), { float: true, min: 0, max: 99,
         step: 1,
         placeholder: '25',
         help: 'How much better a candidate must score before it takes traffic off another fallback: 25 means it has to score at least 25% lower. '
           + 'The same margin applies coming back, so there is a dead zone rather than a threshold and two similar links cannot trade places on noise. '
           + 'Between 0 and 99.',
       }),
-      num('Minimum time between switches (s)', q.min_dwell_sec, (v) => (q.min_dwell_sec = v), {
+      num('Minimum time between switches (s)', q.min_dwell_sec, (v) => (q.min_dwell_sec = v), { min: 0,
         step: 30,
         placeholder: '300',
         help: 'The floor between two fallback swaps, for links genuinely taking turns being better, which is what a carrier working on a tower produces. '
