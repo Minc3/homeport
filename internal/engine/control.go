@@ -871,6 +871,23 @@ func (s *ControlServer) checkDelta(d proto.UsageDelta, now time.Time) proto.Usag
 	return out
 }
 
+// pathBatch is one path's state for the length of one usage frame.
+//
+// base is the watermark the batch began with and never moves: it is what
+// maxSequenceJump is measured against, because measuring against a value the
+// batch itself advances is not a bound at all. With the running watermark as the
+// reference, a thousand deltas each exactly at the limit are each accepted, and
+// one frame walks the watermark a thousand times the stated distance.
+//
+// seen is the running high-water mark, which deduplicates resends inside one
+// frame and becomes the watermark written to the database.
+type pathBatch struct {
+	key     string
+	base    uint64
+	seen    uint64
+	samples []usageSample
+}
+
 // applyUsage folds buffered metering deltas into the ledger and returns, per
 // path in the batch, the highest sequence now safely recorded - which is what
 // the backend needs in order to drop its buffered copies and nothing more.
@@ -890,36 +907,23 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	now := time.Now()
 	ack := proto.UsageAck{Seqs: map[int]uint64{}}
 
-	// Two watermarks per path, and the distinction is the whole of the sequence
-	// bound.
-	//
-	// base is what the database held when this batch started and never moves.
-	// It is what maxSequenceJump is measured against, because measuring against
-	// a value the batch itself advances is not a bound at all: with the running
-	// watermark as the reference, a thousand deltas each exactly at the limit
-	// are each accepted, and one frame walks the watermark a thousand times the
-	// stated distance. Eight such frames reach maxDeltaSequence, and the path is
-	// then unbillable for good - which is the outcome the bound exists to
-	// refuse, reached through the bound itself.
-	//
-	// seen is the running high-water mark, which is what deduplicates resends
-	// inside one frame. It only moves for a delta that was accepted for
-	// billing, and it is committed to the database once per path at the end.
-	base := map[int]uint64{}
-	seen := map[int]uint64{}
-	// The deltas accepted for each path, the key their watermark lives under,
-	// and the sequence that watermark becomes. Written once per path rather
-	// than once per delta: see store.AddUsageBatch for what five hundred
-	// separate transactions cost every other reader in this process.
-	pending := map[int][]usageSample{}
-	keys := map[int]string{}
+	// One record per path in the batch, rather than the six parallel maps this
+	// grew into. They were all keyed by path id and all had to be seeded and
+	// advanced together, which is the drift the commit loop's own comment argues
+	// against for two of them: a future edit that advances one on a path another
+	// does not take produces an ack and a watermark that disagree, and the
+	// direction that loses metered bytes is the silent one. A struct cannot
+	// half-exist.
+	batches := map[int]*pathBatch{}
+	// First-seen order, so the ledger is written in the order the backend sent
+	// rather than in map order.
+	order := []int{}
 	// Whether the configuration holds each id, memoised for the batch. HasPath
 	// takes the state lock and PathByID has a value receiver, so every call is a
-	// lock round trip plus a 560 byte struct copy plus a scan of Paths - and
-	// this test runs before the per-path maps below are seeded, deliberately, so
-	// it cannot ride on them. A thousand deltas across three paths was a
-	// thousand of each, on the read loop that cannot answer a ping while it
-	// works and against the lock the decision loop wants every 500ms.
+	// lock round trip plus a 560 byte struct copy plus a scan of Paths. A
+	// thousand deltas across three paths was a thousand of each, on the read
+	// loop that cannot answer a ping while it works and against the lock the
+	// decision loop wants every 500ms.
 	//
 	// The copy is a fixed 560 bytes rather than the whole deployment: Paths,
 	// Services, Linkers and the rest are slice headers, so a site with thirty
@@ -928,13 +932,15 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	// which points whoever reads it at a pointer receiver for a win that is not
 	// there. What this removes is the lock traffic and the scans.
 	//
-	// The configuration cannot change under this batch in a way that matters: Reconfigure would have to land
-	// mid-frame, and a path removed or added halfway through one is exactly as
-	// arbitrary either way.
+	// Separate from batches above rather than a field on pathBatch, because this
+	// test runs before a path's record is seeded: an id no configuration holds
+	// and no range admits is dropped before anything is read or written for it,
+	// which is the whole point of that check.
+	//
+	// The configuration cannot change under this batch in a way that matters:
+	// Reconfigure would have to land mid-frame, and a path removed or added
+	// halfway through one is exactly as arbitrary either way.
 	known := map[int]bool{}
-	// First-seen order, so the ledger is written in the order the backend sent
-	// rather than in map order.
-	order := []int{}
 
 	// Bounded in count as well as in value. The backend batches at most 500
 	// (agent.reportLoop), and nothing here enforced that: a frame is bounded
@@ -1001,19 +1007,19 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 			}
 			continue
 		}
-		if _, ok := base[d.PathID]; !ok {
+		b := batches[d.PathID]
+		if b == nil {
 			key := "usage_seq:" + strconv.Itoa(d.PathID)
 			last, _ := strconv.ParseUint(st.Meta(key), 10, 64)
-			base[d.PathID] = last
-			seen[d.PathID] = last
-			keys[d.PathID] = key
+			b = &pathBatch{key: key, base: last, seen: last}
+			batches[d.PathID] = b
 			order = append(order, d.PathID)
 			// A duplicate of something already applied is covered by the
 			// existing watermark, so the ack starts there: a batch of pure
 			// resends still tells the backend it may stop resending them.
 			ack.Seqs[d.PathID] = last
 		}
-		if d.Sequence <= seen[d.PathID] {
+		if d.Sequence <= b.seen {
 			continue
 		}
 		// The sequence bound that does the work, measured against the watermark
@@ -1035,10 +1041,10 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 		// correct value to clamp to. It shares badSeq because it shares a
 		// remediation - both send whoever reads it to meter-state.json on the
 		// backend - which is the line these counters are split on.
-		if d.Sequence-base[d.PathID] > maxSequenceJump {
+		if d.Sequence-b.base > maxSequenceJump {
 			if n := s.badSeq.take(); n > 0 {
 				s.log.Error("usage delta jumps implausibly far past this path's watermark; refusing it rather than making it the watermark",
-					"path_id", d.PathID, "seq", d.Sequence, "watermark", base[d.PathID],
+					"path_id", d.PathID, "seq", d.Sequence, "watermark", b.base,
 					"limit", uint64(maxSequenceJump), "dropped", n,
 					"hint", "accepting this would silently end this path's accounting for good; check meter-state.json on the backend")
 			}
@@ -1046,8 +1052,8 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 		}
 		// Bounded before it is billed, not after. See checkDelta.
 		d = s.checkDelta(d, now)
-		seen[d.PathID] = d.Sequence
-		pending[d.PathID] = append(pending[d.PathID], usageSample{
+		b.seen = d.Sequence
+		b.samples = append(b.samples, usageSample{
 			Bytes: d.Bytes, Packets: d.Packets, At: time.Unix(d.AtUnix, 0),
 		})
 	}
@@ -1065,21 +1071,18 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	// and the ack would tell the backend to drop it. A single transaction gives
 	// that for free.
 	for _, id := range order {
-		if len(pending[id]) == 0 {
+		b := batches[id]
+		if len(b.samples) == 0 {
 			continue
 		}
-		// seen[id] is the watermark this batch reached, which for a path with
-		// anything in `pending` is the last sequence it accepted. It was
-		// carried in a second map for a while, assigned the identical value on
-		// the line below its own: two maps that can only ever differ if a
-		// future edit advances one on a path the other does not take, and the
-		// direction that loses metered bytes is the silent one.
-		if err := s.eng.addUsageBatch(id, pending[id], keys[id], strconv.FormatUint(seen[id], 10)); err != nil {
+		// b.seen is the watermark this batch reached, which for a path with
+		// anything in samples is the last sequence it accepted.
+		if err := s.eng.addUsageBatch(id, b.samples, b.key, strconv.FormatUint(b.seen, 10)); err != nil {
 			s.log.Warn("usage batch not recorded, holding back this path's watermark",
-				"path_id", id, "deltas", len(pending[id]), "seq", seen[id], "err", err)
+				"path_id", id, "deltas", len(b.samples), "seq", b.seen, "err", err)
 			continue
 		}
-		ack.Seqs[id] = seen[id]
+		ack.Seqs[id] = b.seen
 	}
 	return ack
 }

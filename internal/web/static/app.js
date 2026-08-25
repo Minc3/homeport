@@ -773,12 +773,53 @@ function field(label, value, onInput, opts = {}) {
   // a 2.5 GB cap into 3, and anything under half a gigabyte into 0, which is
   // how a quota is disabled. That is the silent direction, so where the units
   // and the Go type disagree the units win.
+  //
+  // An empty box is 0 and an unparseable one is not. parseFloat returns
+  // Infinity for a value past Number.MAX_VALUE - a pasted 309-digit figure,
+  // 1e400 - and folding that into the same branch as an empty box wrote 0,
+  // which in a quota box is how a quota is disabled and in a shape box is how
+  // shaping is turned off: the silent direction, reached by a value the
+  // operator can see in front of them. It goes to the field's ceiling instead,
+  // or to MAX_SAFE_INTEGER where there is none, so it is refused loudly rather
+  // than accepted quietly.
+  const read = () => {
+    const raw = input.value.trim();
+    if (raw === '') return 0;
+    const v = parseFloat(raw);
+    if (Number.isNaN(v)) return 0;
+    if (!Number.isFinite(v)) return opts.max === undefined ? Number.MAX_SAFE_INTEGER : opts.max;
+    return v;
+  };
   input.addEventListener('input', () => {
     if (opts.type !== 'number') return onInput(input.value);
-    let v = parseFloat(input.value);
-    if (!Number.isFinite(v)) v = 0;
+    const v = read();
     return onInput(opts.float ? v : Math.round(v));
   });
+  // And the range, on change rather than on input.
+  //
+  // min and max on the element are advisory: saveSettings posts with fetch, so
+  // the browser never runs constraint validation, and nothing clamped. Typing
+  // 5000 into Calibration therefore stored 5000 and every later save was
+  // refused by the endpoint, blocking unrelated edits - which is the whole
+  // failure declaring the bounds was meant to close, left open in the half that
+  // was never implemented.
+  //
+  // On change rather than on input because clamping every keystroke fights the
+  // operator: typing "1" toward "100" in a field with a floor of 10 would snap
+  // to 10 under their cursor. change fires on blur or Enter, so the value is
+  // corrected once they have finished with it, and the box is rewritten so what
+  // is stored is what they can see.
+  if (opts.type === 'number' && (opts.min !== undefined || opts.max !== undefined)) {
+    input.addEventListener('change', () => {
+      if (input.value.trim() === '') return;
+      let v = read();
+      if (opts.min !== undefined && v < opts.min) v = opts.min;
+      if (opts.max !== undefined && v > opts.max) v = opts.max;
+      if (!opts.float) v = Math.round(v);
+      input.value = String(v);
+      onInput(v);
+    });
+  }
   return el('label', { class: 'field' }, caption(label, opts.help), input);
 }
 

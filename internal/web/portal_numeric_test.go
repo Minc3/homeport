@@ -164,20 +164,22 @@ func numCalls(src string) []string {
 	return out
 }
 
-// isDefinition reports whether the identifier at i is being declared rather
-// than called: `function num(`, `const probeField = (`, or a bare `= (`.
+// isDefinition reports whether the identifier at i is the helper's own
+// declaration rather than a call of it.
+//
+// Exactly one thing needs skipping, `function num(`, so it tests exactly that.
+// The previous version looked back forty characters for "function", "const",
+// "let" or a trailing "=", which skipped real call sites: `const autoPPS =
+// num(...)` matched on two counts, so the geo_auto_pps input was silently
+// outside the scan, and so was any call with an unrelated const or let within
+// forty characters ahead of it. A scanner that quietly drops call sites is the
+// failure this whole test exists to prevent, arrived at from the inside.
+//
+// probeField needs no case: its declaration is `const probeField = (`, which
+// contains no `probeField(` token at all.
 func isDefinition(src string, i int) bool {
-	head := src[max(0, i-40):i]
-	return strings.Contains(head, "function ") ||
-		strings.HasSuffix(strings.TrimSpace(head), "=") ||
-		strings.Contains(head, "const ") || strings.Contains(head, "let ")
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
+	const kw = "function "
+	return i >= len(kw) && src[i-len(kw):i] == kw
 }
 
 // matchParen finds the ')' closing the '(' at open, ignoring parens inside

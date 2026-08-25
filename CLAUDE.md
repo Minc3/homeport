@@ -792,6 +792,17 @@ the deployment's own zone on save but which `Location` reads as UTC.
 `Engine.reportQuotaSubstitutions` reports both, beside the two quota multipliers
 it already covered and for the identical reason.
 
+It reports only metered paths, and that is what keeps it worth reading rather
+than a refinement. Every value it looks at is read by `quota.Metered` and
+`quota.PeriodBounds`, and `addUsageBatch` returns before any of them for a path
+that is not metered, so nothing is being substituted because nothing is billed.
+`model.Defaults()` ships `main` unmetered with a zero-valued `Quota`, so its
+blank timezone is a value nobody chose, and reporting it put a `Warn` on every
+fresh install, on every start until somebody saved settings, telling the operator
+to install a tzdata package the binary now embeds. That is how an operator learns
+to ignore the one occurrence that means the ledger was written wrong, which is
+the argument `maxDeltaSkew` carries for the same reason.
+
 **The billing period is worked out once, inside `Evaluate`, and an `EvaluateIn`
 taking pre-computed bounds is not worth having.** There was one for a commit,
 because `Engine.refreshQuota` computes the same bounds on the statement before
@@ -845,7 +856,7 @@ upward, and the parameter check tested only the high side, so a negative delta
 decremented a column that accumulates. That does not record a wrong figure for
 one sample, it erases usage already billed, which is the silent direction and
 the one the carrier's invoice is the first news of. Nothing reached it, because
-`Engine.AddUsage` clamps first, and that is exactly what made it easy to miss:
+The engine clamps first, and that is exactly what made it easy to miss:
 the guarantee was living in a caller three files away while this method looked
 complete. `clampLedger` and `MAX(MIN(...), 0)` make it total, on the parameters
 and on the sum, for the reason `quota.saturatingAdd` carries the same note.
@@ -918,8 +929,8 @@ negative one that credits the month back. It now clamps both, saturates the
 arithmetic and refuses a negative count outright. NaN is tested before the
 ordered comparisons rather than after, because both of them are false for it:
 a NaN calibration would sail through, stay NaN through the multiply, and reach
-`int64(NaN)`, which on the deployment platform is `MinInt64`. `Engine.AddUsage`
-clamps too, because `Metered` clamps only its own copy and the raw packet count
+`int64(NaN)`, which on the deployment platform is `MinInt64`.
+`Engine.addUsageBatch` clamps too, because `Metered` clamps only its own copy and the raw packet count
 went on to the ledger's second column unchanged.
 
 An out-of-range calibration falls back to 100 rather than to the nearest edge,
@@ -1214,7 +1225,8 @@ are down, the backend is unreachable by definition - and that is precisely when
 somebody needs to see why and click "use LTE2 anyway". The frontend is in a
 datacentre on independent internet, so the portal survives a total path outage.
 
-**A portal number field rounds unless its units are fractional.** Every numeric
+**A portal number field rounds unless its units are fractional, and clamps to
+its declared range when the operator leaves it.** Every numeric
 input coerces a cleared box to zero rather than to `NaN`, which JSON writes as
 `null` and Go decodes as a no-op, and rounds unless the call site says
 `float: true`. Both directions were reachable and neither was harmless: an empty
@@ -1232,6 +1244,17 @@ rather than the Go type behind it: the two quota caps are `int64` and are still
 float here, because the box is in GB and its handler multiplies, so rounding it
 turns anything under half a gigabyte into 0 and 0 is how a quota is disabled.
 Where the units and the type disagree, the units win.
+
+The range half was declared and not implemented for a commit. `min` and `max` on
+the element are advisory: `saveSettings` posts with `fetch`, so the browser never
+runs constraint validation, and nothing clamped - so typing 5000 into Calibration
+stored 5000 and every later save was refused, blocking unrelated edits, which is
+the exact failure declaring the bounds was meant to close. The clamp runs on
+`change` rather than on `input`, because clamping every keystroke fights the
+operator: typing "1" toward "100" in a field with a floor of 10 would snap to 10
+under their cursor. An empty box still reads as 0, and a value that parses to
+`Infinity` - a pasted 309-digit figure - goes to the field's ceiling rather than
+to 0, because 0 in a quota box is how a quota is disabled.
 
 `web.TestEveryFractionalPortalInputOptsOutOfRounding` is what holds it, and it
 takes the float list from `model.Config` by reflection rather than from a copy,
@@ -2613,7 +2636,11 @@ where a subtle regression would be invisible in production until an outage:
   ok; and balancing parens without regard for string literals meant one
   unbalanced paren in a label would swallow the calls after it. It scans both
   names now, counts what it found, and requires every fractional field to have
-  been matched by something.
+  been matched by something. The definition guard is `function num(` exactly, for
+  the same reason: a forty-character lookback for `function`, `const`, `let` or a
+  trailing `=` skipped real call sites, so `const autoPPS = num(...)` was
+  silently outside the scan along with anything that had an unrelated `const`
+  within forty characters ahead of it.
 - `web/password_test.go` - a password can be changed, doing so logs out every
   other session while keeping the caller signed in, the current password is
   required, an unauthenticated request cannot change one, the local socket can

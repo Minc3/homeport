@@ -1647,6 +1647,23 @@ func (e *Engine) addUsageBatch(pathID int, samples []usageSample, seqKey, seqVal
 // the same reason from the other side.
 func reportQuotaSubstitutions(log *slog.Logger, cfg model.Config) {
 	for _, p := range cfg.Paths {
+		// Metered paths only. Every value below is read by quota.Metered and
+		// quota.PeriodBounds, and addUsageBatch returns before any of them for a
+		// path that is not metered, so nothing is substituted because nothing is
+		// billed.
+		//
+		// This is not a refinement, it is what keeps the report worth reading.
+		// model.Defaults() ships `main` unmetered with a zero-valued Quota, so a
+		// blank timezone there is not a stored value being ignored, it is a
+		// value nobody ever chose - and reporting it put a Warn on every fresh
+		// install, on every start until somebody saved settings, telling the
+		// operator to install a tzdata package this binary now embeds. A line
+		// that fires on every honest deployment is how an operator learns to
+		// ignore the one occurrence that means the ledger was written wrong,
+		// which is the argument maxDeltaSkew carries for the same reason.
+		if !p.Metered {
+			continue
+		}
 		// NaN outside the ordered test rather than inside it. Every ordered
 		// comparison against NaN is false, so `cal > 0` short-circuits and the
 		// IsNaN branch beside it is never evaluated: written as one condition,
@@ -1674,12 +1691,15 @@ func reportQuotaSubstitutions(log *slog.Logger, cfg model.Config) {
 		// is a rename between tzdata releases or a typo saved before the check
 		// existed, and a blank, which validate fills with the deployment's own
 		// zone on save but which Location reads as UTC.
-		if tz := p.Quota.Timezone; tz == "" || quota.Location(p.Quota).String() != tz {
+		// Resolved once, not three times. time.LoadLocation does not cache, which
+		// is the whole premise of hoisting it out of addUsageBatch's loop one
+		// function above, and the condition plus two log arguments was three
+		// zoneinfo parses to produce one line.
+		if tz, loc := p.Quota.Timezone, quota.Location(p.Quota); tz == "" || loc.String() != tz {
 			log.Warn("stored timezone is not one this host can resolve; billing this path in UTC instead",
-				"path", p.Name, "stored", tz, "billing_in", quota.Location(p.Quota).String(),
+				"path", p.Name, "stored", tz, "billing_in", loc.String(),
 				"hint", "the billing period turns over at UTC midnight rather than where the carrier draws it, "+
-					"and usage already recorded is under the other boundary. Set an IANA zone in the portal, "+
-					"or install tzdata on this host")
+					"and usage already recorded is under the other boundary. Set an IANA zone in the portal")
 		}
 		if o := p.Quota.OverheadPerPacket; o < 0 || o > quota.MaxOverheadPerPacket {
 			log.Warn("stored per-packet overhead is outside the range this build accepts; clamping it",

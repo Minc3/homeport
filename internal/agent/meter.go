@@ -193,38 +193,26 @@ func (m *Meter) PendingBatch(n int) []proto.UsageDelta {
 		return nil
 	}
 
-	// The ordinary site takes the flat prefix it always did. A buffer holding
-	// one path cannot starve anything, so the whole apparatus below is provably
-	// a no-op for it.
+	// One walk to learn which paths are in the buffer, and the answer to "is
+	// there only one" falls out of it. The previous version walked once looking
+	// for a differing path id and then again to build the set, which was two
+	// passes over up to maxBuffered entries to learn the same thing.
 	//
-	// What this costs on that site, stated exactly, because the last two
-	// versions of this comment both overclaimed: one walk of the backlog
-	// comparing an int per entry, and no allocation and no hashing. The walk
-	// does not end early on a single-path buffer, because what it is looking for
-	// is a path that differs and there is not one. That is the price of the
-	// guarantee below, and it is worth naming rather than rounding down to
-	// nothing: the first version said "a map walk and nothing else" while
-	// building a map and a 50,000 entry bitmap, and the second said this found
-	// its answer "without walking the backlog", which is the one thing it cannot
-	// do. Making it genuinely O(1) means carrying a live path count on the
-	// Meter, which is another invariant for sample, AckApplied and load to keep.
-	first := m.pending[0].PathID
-	shared := false
-	for _, d := range m.pending {
-		if d.PathID != first {
-			shared = true
-			break
-		}
-	}
-	if !shared {
-		out := make([]proto.UsageDelta, n)
-		copy(out, m.pending[:n])
-		return out
-	}
-
+	// The single-path branch below is the rare case, not the ordinary one, and
+	// that is the third time this comment has had to be corrected downward. The
+	// shipped configuration meters two paths, and Meter.sample emits a delta for
+	// every metered path with traffic in the same pass, so an ordinary
+	// deployment always has at least two ids buffered and always takes the
+	// shared branch. What the single-path branch is actually for is a site with
+	// one metered link, or a buffer that has drained to one path's backlog.
 	paths := map[int]bool{}
 	for _, d := range m.pending {
 		paths[d.PathID] = true
+	}
+	if len(paths) == 1 {
+		out := make([]proto.UsageDelta, n)
+		copy(out, m.pending[:n])
+		return out
 	}
 	share := n / len(paths)
 	if share < 1 {

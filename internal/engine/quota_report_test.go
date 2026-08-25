@@ -47,7 +47,12 @@ func TestAnOutOfRangeStoredCalibrationIsReportedAtLoad(t *testing.T) {
 			// report is the calibration. The shared fixture leaves Timezone
 			// blank, which no real configuration does - Defaults sets it and
 			// validate fills it - and which is itself reported, below.
+			// Metered, because the report covers only paths that bill: nothing
+			// it looks at is read for a path that does not. And a resolvable
+			// zone on every one, so the only thing this case can report is the
+			// calibration.
 			for i := range cfg.Paths {
+				cfg.Paths[i].Metered = true
 				cfg.Paths[i].Quota.Timezone = "UTC"
 			}
 			cfg.Paths[1].Quota.Calibration = tc.cal
@@ -93,6 +98,7 @@ func TestAnAcceptableStoredCalibrationIsNotReported(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig()
 			for i := range cfg.Paths {
+				cfg.Paths[i].Metered = true
 				cfg.Paths[i].Quota = tc.q
 				cfg.Paths[i].Quota.Timezone = "UTC"
 			}
@@ -131,6 +137,7 @@ func TestAnUnresolvableStoredTimezoneIsReportedAtLoad(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig()
 			for i := range cfg.Paths {
+				cfg.Paths[i].Metered = true
 				cfg.Paths[i].Quota.Timezone = "UTC"
 			}
 			cfg.Paths[1].Quota.Timezone = tc.tz
@@ -148,5 +155,40 @@ func TestAnUnresolvableStoredTimezoneIsReportedAtLoad(t *testing.T) {
 				t.Errorf("want exactly one path reported, got:\n%s", out)
 			}
 		})
+	}
+}
+
+// The shipped configuration reports nothing at all, and that is the property
+// deciding whether any of the lines above are worth reading.
+//
+// model.Defaults() ships `main` unmetered with a zero-valued Quota, so its
+// timezone is blank: not a stored value being ignored, a value nobody chose.
+// Reporting it put a Warn on every fresh install, on every start until somebody
+// saved settings, telling the operator to install a tzdata package this binary
+// now embeds. That is how an operator learns to ignore the one occurrence that
+// means the ledger was written wrong.
+func TestTheShippedConfigurationReportsNothing(t *testing.T) {
+	var buf bytes.Buffer
+	reportQuotaSubstitutions(slog.New(slog.NewTextHandler(&buf, nil)), model.Defaults())
+	if buf.Len() != 0 {
+		t.Errorf("a fresh install produced a report, and it would do so on every start:\n%s", buf.String())
+	}
+}
+
+// And an unmetered path is not reported however wrong its values are, because
+// nothing is billed for it: addUsageBatch returns before quota.Metered and
+// PeriodBounds are ever reached.
+func TestAnUnmeteredPathIsNotReported(t *testing.T) {
+	cfg := testConfig()
+	for i := range cfg.Paths {
+		cfg.Paths[i].Metered = false
+		cfg.Paths[i].Quota.Timezone = "Mars/Olympus_Mons"
+		cfg.Paths[i].Quota.Calibration = 5
+		cfg.Paths[i].Quota.OverheadPerPacket = -1
+	}
+	var buf bytes.Buffer
+	reportQuotaSubstitutions(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+	if buf.Len() != 0 {
+		t.Errorf("an unmetered path was reported, and nothing is billed for one:\n%s", buf.String())
 	}
 }

@@ -172,9 +172,14 @@ func TestOneStuckPathCannotStarveTheOthersOutOfABatch(t *testing.T) {
 	}
 }
 
-// The ordinary site, which must not pay for the fairness above. One path in the
-// buffer means the share is the whole batch, and the result has to be the same
-// flat prefix it always was.
+// A buffer holding one path must not pay for the fairness above: the share is
+// the whole batch, so the result has to be the same flat prefix it always was.
+//
+// Not the ordinary site, which is what this said for two commits. model.Defaults
+// meters two paths and Meter.sample emits a delta for every metered path with
+// traffic in one pass, so an ordinary deployment always has at least two ids
+// buffered. This covers a site with one metered link, or a backlog that has
+// drained down to one path.
 func TestASinglePathBacklogStillDrainsAsAFlatPrefix(t *testing.T) {
 	m := NewMeter(slog.New(slog.NewTextHandler(io.Discard, nil)), filepath.Join(t.TempDir(), "buf.jsonl"))
 
