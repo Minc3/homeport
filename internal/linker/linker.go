@@ -60,6 +60,12 @@ type Linker struct {
 	egressHave  []string
 	egressOK    bool
 
+	// returnOK is the same idea for the marking table: recorded only once
+	// `nft -f` has taken it, so a load that failed is retried by reconcile
+	// instead of being believed. It also gates the mark rule, which must never
+	// go in without it - see ensureReturnPath.
+	returnOK bool
+
 	// applyMu serialises the shell-outs themselves. Both the control session
 	// and the reconcile loop can reach applyEgress, and two runs interleaving
 	// would race `nft -f` against `ip rule add` for the same table.
@@ -157,18 +163,31 @@ func (l *Linker) applyEgress(ctx context.Context, cidrs []string) {
 	l.egressOK = true
 	l.mu.Unlock()
 
-	if len(cidrs) == 0 {
+	// On what was installed, not on what arrived. A push whose networks are all
+	// unusable takes the rules down, and reporting that as "installed" beside
+	// the list that was refused is the journal disagreeing with the kernel.
+	if installed := sysx.EgressNetworks(cidrs); len(installed) == 0 {
 		l.log.Info("no egress networks configured for this host; source NAT removed")
-		return
+	} else {
+		l.log.Info("egress networks installed", "networks", installed,
+			"source", l.boot.Linker.OverlayIP)
 	}
-	l.log.Info("egress networks installed", "networks", cidrs,
-		"source", l.boot.Linker.OverlayIP)
 }
 
 // installEgress does the work, and reports whether the system took it. Split
 // out so applyEgress has exactly one success path to commit on.
 func (l *Linker) installEgress(ctx context.Context, cidrs []string) error {
-	if len(cidrs) == 0 {
+	// Filtered here as well as inside the builder, so the early-out below and
+	// the rules that go in ahead of the ruleset agree with what will actually
+	// be rendered. A push whose networks are all unusable has to take the rules
+	// down, not install the mark rule and then load an empty file over a table
+	// that is already there.
+	usable := sysx.EgressNetworks(cidrs)
+	if len(usable) != len(cidrs) {
+		l.log.Warn("ignoring egress networks that are not IPv4 networks",
+			"asked", cidrs, "usable", usable)
+	}
+	if len(usable) == 0 {
 		sysx.RemoveLinkerEgressRuleset(ctx, l.runner, l.boot.Linker.BackendLAN, l.table())
 		return nil
 	}
@@ -195,7 +214,16 @@ func (l *Linker) installEgress(ctx context.Context, cidrs []string) error {
 	if err := sysx.EnsureLinkerEgressRule(ctx, l.runner, l.boot.Linker.BackendLAN, l.table()); err != nil {
 		return fmt.Errorf("install the egress mark rule: %w", err)
 	}
-	ruleset := sysx.BuildLinkerEgressRuleset(cidrs, iface, l.boot.Linker.OverlayIP, l.boot.Overlay.Subnet)
+	ruleset := sysx.BuildLinkerEgressRuleset(usable, iface, l.boot.Linker.OverlayIP, l.boot.Overlay.Subnet)
+	// Networks and an interface, so the only way back is an overlay address the
+	// generator would not render. LoadBootstrap refuses that now, and this is
+	// the second lock on the same door: an empty ruleset is a zero-byte file
+	// that `nft -f` accepts, so passing it on would latch egressOK against a
+	// table that was never created and retryEgress would never look again.
+	if ruleset == "" {
+		return fmt.Errorf("no egress ruleset could be built for overlay address %q",
+			l.boot.Linker.OverlayIP)
+	}
 	if _, err := sysx.ApplyLinkerEgressRuleset(ctx, l.runner, l.boot.StateDir, ruleset); err != nil {
 		return fmt.Errorf("load the egress source NAT: %w", err)
 	}
@@ -230,6 +258,62 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+// ensureReturnPath installs the connection-marking table and the rule that
+// depends on it, as one thing.
+//
+// Containers cannot bind the overlay address - it does not exist in their
+// namespace - so they are published by Docker DNAT and their replies come back
+// carrying the container's own address, which the source rule cannot match.
+// Marking the connection on the way in is what lets the reply be routed on the
+// way out. Costs nothing where no container is published: nothing is addressed
+// to the overlay address unless the frontend sends it.
+//
+// The table and the rule are a pair and are installed as one, which is the
+// whole reason this is a function rather than four lines in each caller.
+// Nothing sets the mark unless the table is loaded, so the rule on its own
+// selects a table for traffic that can never carry it: plumbing that reads as
+// correct in `ip rule` while the thing it serves was never built. apply used to
+// guard that and reconcile used to install the rule unconditionally, so the
+// guard lasted until the next tick and no longer.
+//
+// An empty ruleset is the same hazard as the egress one: `nft -f` loads a
+// zero-byte file without complaint, so passing it on would report success over
+// a table that was never created. LoadBootstrap refuses the address that gets
+// here, so this is the second lock on the same door rather than the only one.
+func (l *Linker) ensureReturnPath(ctx context.Context) {
+	li := l.boot.Linker
+
+	returnRules := sysx.BuildLinkerReturnRuleset(li.OverlayIP)
+	if returnRules == "" {
+		l.log.Error("cannot build return marking; containerised services published here will time out",
+			"overlay_ip", li.OverlayIP, "hint", "linker.overlay_ip is not an IPv4 address")
+		return
+	}
+	if _, err := sysx.ApplyLinkerReturnRuleset(ctx, l.runner, l.boot.StateDir, returnRules); err != nil {
+		// Left unrecorded, so reconcile comes back for it. Before this, a load
+		// that failed at boot was never retried while its rule was kept
+		// perpetually fresh, which is the pairing inverted.
+		l.log.Error("cannot install return marking; containerised services published here will time out",
+			"err", err)
+		return
+	}
+	l.mu.Lock()
+	l.returnOK = true
+	l.mu.Unlock()
+
+	if err := sysx.EnsureLinkerMarkRule(ctx, l.runner, li.BackendLAN, l.table()); err != nil {
+		l.log.Error("cannot install the return mark rule", "err", err)
+	}
+}
+
+// returnPathOK reports whether the marking table is loaded, which is what
+// decides between rebuilding it and merely keeping its rule fresh.
+func (l *Linker) returnPathOK() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.returnOK
+}
+
 // apply installs everything, unconditionally. Each step is idempotent.
 func (l *Linker) apply(ctx context.Context) {
 	ov := l.boot.Overlay
@@ -254,14 +338,7 @@ func (l *Linker) apply(ctx context.Context) {
 	// cannot match. Marking the connection on the way in is what lets the reply
 	// be routed on the way out. Costs nothing where no container is published:
 	// nothing is addressed to the overlay address unless the frontend sends it.
-	if _, err := sysx.ApplyLinkerReturnRuleset(ctx, l.runner, l.boot.StateDir,
-		sysx.BuildLinkerReturnRuleset(li.OverlayIP)); err != nil {
-		l.log.Error("cannot install return marking; containerised services published here will time out",
-			"err", err)
-	}
-	if err := sysx.EnsureLinkerMarkRule(ctx, l.runner, li.BackendLAN, l.table()); err != nil {
-		l.log.Error("cannot install the return mark rule", "err", err)
-	}
+	l.ensureReturnPath(ctx)
 
 	// Not set, only reported. On a host with one route to the internet the
 	// reverse lookup for a client address resolves to the same interface the
@@ -292,8 +369,16 @@ func (l *Linker) reconcile(ctx context.Context) {
 	if err := sysx.EnsureLinkerRule(ctx, l.runner, li.OverlayIP, li.BackendLAN, l.table()); err != nil {
 		l.log.Error("overlay policy rule missing and could not be restored", "err", err)
 	}
-	if err := sysx.EnsureLinkerMarkRule(ctx, l.runner, li.BackendLAN, l.table()); err != nil {
-		l.log.Error("return mark rule missing and could not be restored", "err", err)
+	// The rule goes back only where the table it selects is actually loaded,
+	// and an attempt that failed is retried whole. An nftables table is not
+	// lost with an interface the way a rule or a route is, so there is nothing
+	// to repair in the ordinary case and no reason to reload it every tick.
+	if l.returnPathOK() {
+		if err := sysx.EnsureLinkerMarkRule(ctx, l.runner, li.BackendLAN, l.table()); err != nil {
+			l.log.Error("return mark rule missing and could not be restored", "err", err)
+		}
+	} else {
+		l.ensureReturnPath(ctx)
 	}
 
 	// An egress install the kernel refused is retried here, because nothing

@@ -491,3 +491,105 @@ func TestBothRulesetsClampTCPMSSIntoTheTunnels(t *testing.T) {
 		t.Errorf("a clamp was rendered with no tunnels:\n%s", rs)
 	}
 }
+
+// The networks an agent is told to pull onto the overlay are re-parsed before
+// anything is written, and what is written is what came back from the parse.
+//
+// They arrive over the control channel, and until this existed they were
+// interpolated into the generated file unquoted and unchecked, straight into
+// `nft -f` as root. web.validate does check them, but that runs on a different
+// host at save time, so it cannot be the only check: what reaches this function
+// is whatever the peer at the far end of a socket said. A value carrying a
+// newline is not one bad rule, it is a free hand with the whole ruleset.
+func TestEgressNetworksAreReparsedBeforeTheyReachTheRuleset(t *testing.T) {
+	injected := "10.0.0.0/8 accept\n\t}\n\tchain evil {\n" +
+		"\t\ttype nat hook prerouting priority -100; policy accept;\n" +
+		"\t\ttcp dport 443 dnat to 203.0.113.9\n"
+
+	for _, tc := range []struct {
+		what string
+		rs   string
+	}{
+		{"backend", BuildBackendEgressRuleset(
+			[]string{injected, "172.18.0.0/16"}, []string{"wg-main"}, "10.99.0.2")},
+		{"linker", BuildLinkerEgressRuleset(
+			[]string{injected, "172.18.0.0/16"}, "eth0", "10.99.0.3", "")},
+	} {
+		if strings.Contains(tc.rs, "chain evil") || strings.Contains(tc.rs, "dnat to") {
+			t.Errorf("%s: injected rules reached the ruleset:\n%s", tc.what, tc.rs)
+		}
+		// The good row alongside it still goes in: nft rejects a whole table
+		// over one bad element, so refusing the batch would let one unusable
+		// network take a working ruleset down with it.
+		if !strings.Contains(tc.rs, "ip saddr 172.18.0.0/16") {
+			t.Errorf("%s: the usable network was dropped with the bad one:\n%s", tc.what, tc.rs)
+		}
+	}
+}
+
+// A network the parse cannot use is dropped, and a batch with nothing usable in
+// it renders nothing at all - which is what makes the callers take the rules
+// down rather than load an empty file over a table that is already there.
+func TestEgressNetworksDropsWhatNftCouldNotLoad(t *testing.T) {
+	for _, bad := range []string{
+		"", "  ", "not-a-network", "172.18.0.0", "2001:db8::/32", "::ffff:172.18.0.0/120",
+	} {
+		if got := EgressNetworks([]string{bad}); len(got) != 0 {
+			t.Errorf("%q should not have survived, got %v", bad, got)
+		}
+		if rs := BuildBackendEgressRuleset([]string{bad}, []string{"wg-main"}, "10.99.0.2"); rs != "" {
+			t.Errorf("%q rendered a ruleset:\n%s", bad, rs)
+		}
+		if rs := BuildLinkerEgressRuleset([]string{bad}, "eth0", "10.99.0.3", ""); rs != "" {
+			t.Errorf("%q rendered a linker ruleset:\n%s", bad, rs)
+		}
+	}
+}
+
+// Re-rendering must not move a single byte for a network the portal accepted,
+// or every existing deployment gets a diff in a file where nothing was meant to
+// change. web.parseIPv4Network already normalises to exactly this form.
+func TestEgressNetworksLeavesAnAcceptedNetworkAlone(t *testing.T) {
+	in := []string{"172.18.0.0/16", "10.0.0.0/8", "192.168.1.0/24", "203.0.113.5/32"}
+	got := EgressNetworks(in)
+	if len(got) != len(in) {
+		t.Fatalf("dropped a valid network: %v", got)
+	}
+	for i := range in {
+		if got[i] != in[i] {
+			t.Errorf("network %d was rewritten: %q -> %q", i, in[i], got[i])
+		}
+	}
+	// A host part, which the portal masks off on save, is masked here too
+	// rather than passed through as typed.
+	if got := EgressNetworks([]string{"172.18.0.5/16"}); len(got) != 1 || got[0] != "172.18.0.0/16" {
+		t.Errorf("a host-part network should render as its network address, got %v", got)
+	}
+}
+
+// The overlay address in a generated ruleset gets the same treatment the
+// networks do, because on the backend it comes from the same place: the pushed
+// configuration. It was the quiet half of the same problem, rendered with %s
+// beside the loud one.
+func TestTheOverlayAddressIsReparsedToo(t *testing.T) {
+	for _, bad := range []string{
+		"", "10.99.0.2 counter\n\tchain evil {", "not-an-address", "10.99.0.0/24", "2001:db8::1",
+	} {
+		if got := AddressLiteral(bad); got != "" {
+			t.Errorf("AddressLiteral(%q) = %q, want nothing usable", bad, got)
+		}
+		if rs := BuildBackendEgressRuleset([]string{"172.18.0.0/16"}, []string{"wg-main"}, bad); rs != "" {
+			t.Errorf("overlay %q rendered a ruleset:\n%s", bad, rs)
+		}
+		if rs := BuildLinkerEgressRuleset([]string{"172.18.0.0/16"}, "eth0", bad, ""); rs != "" {
+			t.Errorf("overlay %q rendered a linker ruleset:\n%s", bad, rs)
+		}
+		if rs := BuildLinkerReturnRuleset(bad); rs != "" {
+			t.Errorf("overlay %q rendered a linker return ruleset:\n%s", bad, rs)
+		}
+	}
+	// And an address that is fine is not moved by a byte.
+	if got := AddressLiteral("10.99.0.2"); got != "10.99.0.2" {
+		t.Errorf("a good address was rewritten to %q", got)
+	}
+}

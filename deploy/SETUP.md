@@ -764,14 +764,31 @@ sudo nft insert rule ip filter DOCKER-USER ip saddr 10.99.0.0/24 accept
 
 ## 15. Updating a host
 
-Re-run its install script. Order does not matter, and no arguments are needed:
-an existing bootstrap file is left alone.
+Re-run its install script. No arguments are needed: an existing bootstrap file
+is left alone.
+
+**Upgrade the backend first and the frontend straight after.** The wire version
+is 2 and hosts do not interoperate across it, so there is a window between the
+two in which the frontend measures 100% loss on every path. The order is what
+decides whether the journal explains that window or misdirects you: only the
+newer host can recognise the older one's probes as a version mismatch rather
+than as a failed authentication. A backend upgraded first logs `dropping probes
+from a different wire version; upgrade both hosts to the same build`, which is
+the truth. A frontend upgraded first leaves the old backend reporting a bad
+shared secret for the whole window, sending you to check the one thing that is
+fine.
+
+Three dead paths in the portal during the gap are that, not a fault, and not a
+reason to reach for `revert`: the dead-man behaviour keeps the installed route
+where it is and published traffic carries on over whichever tunnel was already
+active. Linkers can follow at leisure - an un-upgraded one keeps routing what it
+was already routing and simply receives no egress pushes until it is updated.
 
 ```sh
 cd /path/to/homeport && git pull
-sudo ./deploy/install-frontend.sh          # datacentre box
-sudo ./deploy/install-backend.sh           # box at the house
-sudo ./deploy/install-linker.sh            # each extra host, if any
+sudo ./deploy/install-backend.sh           # box at the house, first
+sudo ./deploy/install-frontend.sh          # datacentre box, straight after
+sudo ./deploy/install-linker.sh            # each extra host, at leisure
 ```
 
 Do not copy the binary over the running one by hand. The scripts install

@@ -66,6 +66,21 @@ make deploy-backend  BACKEND_HOST=root@home
 make deploy-linker   LINKER_HOST=root@gs1     # one host at a time
 ```
 
+**The wire version is 2, and hosts do not interoperate across it.** The probe
+MAC and the control handshake are domain separated (see §6), so an older
+frontend's probes do not authenticate against a newer backend and neither
+half of the handshake matches. Upgrade the backend first and the frontend
+straight after: only the newer host can recognise the older one's probes as a
+version mismatch rather than as a failed authentication, so that order puts the
+accurate message on the host doing the reporting (`deploy/SETUP.md` §15 shows
+both). In the window between them the frontend measures 100% loss on every path, the
+dead-man behaviour keeps the installed route where it is, and published traffic
+carries on over whichever tunnel was already active. Three dead paths in the
+portal during an upgrade is that, not a fault, and it is not a reason to reach
+for `revert`. Linkers can follow at leisure: an un-upgraded one keeps routing
+what it was already routing and simply receives no egress pushes until it is
+updated.
+
 Rolling back goes host by host, in this order (see invariant 8):
 
 ```sh
@@ -363,6 +378,125 @@ the frontend decided "switch to LTE1" and sent that over TCP, the message would
 travel across the path that just died. Probes go out all three tunnels
 continuously, so the decision arrives over whatever still works. The monotonic
 `DecisionSeq` stops a reordered probe from rewinding it.
+
+**Both ends of the control channel prove themselves, and a dialling agent acts
+on nothing until the frontend has.** The handshake used to be one-sided: the
+frontend challenged whoever dialled in, and the dialler never challenged back.
+The reasoning was that the channel runs inside WireGuard, and for the backend
+that holds, because its connection enters the tunnel on its own host. It does
+not hold for a linker. A linker reaches the frontend by routing through the
+backend as an ordinary LAN neighbour (`from <overlay> lookup <table>`, default
+via the backend), so the first hop is plaintext TCP on somebody's office
+network and only becomes WireGuard when the backend forwards it. Anything on
+that segment could answer in the frontend's place, with no shared secret at
+all, and what it would then be believed about is `LinkerConfig.EgressCIDRs` -
+rules the linker loads into nftables as root.
+
+`proto.SignAuth` and `proto.SignAuthAck` are the two halves. Both cover both
+nonces, so neither end can choose the whole preimage, and they carry different
+labels so the cheapest attack on a two-sided handshake - reflecting the
+dialler's own proof back at it - does not work. The dialler checks the
+frontend's half before it sends its `Hello`, so a peer that cannot prove itself
+is not even told which overlay address the host holds.
+
+**And the handshake alone is not enough, which is the part worth reading
+twice.** It proves who the peer is at connect time and says nothing about who
+is writing down the socket afterwards. The attacker above does not have to
+impersonate the frontend: from the same position it can *relay* the handshake
+to the real one, let both ends satisfy each other, and then send frames of its
+own. Mutual authentication without per-frame authentication would have moved
+the attack, not stopped it, and would have read in the diff as a fix.
+
+`proto.Session` is what closes it. Every frame after the handshake carries a
+MAC under a key derived from the pre-shared key and both nonces. A relay cannot
+alter either nonce without breaking the handshake MACs, so it is forced to hand
+both ends the same transcript, which means both ends derive the same key and
+the relay - holding no pre-shared key - derives nothing. Each direction has its
+own label, so a frame cannot be turned round at its sender, and its own counter,
+checked exactly rather than as a floor: the transport is TCP, so a gap is not
+late delivery, it is a frame somebody removed. What is left to an on-path
+attacker is dropping frames, which is what cutting the cable already did.
+
+`Session.WriteFrame` takes a lock across the counter and the write together,
+and that is load-bearing rather than tidy: both the frontend and the backend
+write from two goroutines (`pushLoop` beside the read loop's pong and usage
+ack), and a sequence number that reached the wire out of order would be read as
+tampering by a peer checking it exactly.
+
+It sets the write deadline itself, inside that lock, and the callers no longer
+do. Serialising the writes made a caller-side deadline wrong twice over: a
+goroutine that set one and then waited out another's stalled write arrived at
+the socket with the time already spent and failed instantly, and two goroutines
+setting a deadline on one connection were overwriting each other's regardless,
+because a deadline belongs to the connection and not to the write. The three
+handshake frames still set their own - they are written from one goroutine,
+before any session exists.
+
+**Everything this key authenticates carries a label, because two of them used
+to be the same function.** The probe MAC covers the first 50 bytes of the
+packet; the handshake MAC covered a nonce string the peer supplied. Same key,
+nothing to say which was which. So a peer that could get a challenge answered
+could send a probe body as the nonce and be handed a valid probe MAC instead -
+and a probe body is entirely reachable from a JSON string, because every field
+can be chosen to land below 0x80, `DecisionSeq` included at up to
+`0x7f7f7f7f7f7f7f7f`, which beats the millisecond wall-clock seed by six orders
+of magnitude. The forged probe pins the backend's reply path to a tunnel of the
+attacker's choosing and no later decision can move it. `probeLabel`,
+`controlLabel` and `controlAckLabel` are the fix; `controlMAC` also refuses a
+nonce that is not the exact shape `RandomNonce` produces, so there is no chosen
+preimage to reason about in the first place. A new use of this key gets its own
+label, and no label is ever a prefix of another.
+
+Both changes are wire breaks, which is why `proto.Version` is 2. `Unmarshal`
+reports a version mismatch as `ErrProbeVersion` rather than folding it into
+`ErrBadProbe`, and the responder logs it separately: the two faults send an
+operator to look at completely different things, and "check that the shared
+secret is identical" during a staged upgrade is the one thing that is fine.
+
+**A network pushed down the control channel is re-parsed before it is written,
+and what is written is what came back from the parse.** `sysx.EgressNetworks`
+does it for `BuildBackendEgressRuleset` and `BuildLinkerEgressRuleset` alike.
+`web.validate` already checks these, but that runs on a different host at save
+time, so it cannot be the only check: what reaches the generator is whatever
+the peer at the far end of a socket said. They were interpolated with `%s`,
+unquoted, into a file loaded by `nft -f` as root, and a value carrying a
+newline is not one bad rule but a free hand with the whole ruleset - a chain of
+its own, a `dnat`, anything nft will load. Re-rendering rather than passing the
+accepted string through is the half that makes it a boundary rather than a
+filter: there is then no path by which an unexamined byte reaches the file.
+`sysx.AddressLiteral` is the same treatment for the overlay address beside them,
+which on the backend comes from the same pushed configuration and was the quiet
+half of the same problem. It moves nothing for a configuration the portal
+accepted, because `web.parseIPv4Network` already normalises to exactly this. A bad entry is
+dropped rather than failing the batch, matching `mergeCIDRs`, because nft
+rejects a whole table over one element and one unusable network must not take a
+working ruleset down with it. The callers key their "nothing to install" branch
+on what survives the parse, not on what arrived, or the mark rule goes in with
+an empty ruleset behind it - which is the leak the rules-before-ruleset
+ordering exists to prevent.
+
+**And the third field on that message needed it too, which took a second pass to
+notice.** `Overlay.Subnet` rides the same push as the networks and the address,
+and it was still reaching the generated rules with a bare `%s` in
+`BuildLinkerEgressRuleset` and, worse, reaching `nft insert rule` as an argv
+element in `EnsureOverlayForwardExceptions`. A separate argv element is not the
+protection it looks like: nft joins its own argv and re-lexes the result, so a
+space in that value is a new rule token and a semicolon is a new rule, loaded
+into `DOCKER-USER` as root. `sysx.NetworkLiteral` is the single-network half of
+`EgressNetworks` and both now go through it. The two callers differ in what they
+do with a value it refuses, and deliberately: the generator drops the subnet and
+emits exactly what a site with no subnet gets, because one unusable value must
+not reject a whole table, while the forward exceptions return an error, because
+there is nothing left to install and the linker's control channel does not come
+up without them. Host bits are masked rather than refused, matching
+`web.parseIPv4Network` and the list beside it - nft answers `10.99.0.5/24` with
+"Address has host bits set" and rejects the table with it.
+
+The value is bootstrap-owned rather than operator-editable, so this is a
+robustness boundary rather than a live hole once the handshake is mutual: what
+reaches it is a typo, not an attacker. That is not a reason to leave it, because
+the typo is the reachable case and `model.LoadBootstrap` was admitting it - see
+§9.
 
 **DNAT only, never SNAT.** Leaving the source address alone is the whole reason
 srcds and the web server see real client IPs - for UDP as well as TCP, which no
@@ -1525,7 +1659,40 @@ carries the shared secret, the overlay addressing, and the two things the
 frontend has no way to discover: this host's own overlay address and the
 backend's address on the local network. `LoadBootstrap` refuses a linker config
 missing either, because an agent that starts with neither installs a rule for
-traffic that will never arrive and reports itself perfectly healthy.
+traffic that will never arrive and reports itself perfectly healthy. It refuses
+one that does not *parse* for a sharper version of the same reason: both
+addresses end up in generated nftables rules, and a generator handed an address
+it cannot use renders nothing at all. An empty ruleset is a zero-byte file that
+`nft -f` loads without complaint, so a typo bought a linker that started, logged
+its egress networks as installed, and had no table. The agents check the same
+thing again where they build (`sysx.AddressLiteral`, and the empty-ruleset guard
+in `Linker.installEgress`), because an empty file is not self-announcing and a
+caller that passes one on reports success.
+
+**"Parses" means what the generators can actually use, which is narrower than
+`net.ParseIP`.** Every one of them is IPv4 only, so an IPv6 address parsed
+perfectly, passed the check, and then rendered nothing - the check was catching
+the typo that does not parse and missing the one that parses into something
+unusable, which is the same silent-empty-ruleset failure it was written to
+prevent. `model.ipv4Literal` and `model.ipv4Network` are what it uses now, and
+the normalised form is stored back into the `Bootstrap`, so what the generators
+see is what was checked. They mirror `sysx.AddressLiteral` and
+`sysx.NetworkLiteral` by hand because `sysx` imports `model` and the dependency
+cannot run the other way; if the rule moves in one, move it in the other.
+
+**The marking table and its mark rule go in as a pair, in both writers.**
+Nothing sets that mark unless the table is loaded, so the rule on its own
+selects a table for traffic that can never carry it: plumbing that reads as
+correct in `ip rule` while the thing it serves was never built. Guarding that in
+`apply` alone was worth nothing, because `reconcile` installed the rule
+unconditionally on its next tick, so the guard held for ten seconds. The inverse
+was the worse half of the same gap: `reconcile` never retried the *table*, so a
+load that failed at boot was never reinstalled while its rule was kept
+perpetually fresh. `Linker.ensureReturnPath` is the single writer both call, and
+`returnOK` is recorded only once `nft -f` has taken it, exactly as `egressOK` is
+- so a refused load is retried rather than believed. `reconcile` reloads nothing
+when that flag is set: an nftables table is not lost with an interface the way a
+rule or a route is, so there is nothing to repair in the ordinary case.
 
 ---
 
@@ -1638,8 +1805,34 @@ where a subtle regression would be invisible in production until an outage:
   clamping, metered-byte reconstruction, grants expiring by time and by bytes,
   ceiling overriding a grant.
 - `proto/proto_test.go` - round trip, and rejection of wrong keys, tampering,
-  wrong sizes and replayed challenges.
+  wrong sizes and replayed challenges. Also the two properties the handshake
+  exists for: that the dialler's proof and the frontend's are not
+  interchangeable, so reflecting one back is not enough; and that the handshake
+  cannot be talked into signing a probe, pinned twice over - the nonce shape is
+  refused before the key is touched, and each MAC is checked against the bare
+  HMAC it used to be. `agent/shutdown_test.go` holds the other end of it: a
+  session is refused, and the hello never goes out, against a peer with no
+  proof, a made-up MAC, a proof under the wrong key, and the dialler's own
+  proof reflected back. And the session the handshake establishes: a relay that
+  passed the handshake through, so it holds both nonces and no key, cannot write
+  a frame either end will read; a frame cannot be reflected at its sender,
+  replayed, reordered or relabelled; and a frame with no MAC at all is refused.
+  `engine/linker_session_test.go` holds the frontend's end of that over a real
+  socket, which is what proves the server actually reads through the session
+  rather than beside it. Back in `proto/proto_test.go`, that every frame gets
+  its own write deadline, which is what stops a writer queued behind a stalled
+  one reaching the socket with the time already spent.
 - `sysx/nft_test.go` - the published ruleset never masquerades; atomic replace;
+  a pushed egress network carrying nftables syntax and a newline never reaches
+  the generated file while the usable network beside it still does, a network
+  the parse cannot use renders nothing at all rather than an empty ruleset over
+  a table that is already loaded, and one the portal accepted is not moved by a
+  byte; the overlay address beside them gets the same treatment, so a generator
+  handed one it cannot parse renders nothing rather than a file with it in;
+  `linker/linker_test.go` holds that a push with nothing usable in it takes the
+  rules down instead of installing the mark rule, and that an install which
+  would render no ruleset at all is not recorded as applied, so the retry that
+  exists for a refused install still covers it;
   both mode-gated tables clamp the TCP MSS on SYNs leaving by a tunnel, scoped
   to the tunnels, and render no clamp with no tunnels;
 - `linker/linker_test.go` also holds that the egress rules go in before the
@@ -1813,7 +2006,10 @@ where a subtle regression would be invisible in production until an outage:
   kept whenever the table could not be confirmed clean. The stray rule is the
   only evidence the table was ever this system's, so it is the marker the next
   reconcile tick retries from; deleting it first would turn any failure in the
-  gap into a permanent, invisible misroute.
+  gap into a permanent, invisible misroute. And the subnet's own re-parse: one
+  the generator cannot use is dropped, leaving exactly the ruleset a site with
+  no subnet gets rather than a table nft would reject whole, while one carrying
+  host bits is masked so the overlay rules a linker needs are still emitted.
 - `agent/revert_test.go` - the backend takes down what it installed: both return
   sources, the mark rule, the marking and egress tables, the routes to extra
   hosts, the probe tables and the overlay route; that it deletes table 100's
@@ -1829,7 +2025,11 @@ where a subtle regression would be invisible in production until an outage:
   agent writes no sysctls, and it loads exactly one nftables table of its own
   which never translates an address. Also that marking happens before dstnat and
   only in the original direction, which is what makes it match the overlay
-  address rather than the container's.
+  address rather than the container's. And the return path's pairing, in both
+  writers: reconcile withholds the mark rule while the table it selects is not
+  loaded, retries a table the kernel refused, and reloads nothing once one is
+  in - the three cases that were a guard in `apply` undone by `reconcile` a tick
+  later, and a refused load nothing ever came back for.
 - `engine/linker_registry_test.go` - each linker receives only its own networks,
   an unowned row never leaks to one, nothing is pushed while the egress master
   switch is off, only configured linkers are accepted, and a configured host
@@ -1840,7 +2040,23 @@ where a subtle regression would be invisible in production until an outage:
   still being understood as the backend.
 - `sysx/forward_test.go` - the Docker forward exceptions widen when the overlay
   subnet is set, leave an already-correct chain alone, and never touch a rule
-  they do not own.
+  they do not own. Also that the prefix is re-parsed before it is handed to
+  `nft`: a value carrying a second rule, a bare address or the wrong family is
+  refused with nothing inserted, while one that is a network written untidily is
+  normalised and installed. nft joins its own argv and re-lexes it, so a
+  separate argv element is not the protection it looks like.
+- `model/bootstrap_test.go` - an address that is present but is not an address
+  is refused at load: a hostname, a typo, a network where an address belongs.
+  And the narrower rule the generators actually impose: an address that parses
+  but is not IPv4 is refused too, for the overlay pair and the linker pair
+  alike, because that one used to pass and then render nothing; a subnet
+  carrying host bits is masked rather than refused, since nft rejects the whole
+  table over the unmasked form; and an absent subnet is still left empty, which
+  is invariant 19.
+  The linker's two, and the overlay pair on every role, since all of them reach
+  a generator that answers an unparseable address with an empty file. A config
+  naming none of them still loads on its defaults, so the check cannot become a
+  reason to write them out.
 - `web/linker_config_test.go` also covers the routing table: out of range,
   colliding with a table this system uses at the far end, and zero meaning the
   default.
@@ -1858,7 +2074,14 @@ where a subtle regression would be invisible in production until an outage:
   frontend or backend, no publishing to an address no linker holds.
 - `engine/linker_push_test.go` - only enabled linkers reach the backend, and a
   site with none sends nothing.
-- `agent/agent_test.go` - observe mode loads no nftables table: the marking
+- `agent/agent_test.go` - an overlay address the generator cannot use leaves the
+  egress rules alone rather than removing them, because an empty ruleset means
+  two different things and only one of them is an instruction; an empty network
+  list still removes them, which is the case that branch must not break. The
+  same fault reached through the other input: a push where no network survives
+  the parse renders that same empty ruleset, and it leaves the rules alone too,
+  while one usable entry beside a bad one is still installed. Also
+  observe mode loads no nftables table: the marking
   table's file is written, `nft -f` is not run, the return-mark rule still goes
   in as plumbing, and arming loads it.
 - `model/defaults_test.go` - the shipped service rows are this deployment's

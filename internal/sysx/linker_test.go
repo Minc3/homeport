@@ -700,3 +700,46 @@ func TestLinkerRouteViaReportsATableThatNeverExistedAsNoRoute(t *testing.T) {
 		t.Error("an unrelated ip failure was read as an empty table")
 	}
 }
+
+// The networks and the overlay address in this generator are re-parsed and
+// re-rendered before they reach the file; the subnet beside them was still
+// going in with a bare %s. It is not a filtered list that can drop one bad
+// entry and keep the rest - it is a lone value, and nft rejects the whole table
+// over it, taking the mark chain and the source NAT down together. The mark
+// rule is installed before this runs, so the result is container traffic marked
+// into a table with no ruleset behind it, which is the leak the rules-before-
+// ruleset ordering exists to prevent.
+func TestLinkerEgressDropsASubnetNftCouldNotLoad(t *testing.T) {
+	for name, subnet := range map[string]string{
+		"injected rule": "10.99.0.0/24 }\n\tchain evil {",
+		"wrong family":  "2001:db8::/32",
+		"not a network": "garbage",
+	} {
+		rs := BuildLinkerEgressRuleset([]string{"172.18.0.0/16"}, "eth0", "10.99.0.3", subnet)
+		if rs == "" {
+			t.Errorf("%s: an unusable subnet must not take the whole ruleset down", name)
+			continue
+		}
+		if strings.Contains(rs, subnet) {
+			t.Errorf("%s: the raw subnet reached the generated file:\n%s", name, rs)
+		}
+		// What is left is exactly what a site with no subnet gets, which is a
+		// working ruleset rather than a rejected one.
+		if want := BuildLinkerEgressRuleset([]string{"172.18.0.0/16"}, "eth0", "10.99.0.3", ""); rs != want {
+			t.Errorf("%s: want the no-subnet ruleset, got:\n%s", name, rs)
+		}
+	}
+}
+
+// The other direction: a subnet that is a network but carries host bits is
+// masked rather than dropped, so the overlay rules a linker needs are still
+// emitted. nft would have rejected the table over the unmasked form.
+func TestLinkerEgressMasksHostBitsOffTheSubnet(t *testing.T) {
+	rs := BuildLinkerEgressRuleset([]string{"172.18.0.0/16"}, "eth0", "10.99.0.3", "10.99.0.5/24")
+	if !strings.Contains(rs, "ip daddr 10.99.0.0/24") {
+		t.Fatalf("want the masked subnet in the overlay rules:\n%s", rs)
+	}
+	if strings.Contains(rs, "10.99.0.5/24") {
+		t.Fatalf("the unmasked subnet reached the file:\n%s", rs)
+	}
+}

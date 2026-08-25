@@ -2,6 +2,7 @@ package linker
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -12,14 +13,24 @@ import (
 )
 
 // fakeRunner records every command and answers reads from a canned table.
+//
+// fails makes a matching command return an error, which is how a load the
+// kernel refused is staged: the retry paths exist for exactly that and cannot
+// be reached by leaving a reply out.
 type fakeRunner struct {
 	replies map[string]string
+	fails   []string
 	calls   []string
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
 	cmd := name + " " + strings.Join(args, " ")
 	f.calls = append(f.calls, cmd)
+	for _, bad := range f.fails {
+		if strings.Contains(cmd, bad) {
+			return "", errors.New("refused: " + bad)
+		}
+	}
 	if out, ok := f.replies[cmd]; ok {
 		return out, nil
 	}
@@ -386,7 +397,7 @@ func TestAFailedEgressInstallIsRetriedRatherThanRemembered(t *testing.T) {
 	l := testLinker(t, f)
 
 	l.applyEgress(context.Background(), []string{"172.18.0.0/16"})
-	if f.ran("nft -f") {
+	if f.ran("linker-egress.nft") {
 		t.Errorf("a ruleset was loaded with no interface to scope it to; calls were %v", f.calls)
 	}
 	if l.egressOK {
@@ -399,7 +410,7 @@ func TestAFailedEgressInstallIsRetriedRatherThanRemembered(t *testing.T) {
 	f.calls = nil
 	l.reconcile(context.Background())
 
-	if !f.ran("nft -f") {
+	if !f.ran("linker-egress.nft") {
 		t.Errorf("reconcile did not retry the failed egress install; calls were %v", f.calls)
 	}
 	if !f.ran("ip rule add fwmark 0x301") {
@@ -414,7 +425,7 @@ func TestAFailedEgressInstallIsRetriedRatherThanRemembered(t *testing.T) {
 	// behind it leaves by this host's own internet, where Docker's masquerade
 	// binds the flow to that address for good. Loading the ruleset first
 	// reopened that window on every boot and every retry.
-	lookup, refusal, ruleset := f.index("ip rule add fwmark 0x301 lookup"), f.index("ip rule add fwmark 0x301 unreachable"), f.index("nft -f")
+	lookup, refusal, ruleset := f.index("ip rule add fwmark 0x301 lookup"), f.index("ip rule add fwmark 0x301 unreachable"), f.index("linker-egress.nft")
 	if lookup < 0 || refusal < 0 || ruleset < 0 || lookup > ruleset || refusal > ruleset {
 		t.Errorf("the ruleset was loaded before the rules that route what it marks; calls were %v", f.calls)
 	}
@@ -431,7 +442,7 @@ func TestAnUnchangedEgressPushCostsNothing(t *testing.T) {
 	l := testLinker(t, f)
 
 	l.applyEgress(context.Background(), []string{"172.18.0.0/16"})
-	if !f.ran("nft -f") {
+	if !f.ran("linker-egress.nft") {
 		t.Fatalf("first push did not install anything; calls were %v", f.calls)
 	}
 
@@ -443,7 +454,7 @@ func TestAnUnchangedEgressPushCostsNothing(t *testing.T) {
 
 	f.calls = nil
 	l.reconcile(context.Background())
-	if f.ran("nft -f") {
+	if f.ran("linker-egress.nft") {
 		t.Errorf("reconcile reinstalled egress that was already applied; calls were %v", f.calls)
 	}
 }
@@ -463,5 +474,143 @@ func TestReconcileLeavesEgressAloneUntilTheFrontendHasSpoken(t *testing.T) {
 		if strings.Contains(c, "failover_linker_egress") || strings.Contains(c, "0x301") {
 			t.Errorf("touched egress before being told anything about it: %s", c)
 		}
+	}
+}
+
+// A push whose networks are all unusable takes the rules down rather than
+// half-installing.
+//
+// The networks arrive over the wire, so this agent re-parses them rather than
+// trusting that the far end validated anything - see sysx.EgressNetworks. What
+// that leaves is a list which is not empty as sent and is empty as rendered,
+// and the early-out has to be keyed on the second: keyed on the first, the mark
+// rule went in, an empty ruleset was loaded over whatever table was already
+// there, and the agent logged that the networks were installed. A marked packet
+// with no ruleset behind it is the leak the ordering here exists to prevent.
+func TestAnUnusableEgressPushTakesTheRulesDown(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip route get 192.168.1.2": "192.168.1.2 dev eth0 src 192.168.1.50 uid 0",
+	}}
+	l := testLinker(t, f)
+
+	l.applyEgress(context.Background(), []string{"172.18.0.0/16"})
+	if !f.ran("linker-egress.nft") {
+		t.Fatalf("first push did not install anything; calls were %v", f.calls)
+	}
+
+	f.calls = nil
+	l.applyEgress(context.Background(), []string{"nonsense", "10.0.0.0/8 accept\n\tchain evil {"})
+
+	if f.ran("linker-egress.nft") {
+		t.Errorf("a ruleset was built from networks none of which parse; calls were %v", f.calls)
+	}
+	if f.ran("ip rule add fwmark 0x301") {
+		t.Errorf("the mark rule went in with no ruleset behind it; calls were %v", f.calls)
+	}
+	if !f.ran("delete table ip failover_linker_egress") {
+		t.Errorf("the previous ruleset was left loaded; calls were %v", f.calls)
+	}
+}
+
+// An egress install that would render no ruleset is a failure, not a success.
+//
+// The generators answer an address they cannot use by rendering nothing, and an
+// empty file is one `nft -f` accepts. Passed on, it latches egressOK against a
+// table that was never created, so retryEgress never looks again and the
+// journal reports networks installed that are not. LoadBootstrap refuses the
+// address that gets here, and this is the second lock on that door.
+func TestAnEgressInstallThatRendersNothingIsNotRecordedAsApplied(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip route get 192.168.1.2": "192.168.1.2 dev eth0 src 192.168.1.50 uid 0",
+	}}
+	l := testLinker(t, f)
+	l.boot.Linker.OverlayIP = "not-an-address"
+
+	l.applyEgress(context.Background(), []string{"172.18.0.0/16"})
+
+	if f.ran("linker-egress.nft") {
+		t.Errorf("an empty ruleset was loaded; calls were %v", f.calls)
+	}
+	if l.egressOK {
+		t.Error("an install that rendered nothing was recorded as applied, so nothing will retry it")
+	}
+}
+
+// The marking table and the mark rule are a pair. Nothing sets that mark unless
+// the table is loaded, so the rule on its own selects a table for traffic that
+// can never carry it - plumbing that reads as correct in `ip rule` while the
+// thing it serves was never built. apply guarded this and reconcile installed
+// the rule unconditionally ten seconds later, so the guard lasted exactly one
+// tick.
+func TestReconcileWithholdsTheMarkRuleUntilItsTableIsLoaded(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip route get 192.168.1.2": "192.168.1.2 dev eth0 src 192.168.1.50 uid 0",
+	}}
+	l := testLinker(t, f)
+	// An address no generator can render, which is what makes the ruleset empty.
+	l.boot.Linker.OverlayIP = "2001:db8::3"
+
+	l.reconcile(context.Background())
+
+	if f.ran("linker-return.nft") {
+		t.Errorf("an empty ruleset was written and loaded; calls were %v", f.calls)
+	}
+	if f.ran("ip rule add fwmark 0x201") {
+		t.Errorf("the mark rule went in without the table it selects; calls were %v", f.calls)
+	}
+}
+
+// The inverse of the same pairing, and the worse half: a table that failed to
+// load at startup was never reinstalled, while its rule was kept perpetually
+// fresh by every tick. Recording the success only after `nft -f` has taken it
+// is what lets reconcile come back for it, exactly as retryEgress does.
+func TestReconcileRetriesAReturnRulesetThatFailedToLoad(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip route get 192.168.1.2": "192.168.1.2 dev eth0 src 192.168.1.50 uid 0",
+	}}
+	l := testLinker(t, f)
+
+	f.fails = []string{"linker-return.nft"}
+	l.ensureReturnPath(context.Background())
+	if l.returnPathOK() {
+		t.Fatal("a load the kernel refused was recorded as applied")
+	}
+	if f.ran("ip rule add fwmark 0x201") {
+		t.Errorf("the mark rule went in after the table failed to load; calls were %v", f.calls)
+	}
+
+	f.fails = nil
+	f.calls = nil
+	l.reconcile(context.Background())
+
+	if !f.ran("linker-return.nft") {
+		t.Errorf("reconcile did not retry the failed load; calls were %v", f.calls)
+	}
+	if !f.ran("ip rule add fwmark 0x201") {
+		t.Errorf("the mark rule was not installed on retry; calls were %v", f.calls)
+	}
+	if !l.returnPathOK() {
+		t.Error("a successful retry was not recorded, so it will reload every tick")
+	}
+}
+
+// ...and once it has loaded, it must stop reloading. An nftables table is not
+// lost with an interface the way a rule or a route is, so there is nothing for
+// reconcile to repair in the ordinary case.
+func TestReconcileDoesNotReloadAnIntactReturnRuleset(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip route get 192.168.1.2": "192.168.1.2 dev eth0 src 192.168.1.50 uid 0",
+	}}
+	l := testLinker(t, f)
+
+	l.ensureReturnPath(context.Background())
+	if !l.returnPathOK() {
+		t.Fatalf("the first install did not take; calls were %v", f.calls)
+	}
+
+	f.calls = nil
+	l.reconcile(context.Background())
+	if f.ran("linker-return.nft") {
+		t.Errorf("reconcile reloaded a table that was already loaded; calls were %v", f.calls)
 	}
 }

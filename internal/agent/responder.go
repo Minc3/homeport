@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -97,6 +98,8 @@ func (r *Responder) listen(ctx context.Context) error {
 	// rate that cannot flood the journal.
 	var lastNoise time.Time
 	var noise int
+	var lastVersion time.Time
+	var wrongVersion int
 	var lastFail time.Time
 	failed := map[int]int{}
 
@@ -110,6 +113,23 @@ func (r *Responder) listen(ctx context.Context) error {
 		}
 		msg, err := proto.Unmarshal(buf[:n], r.agent.psk)
 		if err != nil {
+			// Two different things to go and look at, so they are not reported
+			// as one. A packet from another wire version is a host part-way
+			// through an upgrade, and the hosts have to move together: the
+			// MACs are domain separated by version, so an older frontend's
+			// probes will not authenticate here and this one's replies will
+			// not authenticate there. Told it was a secret mismatch, an
+			// operator goes and checks the one thing that is fine.
+			if errors.Is(err, proto.ErrProbeVersion) {
+				wrongVersion++
+				if time.Since(lastVersion) > 30*time.Second {
+					r.log.Warn("dropping probes from a different wire version; upgrade both hosts to the same build",
+						"packets", wrongVersion, "from", src.String())
+					lastVersion = time.Now()
+					wrongVersion = 0
+				}
+				continue
+			}
 			noise++
 			if time.Since(lastNoise) > 30*time.Second {
 				r.log.Warn("dropping unauthenticated probe packets; check that the shared secret is identical on both hosts",

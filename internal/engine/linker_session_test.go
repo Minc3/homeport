@@ -17,8 +17,10 @@ import (
 )
 
 // dialSession drives one control connection against serve() over a real socket
-// pair, doing the challenge/response the way an agent would.
-func dialSession(t *testing.T, e *Engine, psk []byte, hello proto.Hello) (net.Conn, *bufio.Reader, func()) {
+// pair, doing the whole handshake the way an agent would: both proofs, then a
+// session whose key comes from both nonces, under which every later frame is
+// authenticated.
+func dialSession(t *testing.T, e *Engine, psk []byte, hello proto.Hello) (net.Conn, *bufio.Reader, *proto.Session, func()) {
 	t.Helper()
 	srvConn, cliConn := net.Pipe()
 
@@ -41,14 +43,35 @@ func dialSession(t *testing.T, e *Engine, psk []byte, hello proto.Hello) (net.Co
 	if err := proto.DecodeInto(env, &ch); err != nil {
 		t.Fatalf("challenge payload: %v", err)
 	}
-	if err := proto.WriteFrame(cliConn, proto.MsgAuth,
-		proto.Auth{MAC: proto.SignChallenge(psk, ch.Nonce)}); err != nil {
+	// Both halves of the handshake, as a real agent does it: the frontend has
+	// to prove itself too before this end says who it is.
+	mine := proto.RandomNonce()
+	mac, err := proto.SignAuth(psk, ch.Nonce, mine)
+	if err != nil {
+		t.Fatalf("sign auth: %v", err)
+	}
+	if err := proto.WriteFrame(cliConn, proto.MsgAuth, proto.Auth{MAC: mac, Nonce: mine}); err != nil {
 		t.Fatalf("auth: %v", err)
 	}
-	if err := proto.WriteFrame(cliConn, proto.MsgHello, hello); err != nil {
+	if line, err = r.ReadBytes('\n'); err != nil {
+		t.Fatalf("read auth ack: %v", err)
+	}
+	if err := json.Unmarshal(line, &env); err != nil {
+		t.Fatalf("decode auth ack: %v", err)
+	}
+	var ack proto.AuthAck
+	if env.Type != proto.MsgAuthAck || proto.DecodeInto(env, &ack) != nil ||
+		!proto.VerifyAuthAck(psk, ch.Nonce, mine, ack.MAC) {
+		t.Fatalf("the frontend did not prove itself: %q", env.Type)
+	}
+	sess, err := proto.NewSession(psk, ch.Nonce, mine, true)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if err := sess.WriteFrame(cliConn, proto.MsgHello, hello); err != nil {
 		t.Fatalf("hello: %v", err)
 	}
-	return cliConn, r, func() { cancel(); cliConn.Close() }
+	return cliConn, r, sess, func() { cancel(); cliConn.Close() }
 }
 
 // The whole point of the channel: a linker connects and is handed the networks
@@ -57,20 +80,16 @@ func TestLinkerReceivesItsNetworksOverTheChannel(t *testing.T) {
 	psk := []byte("shared-secret")
 	e := newTestEngine(linkerCfg(), nil)
 
-	conn, r, done := dialSession(t, e, psk, proto.Hello{
+	conn, r, sess, done := dialSession(t, e, psk, proto.Hello{
 		Role: model.RoleLinker, OverlayIP: "10.99.0.3",
 		Version: "test-build", Hostname: "gs1host",
 	})
 	defer done()
 
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	line, err := r.ReadBytes('\n')
+	env, err := sess.ReadFrame(r)
 	if err != nil {
 		t.Fatalf("read push: %v", err)
-	}
-	var env proto.Envelope
-	if err := json.Unmarshal(line, &env); err != nil {
-		t.Fatalf("decode push: %v", err)
 	}
 	if env.Type != proto.MsgLinkerConfig {
 		t.Fatalf("first frame was %q, want a linker config", env.Type)
@@ -90,13 +109,13 @@ func TestConnectingRegistersLiveness(t *testing.T) {
 	psk := []byte("shared-secret")
 	e := newTestEngine(linkerCfg(), nil)
 
-	conn, r, done := dialSession(t, e, psk, proto.Hello{
+	conn, r, sess, done := dialSession(t, e, psk, proto.Hello{
 		Role: model.RoleLinker, OverlayIP: "10.99.0.3",
 		Version: "test-build", Hostname: "gs1host",
 	})
 	defer done()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := r.ReadBytes('\n'); err != nil { // wait for the push, so the session is up
+	if _, err := sess.ReadFrame(r); err != nil { // wait for the push, so the session is up
 		t.Fatalf("read push: %v", err)
 	}
 
@@ -123,7 +142,7 @@ func TestALinkerCannotClaimAnUnconfiguredAddress(t *testing.T) {
 	psk := []byte("shared-secret")
 	e := newTestEngine(linkerCfg(), nil)
 
-	conn, r, done := dialSession(t, e, psk, proto.Hello{
+	conn, r, sess, done := dialSession(t, e, psk, proto.Hello{
 		Role: model.RoleLinker, OverlayIP: "10.99.0.9", // never configured
 		Version: "test-build", Hostname: "impostor",
 	})
@@ -131,7 +150,7 @@ func TestALinkerCannotClaimAnUnconfiguredAddress(t *testing.T) {
 
 	// The session is refused, so the connection closes with nothing pushed.
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := r.ReadBytes('\n'); err == nil {
+	if _, err := sess.ReadFrame(r); err == nil {
 		t.Fatal("an unconfigured linker was sent configuration")
 	}
 	for _, l := range e.Status().LinkerStates {
@@ -155,7 +174,7 @@ func TestAHelloWithNoRoleIsStillTheBackend(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 	e.st = st
 
-	_, _, done := dialSession(t, e, psk, proto.Hello{
+	_, _, _, done := dialSession(t, e, psk, proto.Hello{
 		Version: "old-backend", Hostname: "debian",
 	})
 	defer done()
@@ -168,4 +187,118 @@ func TestAHelloWithNoRoleIsStillTheBackend(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Error("a roleless hello was not treated as the backend")
+}
+
+// The frontend will not read a frame that is not authenticated to the session,
+// which is what makes the handshake worth doing.
+//
+// Without this the handshake proves who connected and nothing more: a relay on
+// the wire can pass the whole handshake through to the real frontend and then
+// send frames of its own down a connection both ends believe in. This end of
+// that property is that a bare frame - which is all a relay can produce, having
+// no pre-shared key - gets nowhere.
+func TestTheFrontendRefusesAnUnauthenticatedFrame(t *testing.T) {
+	psk := []byte("shared-secret")
+	e := newTestEngine(linkerCfg(), nil)
+
+	srvConn, cliConn := net.Pipe()
+	defer cliConn.Close()
+	s := &ControlServer{eng: e, log: slog.New(slog.NewTextHandler(io.Discard, nil)), psk: psk}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.serve(ctx, srvConn)
+
+	r := bufio.NewReader(cliConn)
+	_ = cliConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	line, err := r.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read challenge: %v", err)
+	}
+	var env proto.Envelope
+	if err := json.Unmarshal(line, &env); err != nil {
+		t.Fatalf("decode challenge: %v", err)
+	}
+	var ch proto.Challenge
+	if err := proto.DecodeInto(env, &ch); err != nil {
+		t.Fatalf("challenge payload: %v", err)
+	}
+	mine := proto.RandomNonce()
+	mac, err := proto.SignAuth(psk, ch.Nonce, mine)
+	if err != nil {
+		t.Fatalf("sign auth: %v", err)
+	}
+	if err := proto.WriteFrame(cliConn, proto.MsgAuth, proto.Auth{MAC: mac, Nonce: mine}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if _, err := r.ReadBytes('\n'); err != nil { // the frontend's proof
+		t.Fatalf("read auth ack: %v", err)
+	}
+
+	// The handshake is complete and this end still cannot say anything: the
+	// hello goes out with no session MAC on it, as a relay's would.
+	if err := proto.WriteFrame(cliConn, proto.MsgHello, proto.Hello{
+		Role: model.RoleLinker, OverlayIP: "10.99.0.3", Hostname: "relay",
+	}); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+
+	_ = cliConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := r.ReadBytes('\n'); err == nil {
+		t.Fatal("the frontend answered a frame it had not authenticated")
+	}
+	for _, l := range e.Status().LinkerStates {
+		if l.Up {
+			t.Errorf("an unauthenticated frame registered liveness: %+v", l)
+		}
+	}
+}
+
+// Every frame the frontend sends goes through the session, not just the ones
+// somebody remembered.
+//
+// This is a guard against the shape of edit that is easy to get wrong rather
+// than against an attacker: the writes are spread over four functions and two
+// goroutines, and one left on the bare proto.WriteFrame is invisible from the
+// frontend's side - it is the peer that fails to authenticate it, seconds or
+// minutes later, and the symptom is a channel that drops for no stated reason.
+// The usage ack is the one that was missed.
+func TestEveryFrontendReplyIsAuthenticated(t *testing.T) {
+	psk := []byte("shared-secret")
+	e := newTestEngine(linkerCfg(), nil)
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	e.st = st
+
+	conn, r, sess, done := dialSession(t, e, psk, proto.Hello{Version: "test", Hostname: "debian"})
+	defer done()
+
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := sess.WriteFrame(conn, proto.MsgUsage, proto.Usage{
+		Deltas: []proto.UsageDelta{{PathID: 2, Bytes: 1024, Packets: 8, AtUnix: time.Now().Unix(), Sequence: 1}},
+	}); err != nil {
+		t.Fatalf("send usage: %v", err)
+	}
+
+	// Read until the ack turns up. The config push and the keepalive share this
+	// connection, and every one of them has to authenticate on the way past.
+	for {
+		env, err := sess.ReadFrame(r)
+		if err != nil {
+			t.Fatalf("a frame from the frontend did not authenticate: %v", err)
+		}
+		if env.Type == proto.MsgUsageAck {
+			var ack proto.UsageAck
+			if err := proto.DecodeInto(env, &ack); err != nil {
+				t.Fatalf("ack payload: %v", err)
+			}
+			if ack.Seqs[2] != 1 {
+				t.Errorf("ack did not cover the delta: %+v", ack.Seqs)
+			}
+			return
+		}
+	}
 }

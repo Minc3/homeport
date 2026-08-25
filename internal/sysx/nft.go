@@ -3,6 +3,7 @@ package sysx
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -260,6 +261,8 @@ var internetOnly = "ip daddr != { " + strings.Join(nonInternetDestinations, ", "
 // the source to an address on the output interface - and the tunnels carry no
 // address at all, because wg-quick runs with Table = off and no Address.
 func BuildBackendEgressRuleset(cidrs, ifaces []string, overlayIP string) string {
+	cidrs = EgressNetworks(cidrs)
+	overlayIP = AddressLiteral(overlayIP)
 	if len(cidrs) == 0 || len(ifaces) == 0 || overlayIP == "" {
 		return ""
 	}
@@ -297,6 +300,81 @@ func BuildBackendEgressRuleset(cidrs, ifaces []string, overlayIP string) string 
 
 	b.WriteString("}\n")
 	return b.String()
+}
+
+// EgressNetworks parses the networks an agent has been told to pull onto the
+// overlay and re-renders them from what it parsed. Anything that is not an
+// IPv4 network is dropped.
+//
+// The strings arrive over the control channel, and until this existed they
+// went into the generated file unparsed and unquoted, straight into `nft -f`
+// as root. web.validate checks them, but that runs on a different host at save
+// time, which is the wrong place for this to be the only check: what reaches
+// the file here is whatever the peer at the other end of a socket said, and a
+// value carrying a newline is not one bad rule but a free hand with the whole
+// ruleset - a chain of its own, a dnat, anything nft will load.
+//
+// Rendering the parsed form rather than passing the accepted string through is
+// the half that makes it a boundary rather than a filter: there is then no path
+// by which an unexamined byte reaches the file. It changes nothing for a
+// configuration the portal accepted, because web.parseIPv4Network already
+// normalises to exactly this, and sysx/nft_test.go pins that.
+//
+// Dropping a bad entry rather than refusing the batch is deliberate, and
+// matches mergeCIDRs in protect.go: nft rejects a whole table over one bad
+// element, and one unusable network must not take a working egress ruleset -
+// or, on the backend, the reply path beside it - down with it.
+func EgressNetworks(cidrs []string) []string {
+	out := make([]string, 0, len(cidrs))
+	for _, c := range cidrs {
+		if n := NetworkLiteral(c); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// NetworkLiteral returns an IPv4 network as nft should see it, or "" for
+// anything that is not one. Host bits are masked off, so the string it returns
+// is one nft will load: a value like 10.99.0.5/24 is rejected outright with
+// "Address has host bits set", and it rejects the whole table with it.
+//
+// The single-network half of EgressNetworks, for the values that arrive one at
+// a time rather than as a list - the overlay subnet in particular, which rides
+// the same pushed control message as the networks and had been going into the
+// generated rules with a bare %s. Filtering a list can drop a bad entry and
+// keep the rest; a lone value has no such choice, so every caller has to treat
+// "" as a failure rather than as a network.
+func NetworkLiteral(cidr string) string {
+	_, n, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil || n.IP.To4() == nil {
+		return ""
+	}
+	if _, bits := n.Mask.Size(); bits != 32 {
+		return ""
+	}
+	return n.String()
+}
+
+// AddressLiteral returns an IPv4 address as nft should see it, or "" for
+// anything that is not one.
+//
+// The companion to EgressNetworks, and it exists for the same reason: on the
+// backend the overlay address beside those networks arrives over the control
+// channel, in the pushed configuration, and was rendered into the file with
+// %s. The networks were the loud version of that problem and this was the
+// quiet one.
+//
+// A generator handed an address it cannot use renders nothing at all, and
+// every caller has to treat that as a failure rather than as a ruleset. It is
+// not self-announcing: an empty file is one `nft -f` accepts without complaint,
+// so a caller that passes it on installs nothing and reports success.
+func AddressLiteral(addr string) string {
+	ip := net.ParseIP(strings.TrimSpace(addr))
+	if ip == nil || ip.To4() == nil {
+		return ""
+	}
+	return ip.To4().String()
 }
 
 // BuildReturnRuleset renders the backend's connection-marking ruleset.
@@ -481,6 +559,17 @@ func EnsureOverlayForwardExceptions(ctx context.Context, r Runner, overlayPrefix
 	if overlayPrefix == "" {
 		return nil
 	}
+	// Re-parsed and re-rendered, for the reason EgressNetworks exists: this
+	// value arrives on the same pushed control message as the egress networks,
+	// and it is not a shell argument that a separate argv element would make
+	// safe - nft joins its own argv and re-lexes the result, so a space in here
+	// is a new rule token and a semicolon is a new rule. The generators beside
+	// it were given this treatment and this call was not.
+	prefix := NetworkLiteral(overlayPrefix)
+	if prefix == "" {
+		return fmt.Errorf("overlay subnet %q is not an IPv4 network", overlayPrefix)
+	}
+	overlayPrefix = prefix
 	existing, err := r.Run(ctx, "nft", "-a", "list", "chain", "ip", "filter", DockerUserChain)
 	if err != nil {
 		return nil // no Docker, nothing to work around

@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"strings"
 )
 
 // Bootstrap is the small on-disk file each agent reads at startup.
@@ -112,6 +114,38 @@ func LoadBootstrap(path string) (Bootstrap, error) {
 	if b.Overlay.ControlPort == 0 {
 		b.Overlay.ControlPort = 51998
 	}
+	// Every role, because every role puts these into `ip` commands and into
+	// generated nftables rules, and the generators answer an address they
+	// cannot parse by rendering nothing - which loads as an empty file and
+	// installs nothing. Defaulted above when absent, so reaching here with
+	// something unparseable means somebody typed it.
+	//
+	// IPv4 specifically, and that is the point rather than pedantry. A plain
+	// net.ParseIP check accepted an IPv6 address here and let the agent start,
+	// and every generator downstream then rendered nothing at all, which is the
+	// silent-empty-ruleset failure this check exists to catch - it was catching
+	// only the typo that does not parse and missing the one that parses into
+	// something unusable. The normalised form is stored back, so what the
+	// generators see is what was checked.
+	if v := ipv4Literal(b.Overlay.FrontendIP); v == "" {
+		return Bootstrap{}, fmt.Errorf("bootstrap config: overlay.frontend_ip %q is not an IPv4 address", b.Overlay.FrontendIP)
+	} else {
+		b.Overlay.FrontendIP = v
+	}
+	if v := ipv4Literal(b.Overlay.BackendIP); v == "" {
+		return Bootstrap{}, fmt.Errorf("bootstrap config: overlay.backend_ip %q is not an IPv4 address", b.Overlay.BackendIP)
+	} else {
+		b.Overlay.BackendIP = v
+	}
+	// Optional, so only checked when it is there. Empty is the ordinary case
+	// and means one host at the far end.
+	if b.Overlay.Subnet != "" {
+		v := ipv4Network(b.Overlay.Subnet)
+		if v == "" {
+			return Bootstrap{}, fmt.Errorf("bootstrap config: overlay.subnet %q is not an IPv4 network in CIDR form", b.Overlay.Subnet)
+		}
+		b.Overlay.Subnet = v
+	}
 	// A linker with either field missing would start, install nothing useful
 	// and look healthy. Both are load-bearing and neither has a sane default,
 	// so refuse rather than guess.
@@ -121,6 +155,22 @@ func LoadBootstrap(path string) (Bootstrap, error) {
 		}
 		if b.Linker.BackendLAN == "" {
 			return Bootstrap{}, fmt.Errorf("bootstrap config: a linker needs linker.backend_lan, the backend's address on this network")
+		}
+		// Parsed, not just present. Both end up in generated nftables rules,
+		// and the generators refuse an address they cannot parse by rendering
+		// nothing at all - which `nft -f` accepts as an empty file, so a typo
+		// here bought a linker that started, reported its egress networks
+		// installed, and had no ruleset. Refused at the one moment somebody is
+		// looking at this file.
+		if v := ipv4Literal(b.Linker.OverlayIP); v == "" {
+			return Bootstrap{}, fmt.Errorf("bootstrap config: linker.overlay_ip %q is not an IPv4 address", b.Linker.OverlayIP)
+		} else {
+			b.Linker.OverlayIP = v
+		}
+		if v := ipv4Literal(b.Linker.BackendLAN); v == "" {
+			return Bootstrap{}, fmt.Errorf("bootstrap config: linker.backend_lan %q is not an IPv4 address", b.Linker.BackendLAN)
+		} else {
+			b.Linker.BackendLAN = v
 		}
 		if b.Linker.OverlayIP == b.Overlay.BackendIP || b.Linker.OverlayIP == b.Overlay.FrontendIP {
 			return Bootstrap{}, fmt.Errorf("bootstrap config: linker.overlay_ip %s is already the frontend's or the backend's address", b.Linker.OverlayIP)
@@ -155,4 +205,35 @@ func LoadBootstrap(path string) (Bootstrap, error) {
 func (b Bootstrap) Key() []byte {
 	sum := sha256.Sum256([]byte(b.PSK))
 	return sum[:]
+}
+
+// ipv4Literal and ipv4Network are the checks the generators actually apply,
+// enforced at the one moment somebody is looking at this file.
+//
+// They mirror sysx.AddressLiteral and sysx.NetworkLiteral deliberately rather
+// than calling them: sysx imports model, so the dependency cannot run the other
+// way. If the rule in either of those moves, move it here too - the failure of
+// them disagreeing is an agent that starts, reports its rules installed, and
+// has none.
+func ipv4Literal(addr string) string {
+	ip := net.ParseIP(strings.TrimSpace(addr))
+	if ip == nil || ip.To4() == nil {
+		return ""
+	}
+	return ip.To4().String()
+}
+
+// ipv4Network masks host bits off rather than refusing them, matching what the
+// portal already does with a pasted CIDR. Left in, they are not a cosmetic
+// difference: nft rejects "10.99.0.5/24" with "Address has host bits set" and
+// rejects the whole table with it.
+func ipv4Network(cidr string) string {
+	_, n, err := net.ParseCIDR(strings.TrimSpace(cidr))
+	if err != nil || n.IP.To4() == nil {
+		return ""
+	}
+	if _, bits := n.Mask.Size(); bits != 32 {
+		return ""
+	}
+	return n.String()
 }

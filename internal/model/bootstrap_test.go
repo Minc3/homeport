@@ -127,3 +127,133 @@ func TestLinkerBootstrapAcceptsAnOmittedTable(t *testing.T) {
 		}
 	}
 }
+
+// An address that is present but is not an address is refused here, because
+// nothing downstream refuses it loudly.
+//
+// Both fields end up in generated nftables rules, and the generators answer an
+// address they cannot parse by rendering nothing at all. An empty ruleset is a
+// zero-byte file that `nft -f` loads without complaint, so a typo bought a
+// linker that started, logged its egress networks as installed, and had no
+// table. This file is the one moment somebody is looking at the value.
+func TestLinkerBootstrapRejectsAnAddressThatIsNotOne(t *testing.T) {
+	cases := map[string]string{
+		"overlay_ip is a hostname":  `{"role":"linker","psk":"x","linker":{"overlay_ip":"gs1.local","backend_lan":"192.168.1.2"}}`,
+		"overlay_ip has a typo":     `{"role":"linker","psk":"x","linker":{"overlay_ip":"10.99.0.300","backend_lan":"192.168.1.2"}}`,
+		"overlay_ip is a network":   `{"role":"linker","psk":"x","linker":{"overlay_ip":"10.99.0.3/24","backend_lan":"192.168.1.2"}}`,
+		"backend_lan is a hostname": `{"role":"linker","psk":"x","linker":{"overlay_ip":"10.99.0.3","backend_lan":"backend"}}`,
+		"backend_lan has a typo":    `{"role":"linker","psk":"x","linker":{"overlay_ip":"10.99.0.3","backend_lan":"192.168.1."}}`,
+	}
+	for name, body := range cases {
+		p := filepath.Join(t.TempDir(), "linker.json")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := model.LoadBootstrap(p); err == nil {
+			t.Errorf("%s: should have been rejected", name)
+		}
+	}
+}
+
+// The overlay addresses are checked on every role, not just a linker's.
+//
+// They go into `ip` commands and into generated nftables rules on all three
+// agents, and a generator handed an address it cannot parse renders nothing at
+// all - which loads as an empty file and installs nothing. Absent is fine and
+// takes the default; present and unparseable is a typo, and this file is where
+// it was typed.
+func TestBootstrapRejectsAnOverlayAddressThatIsNotOne(t *testing.T) {
+	cases := map[string]string{
+		"frontend_ip typo": `{"role":"frontend","psk":"x","overlay":{"frontend_ip":"10.99.0.256"}}`,
+		"backend_ip typo":  `{"role":"backend","psk":"x","overlay":{"backend_ip":"10.99.0."}}`,
+		"backend_ip name":  `{"role":"backend","psk":"x","overlay":{"backend_ip":"backend.local"}}`,
+		"subnet not cidr":  `{"role":"backend","psk":"x","overlay":{"subnet":"10.99.0.0"}}`,
+	}
+	for name, body := range cases {
+		p := filepath.Join(t.TempDir(), "boot.json")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := model.LoadBootstrap(p); err == nil {
+			t.Errorf("%s: should have been rejected", name)
+		}
+	}
+
+	// And the ordinary config, which names none of them, still loads on its
+	// defaults. This check must not become a reason to write them out.
+	p := filepath.Join(t.TempDir(), "boot.json")
+	if err := os.WriteFile(p, []byte(`{"role":"backend","psk":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := model.LoadBootstrap(p)
+	if err != nil {
+		t.Fatalf("a config with no overlay section should load: %v", err)
+	}
+	if b.Overlay.BackendIP != "10.99.0.2" || b.Overlay.FrontendIP != "10.99.0.1" {
+		t.Errorf("defaults did not survive: %+v", b.Overlay)
+	}
+}
+
+// The point of the address checks is the generators downstream, and every one
+// of them is IPv4 only: sysx.AddressLiteral answers anything else by rendering
+// nothing, which `nft -f` loads as an empty file without complaint. A bare
+// net.ParseIP check passed an IPv6 address straight through, so the agent
+// started, logged its rules installed, and had none - the exact failure these
+// checks exist to prevent, reached by the typo that parses rather than the one
+// that does not.
+func TestBootstrapRejectsAnAddressTheGeneratorsCannotUse(t *testing.T) {
+	cases := map[string]string{
+		"linker overlay_ip":  `{"role":"linker","psk":"x","linker":{"overlay_ip":"2001:db8::3","backend_lan":"192.168.1.2"}}`,
+		"linker backend_lan": `{"role":"linker","psk":"x","linker":{"overlay_ip":"10.99.0.3","backend_lan":"2001:db8::2"}}`,
+		"overlay frontend":   `{"role":"frontend","psk":"x","overlay":{"frontend_ip":"2001:db8::1"}}`,
+		"overlay backend":    `{"role":"backend","psk":"x","overlay":{"backend_ip":"2001:db8::2"}}`,
+		"subnet family":      `{"role":"frontend","psk":"x","overlay":{"subnet":"2001:db8::/32"}}`,
+	}
+	for name, body := range cases {
+		p := filepath.Join(t.TempDir(), "b.json")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := model.LoadBootstrap(p); err == nil {
+			t.Errorf("%s: an address no generator can render must be refused", name)
+		}
+	}
+}
+
+// nft rejects "10.99.0.5/24" outright with "Address has host bits set", and it
+// rejects the whole table with it - so a subnet carrying host bits would take
+// the mark chain and the source NAT down together. net.ParseCIDR accepts the
+// string and reports the masked network, but the unmasked original was what got
+// stored and what reached the generated rules. Masked here, at the one moment
+// somebody is looking at this file, matching what the portal does with a pasted
+// CIDR.
+func TestBootstrapMasksHostBitsOffTheOverlaySubnet(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "frontend.json")
+	body := `{"role":"frontend","psk":"x","overlay":{"subnet":"10.99.0.5/24"}}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := model.LoadBootstrap(p)
+	if err != nil {
+		t.Fatalf("a subnet with host bits should be masked, not refused: %v", err)
+	}
+	if b.Overlay.Subnet != "10.99.0.0/24" {
+		t.Fatalf("overlay.subnet = %q, want the masked network 10.99.0.0/24", b.Overlay.Subnet)
+	}
+}
+
+// Invariant 19: a site that has not set a subnet must stay byte-identical to a
+// build that had never heard of one. Normalising the field must not invent it.
+func TestBootstrapLeavesAnAbsentSubnetEmpty(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "frontend.json")
+	if err := os.WriteFile(p, []byte(`{"role":"frontend","psk":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := model.LoadBootstrap(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Overlay.Subnet != "" {
+		t.Fatalf("overlay.subnet = %q, want it left empty", b.Overlay.Subnet)
+	}
+}

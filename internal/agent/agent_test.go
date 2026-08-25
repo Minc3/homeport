@@ -216,3 +216,89 @@ func TestObserveModeLoadsNoMarkingTable(t *testing.T) {
 		t.Errorf("arming loaded %d nftables table(s), want the marking table; calls were %v", n, runner.calls)
 	}
 }
+
+// An overlay address the generator cannot use is a fault, not an instruction to
+// take the egress rules down.
+//
+// Both render as an empty ruleset, and applyEgress reads an empty ruleset as
+// "the feature is off" and removes everything - which is right when the
+// frontend has sent no networks and wrong when it has sent networks and an
+// address that does not parse. Without the distinction a typo in the frontend's
+// overlay address reaches this host as a silent teardown, with a working
+// configuration replaced by nothing and no line in the journal saying so.
+func TestABadOverlayAddressDoesNotTearDownEgress(t *testing.T) {
+	a, runner := testAgent(t, true)
+
+	cfg := proto.BackendConfig{
+		Overlay:     proto.OverlayInfo{FrontendIP: "10.99.0.1", BackendIP: "10.99.0.2"},
+		EgressCIDRs: []string{"172.18.0.0/16"},
+	}
+	a.applyEgress(context.Background(), cfg, []string{"wg-main"})
+	if runner.count("nft -f") == 0 {
+		t.Fatalf("a good configuration installed nothing; calls were %v", runner.calls)
+	}
+
+	runner.calls = nil
+	cfg.Overlay.BackendIP = "10.99.0.2.5" // a typo, not an instruction
+	a.applyEgress(context.Background(), cfg, []string{"wg-main"})
+
+	if runner.count("delete table ip failover_egress") > 0 {
+		t.Errorf("a bad address tore the egress rules down; calls were %v", runner.calls)
+	}
+	if runner.count("nft -f") > 0 {
+		t.Errorf("a bad address still reached a ruleset; calls were %v", runner.calls)
+	}
+
+	// An empty list still means what it always meant: the feature is off, and
+	// the rules go. This is the case the branch above must not have broken.
+	runner.calls = nil
+	cfg.Overlay.BackendIP = "10.99.0.2"
+	cfg.EgressCIDRs = nil
+	a.applyEgress(context.Background(), cfg, []string{"wg-main"})
+	if runner.count("delete table ip failover_egress") == 0 {
+		t.Errorf("an empty list no longer removes the rules; calls were %v", runner.calls)
+	}
+}
+
+// The same fault reached through the other input, which the guard above did not
+// cover.
+//
+// The generator drops the networks it cannot parse, so a push where none of
+// them survive renders exactly the empty string an absent feature does - and
+// the teardown then ran with nothing in the journal, because the line that
+// names the unusable networks sat past the point of no return. Containers lose
+// their tunnel egress and the server browser starts advertising the house's
+// address, silently, which is the one thing the feature exists to prevent.
+func TestAPushWithNoUsableNetworkDoesNotTearDownEgress(t *testing.T) {
+	a, runner := testAgent(t, true)
+
+	cfg := proto.BackendConfig{
+		Overlay:     proto.OverlayInfo{FrontendIP: "10.99.0.1", BackendIP: "10.99.0.2"},
+		EgressCIDRs: []string{"172.18.0.0/16"},
+	}
+	a.applyEgress(context.Background(), cfg, []string{"wg-main"})
+	if runner.count("nft -f") == 0 {
+		t.Fatalf("a good configuration installed nothing; calls were %v", runner.calls)
+	}
+
+	runner.calls = nil
+	cfg.EgressCIDRs = []string{"2001:db8::/32", "nonsense"}
+	a.applyEgress(context.Background(), cfg, []string{"wg-main"})
+
+	if runner.count("delete table ip failover_egress") > 0 {
+		t.Errorf("an unusable list tore the egress rules down; calls were %v", runner.calls)
+	}
+	if runner.count("nft -f") > 0 {
+		t.Errorf("an unusable list still reached a ruleset; calls were %v", runner.calls)
+	}
+
+	// A list with one usable entry in it is still an instruction, and the
+	// survivor is what gets installed. Dropping the whole push over one bad
+	// entry is the failure mode EgressNetworks was written to avoid.
+	runner.calls = nil
+	cfg.EgressCIDRs = []string{"nonsense", "172.19.0.0/16"}
+	a.applyEgress(context.Background(), cfg, []string{"wg-main"})
+	if runner.count("nft -f") == 0 {
+		t.Errorf("one bad entry took a usable network down with it; calls were %v", runner.calls)
+	}
+}

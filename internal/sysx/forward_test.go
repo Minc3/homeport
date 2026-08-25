@@ -163,3 +163,52 @@ func TestEgressForwardExceptionWidensToo(t *testing.T) {
 		t.Errorf("widened egress rule not inserted; calls were %v", r.calls)
 	}
 }
+
+// nft joins its own argv and re-lexes the result, so a separate argv element is
+// not the protection it looks like: a space in this value is a new rule token
+// and a semicolon is a new rule, inserted into DOCKER-USER as root. The value
+// arrives on the same pushed control message as the egress networks, which are
+// re-parsed and re-rendered before they reach a file - this call was the one
+// consumer of that message still taking the string as given.
+func TestForwardExceptionRefusesAPrefixItCannotParse(t *testing.T) {
+	for name, prefix := range map[string]string{
+		"trailing rule": `10.99.0.0/24 accept ; ip saddr 0.0.0.0/0 accept`,
+		"not a network": `not-a-network`,
+		"wrong family":  `2001:db8::/32`,
+		"bare address":  `10.99.0.2`,
+	} {
+		r := &chainRunner{listing: emptyDockerUser}
+		if err := EnsureOverlayForwardExceptions(context.Background(), r, prefix); err == nil {
+			t.Errorf("%s: %q must be refused, not handed to nft", name, prefix)
+		}
+		if n := r.did("insert rule"); n != 0 {
+			t.Errorf("%s: inserted %d rules for a prefix that is not a network", name, n)
+		}
+	}
+}
+
+// The other half of the same helper: a value that is a network but not written
+// the way nft wants it is normalised rather than refused, matching what
+// EgressNetworks does with the list beside it and what the portal does with a
+// pasted CIDR. Host bits left in are not cosmetic - nft answers "Address has
+// host bits set" and rejects the whole table.
+func TestForwardExceptionNormalisesThePrefixItInstalls(t *testing.T) {
+	for name, prefix := range map[string]string{
+		"host bits set": "10.99.0.5/24",
+		"padded":        "  10.99.0.0/24  ",
+	} {
+		r := &chainRunner{listing: emptyDockerUser}
+		if err := EnsureOverlayForwardExceptions(context.Background(), r, prefix); err != nil {
+			t.Errorf("%s: %q is a network and should be accepted: %v", name, prefix, err)
+		}
+		if n := r.did("ip daddr 10.99.0.0/24 accept"); n != 1 {
+			t.Errorf("%s: want one accept for the masked network, got %d", name, n)
+		}
+	}
+}
+
+const emptyDockerUser = `table ip filter {
+	chain DOCKER-USER {
+		counter packets 0 bytes 0 # handle 3
+	}
+}`

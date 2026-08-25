@@ -394,7 +394,43 @@ func (a *Agent) applyShaping(ctx context.Context, cfg proto.BackendConfig) {
 func (a *Agent) applyEgress(ctx context.Context, cfg proto.BackendConfig, ifaces []string) {
 	gated := a.gatedRunner()
 
-	ruleset := sysx.BuildBackendEgressRuleset(cfg.EgressCIDRs, ifaces, cfg.Overlay.BackendIP)
+	// An address the generator cannot use is a fault, not an instruction. Both
+	// render as an empty ruleset, and below that is read as "the feature is
+	// off" and tears the rules down - so without this a typo in the frontend's
+	// overlay address arrives here as a silent teardown with nothing in the
+	// journal. Checked before the build, because afterwards the two are the
+	// same empty string. See sysx.AddressLiteral.
+	if len(cfg.EgressCIDRs) > 0 && sysx.AddressLiteral(cfg.Overlay.BackendIP) == "" {
+		a.log.Error("cannot pull networks onto the tunnel: the overlay address is not an address; "+
+			"leaving the egress rules as they are",
+			"overlay_ip", cfg.Overlay.BackendIP, "networks", cfg.EgressCIDRs)
+		return
+	}
+
+	// The same fault reached through the other input, and the guard above did
+	// not cover it. The generator drops the networks it cannot parse, so a push
+	// where none of them survive renders the same empty string an absent
+	// feature does - and the teardown below then runs with nothing in the
+	// journal at all, because the warning that names them is past the point of
+	// no return. Containers lose their tunnel egress and the server browser
+	// starts advertising the house's address, silently.
+	//
+	// Parsed once, here, and carried down: the branch that decides and the
+	// ruleset that is written must not be able to disagree about what usable
+	// meant.
+	installed := sysx.EgressNetworks(cfg.EgressCIDRs)
+	if len(installed) != len(cfg.EgressCIDRs) {
+		a.log.Warn("ignoring egress networks that are not IPv4 networks",
+			"asked", cfg.EgressCIDRs, "usable", installed)
+	}
+	if len(cfg.EgressCIDRs) > 0 && len(installed) == 0 {
+		a.log.Error("cannot pull networks onto the tunnel: none of them are IPv4 networks; "+
+			"leaving the egress rules as they are",
+			"networks", cfg.EgressCIDRs)
+		return
+	}
+
+	ruleset := sysx.BuildBackendEgressRuleset(installed, ifaces, cfg.Overlay.BackendIP)
 	if ruleset == "" {
 		real := a.realRunner()
 		sysx.RemoveEgressRuleset(ctx, real)
@@ -414,7 +450,10 @@ func (a *Agent) applyEgress(ctx context.Context, cfg proto.BackendConfig, ifaces
 		a.log.Error("cannot apply the egress ruleset", "err", err)
 		return
 	}
-	a.log.Info("networks routed out through the frontend", "networks", cfg.EgressCIDRs)
+	// What was installed, not what arrived: entries the parse could not use were
+	// dropped on the way in, and naming them here as routed would have the
+	// journal disagree with the kernel. The linker reports the same way.
+	a.log.Info("networks routed out through the frontend", "networks", installed)
 }
 
 // realRunner always acts on the system, regardless of mode. It backs the

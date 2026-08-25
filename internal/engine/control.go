@@ -115,8 +115,37 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 	}
 	var auth proto.Auth
 	if env.Type != proto.MsgAuth || proto.DecodeInto(env, &auth) != nil ||
-		!proto.VerifyChallenge(s.psk, nonce, auth.MAC) {
-		s.log.Warn("control authentication failed", "remote", remote)
+		!proto.VerifyAuth(s.psk, nonce, auth.Nonce, auth.MAC) {
+		s.log.Warn("control authentication failed", "remote", remote,
+			"hint", "is the shared secret identical, and is that host running this build?")
+		return
+	}
+
+	// And now prove who we are, before the peer is asked to believe anything.
+	//
+	// The dialling agent will not send its hello until this arrives, and will
+	// not apply a pushed configuration without it. That matters most for a
+	// linker: its connection reaches us by routing through the backend as a LAN
+	// neighbour, so its first hop is plaintext TCP on a network this system does
+	// not own, and what an impostor in that position would be believed about is
+	// the egress networks - which the linker loads into nftables as root.
+	proof, err := proto.SignAuthAck(s.psk, nonce, auth.Nonce)
+	if err != nil {
+		s.log.Warn("control authentication failed", "remote", remote, "err", err)
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := proto.WriteFrame(conn, proto.MsgAuthAck, proto.AuthAck{MAC: proof}); err != nil {
+		return
+	}
+
+	// From here on every frame carries its own MAC under a key derived from
+	// both nonces. Proving who the peer is settles who it is, not who is
+	// writing down the socket afterwards, and a relay on the wire can let both
+	// ends authenticate and then inject its own frames. See proto.Session.
+	sess, err := proto.NewSession(s.psk, nonce, auth.Nonce, false)
+	if err != nil {
+		s.log.Warn("control authentication failed", "remote", remote, "err", err)
 		return
 	}
 
@@ -124,7 +153,7 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 	// linkers existed sends a Hello with no role, and an empty role means
 	// backend - so an older backend is understood exactly as it always was.
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	first, err := readFrame(r)
+	first, err := sess.ReadFrame(r)
 	if err != nil {
 		return
 	}
@@ -134,7 +163,7 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 	}
 
 	if hello.Role == model.RoleLinker {
-		s.serveLinker(ctx, conn, r, hello, remote)
+		s.serveLinker(ctx, conn, r, sess, hello, remote)
 		return
 	}
 
@@ -160,11 +189,11 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 	}()
 
 	// Push config immediately, then whenever it changes.
-	go s.pushLoop(ctx, conn)
+	go s.pushLoop(ctx, conn, sess)
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(proto.ControlDeadline))
-		env, err := readFrame(r)
+		env, err := sess.ReadFrame(r)
 		if err != nil {
 			s.log.Info("backend disconnected", "remote", remote, "err", err)
 			return
@@ -181,11 +210,11 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 			if proto.DecodeInto(env, &u) == nil {
 				ack := s.applyUsage(u)
 				// The ack is what lets the backend drop its buffered copy. Sent
-				// from this goroutine, beside the pong: concurrent WriteFrames
-				// are safe, each is a single Write on the connection.
+				// from this goroutine, beside the pong, while pushLoop writes
+				// from another: Session.WriteFrame serialises them, which it has
+				// to now that each frame carries a sequence number.
 				if len(ack.Seqs) > 0 {
-					_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-					_ = proto.WriteFrame(conn, proto.MsgUsageAck, ack)
+					_ = sess.WriteFrame(conn, proto.MsgUsageAck, ack)
 				}
 			}
 		case proto.MsgLink:
@@ -198,8 +227,7 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 				s.eng.SetHandshakeAges(ages)
 			}
 		case proto.MsgPing:
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			_ = proto.WriteFrame(conn, proto.MsgPong, nil)
+			_ = sess.WriteFrame(conn, proto.MsgPong, nil)
 		}
 	}
 }
@@ -254,7 +282,7 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	return ack
 }
 
-func (s *ControlServer) pushLoop(ctx context.Context, conn net.Conn) {
+func (s *ControlServer) pushLoop(ctx context.Context, conn net.Conn, sess *proto.Session) {
 	var pushed uint64
 	first := true
 	t := time.NewTicker(2 * time.Second)
@@ -272,13 +300,11 @@ func (s *ControlServer) pushLoop(ctx context.Context, conn net.Conn) {
 				continue
 			}
 			pushed, first = v, false
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := proto.WriteFrame(conn, proto.MsgConfig, backendConfig(s.eng.Config())); err != nil {
+			if err := sess.WriteFrame(conn, proto.MsgConfig, backendConfig(s.eng.Config())); err != nil {
 				return
 			}
 		case <-ka.C:
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := proto.WriteFrame(conn, proto.MsgPing, nil); err != nil {
+			if err := sess.WriteFrame(conn, proto.MsgPing, nil); err != nil {
 				return
 			}
 		}
@@ -355,7 +381,7 @@ func readFrame(r *bufio.Reader) (proto.Envelope, error) {
 // tracks which tunnel is carrying traffic, and a second thing that had to agree
 // with the frontend about the active path is exactly the failure mode pfSense
 // demonstrates.
-func (s *ControlServer) serveLinker(ctx context.Context, conn net.Conn, r *bufio.Reader, hello proto.Hello, remote string) {
+func (s *ControlServer) serveLinker(ctx context.Context, conn net.Conn, r *bufio.Reader, sess *proto.Session, hello proto.Hello, remote string) {
 	// The shared secret proves the peer belongs to this deployment. It does not
 	// prove it is entitled to a particular overlay address, and a linker that
 	// could name itself could be handed another linker's networks - so the
@@ -384,11 +410,11 @@ func (s *ControlServer) serveLinker(ctx context.Context, conn net.Conn, r *bufio
 		_ = conn.Close()
 	}()
 
-	go s.pushLinkerLoop(ctx, conn, hello.OverlayIP)
+	go s.pushLinkerLoop(ctx, conn, sess, hello.OverlayIP)
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(proto.ControlDeadline))
-		env, err := readFrame(r)
+		env, err := sess.ReadFrame(r)
 		if err != nil {
 			s.log.Info("linker disconnected", "remote", remote, "overlay", hello.OverlayIP, "err", err)
 			return
@@ -398,15 +424,14 @@ func (s *ControlServer) serveLinker(ctx context.Context, conn net.Conn, r *bufio
 		// exactly the evidence that the host is still there.
 		s.eng.MarkLinkerSeen(hello.OverlayIP)
 		if env.Type == proto.MsgPing {
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			_ = proto.WriteFrame(conn, proto.MsgPong, nil)
+			_ = sess.WriteFrame(conn, proto.MsgPong, nil)
 		}
 	}
 }
 
 // pushLinkerLoop sends the linker its configuration, and again whenever it
 // changes. Mirrors pushLoop, keyed on the same version counter.
-func (s *ControlServer) pushLinkerLoop(ctx context.Context, conn net.Conn, overlayIP string) {
+func (s *ControlServer) pushLinkerLoop(ctx context.Context, conn net.Conn, sess *proto.Session, overlayIP string) {
 	// `first` rather than comparing against a zero value: the version counter
 	// starts at zero, so a linker connecting to a frontend whose configuration
 	// has never changed would match on the first pass and never be sent
@@ -421,8 +446,7 @@ func (s *ControlServer) pushLinkerLoop(ctx context.Context, conn net.Conn, overl
 		}
 		pushed, first = v, false
 		cfg := s.eng.LinkerConfigFor(overlayIP)
-		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := proto.WriteFrame(conn, proto.MsgLinkerConfig, cfg); err != nil {
+		if err := sess.WriteFrame(conn, proto.MsgLinkerConfig, cfg); err != nil {
 			return false
 		}
 		s.log.Info("pushed configuration to linker",
@@ -453,8 +477,7 @@ func (s *ControlServer) pushLinkerLoop(ctx context.Context, conn net.Conn, overl
 			// The read side of this session has a deadline, and a healthy
 			// linker has nothing to say - so without something to answer, an
 			// idle but perfectly well host would be dropped every 45 seconds.
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := proto.WriteFrame(conn, proto.MsgPing, nil); err != nil {
+			if err := sess.WriteFrame(conn, proto.MsgPing, nil); err != nil {
 				return
 			}
 		}

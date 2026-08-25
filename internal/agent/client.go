@@ -103,6 +103,26 @@ func (a *Agent) controlSession(ctx context.Context) error {
 // runSession is the session on an established connection, split out from the
 // dial so that its shutdown behaviour can be tested over a pipe.
 func (a *Agent) runSession(ctx context.Context, conn net.Conn, addr string) error {
+	// Closing the connection is the only thing that unblocks a read, and that
+	// has to be true from the first one, not from the end of the handshake.
+	//
+	// readFrame sits on the socket with nothing but a deadline behind it, and a
+	// silent-but-healthy channel is normal - the frontend only speaks when it
+	// has something to say. So a SIGTERM arriving mid-session left this
+	// goroutine parked for up to 45 seconds while systemd's TimeoutStopSec of
+	// 10 elapsed, and every restart ended in SIGKILL rather than a clean exit.
+	//
+	// The handshake is two reads of 15 seconds now that the frontend proves
+	// itself too, so installed after it this watcher left half a minute of the
+	// session's life uncovered - the same fault in the window where a redial
+	// loop makes it most likely. The linker's client has always done it here.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
+
 	r := bufio.NewReader(conn)
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	env, err := readFrame(r)
@@ -113,37 +133,53 @@ func (a *Agent) runSession(ctx context.Context, conn net.Conn, addr string) erro
 	if env.Type != proto.MsgChallenge || proto.DecodeInto(env, &ch) != nil {
 		return fmt.Errorf("unexpected first frame %q", env.Type)
 	}
+	// Both ends prove themselves. Ours first, then the frontend's, and nothing
+	// it sends is acted on until its half has been checked - see proto.Auth for
+	// why a one-sided handshake was not enough.
+	mine := proto.RandomNonce()
+	mac, err := proto.SignAuth(a.psk, ch.Nonce, mine)
+	if err != nil {
+		return fmt.Errorf("frontend sent an unusable challenge: %w", err)
+	}
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := proto.WriteFrame(conn, proto.MsgAuth, proto.Auth{MAC: proto.SignChallenge(a.psk, ch.Nonce)}); err != nil {
+	if err := proto.WriteFrame(conn, proto.MsgAuth, proto.Auth{MAC: mac, Nonce: mine}); err != nil {
 		return err
 	}
+	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	env, err = readFrame(r)
+	if err != nil {
+		return err
+	}
+	var ack proto.AuthAck
+	if env.Type != proto.MsgAuthAck || proto.DecodeInto(env, &ack) != nil ||
+		!proto.VerifyAuthAck(a.psk, ch.Nonce, mine, ack.MAC) {
+		return fmt.Errorf("the peer at %s did not prove it holds the shared secret; "+
+			"refusing to take configuration from it", addr)
+	}
+
+	// Every frame from here carries its own MAC. The handshake settles who the
+	// peer is and nothing about who writes down the socket afterwards; see
+	// proto.Session.
+	sess, err := proto.NewSession(a.psk, ch.Nonce, mine, true)
+	if err != nil {
+		return fmt.Errorf("cannot establish a session with %s: %w", addr, err)
+	}
+
 	host, _ := os.Hostname()
-	if err := proto.WriteFrame(conn, proto.MsgHello, proto.Hello{Version: Version, Hostname: host}); err != nil {
+	// The deadline for this and every later frame is set inside WriteFrame:
+	// the one taken before the auth write above may have been spent waiting
+	// for the frontend's proof, and on a slow link that failed the hello
+	// instantly and redialled forever.
+	if err := sess.WriteFrame(conn, proto.MsgHello, proto.Hello{Version: Version, Hostname: host}); err != nil {
 		return err
 	}
 	a.log.Info("control channel connected", "frontend", addr)
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Closing the connection is the only thing that unblocks the read below.
-	//
-	// readFrame sits on the socket with nothing but ControlDeadline behind it,
-	// and a silent-but-healthy channel is normal - the frontend only speaks
-	// when it has something to say. So a SIGTERM arriving mid-session left this
-	// goroutine parked for up to 45 seconds while systemd's TimeoutStopSec of
-	// 10 elapsed, and every restart ended in SIGKILL rather than a clean exit.
-	// The probe responder already does this; the control client did not.
-	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
-	}()
-
-	go a.reportLoop(ctx, conn)
+	go a.reportLoop(ctx, conn, sess)
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(proto.ControlDeadline))
-		env, err := readFrame(r)
+		env, err := sess.ReadFrame(r)
 		if err != nil {
 			return err
 		}
@@ -163,14 +199,13 @@ func (a *Agent) runSession(ctx context.Context, conn net.Conn, addr string) erro
 			}
 			a.meter.AckApplied(ack.Seqs)
 		case proto.MsgPing:
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			_ = proto.WriteFrame(conn, proto.MsgPong, nil)
+			_ = sess.WriteFrame(conn, proto.MsgPong, nil)
 		}
 	}
 }
 
 // reportLoop ships buffered usage and tunnel state upward.
-func (a *Agent) reportLoop(ctx context.Context, conn net.Conn) {
+func (a *Agent) reportLoop(ctx context.Context, conn net.Conn, sess *proto.Session) {
 	usage := time.NewTicker(10 * time.Second)
 	defer usage.Stop()
 	link := time.NewTicker(15 * time.Second)
@@ -189,8 +224,7 @@ func (a *Agent) reportLoop(ctx context.Context, conn net.Conn) {
 			if len(batch) == 0 {
 				continue
 			}
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := proto.WriteFrame(conn, proto.MsgUsage, proto.Usage{Deltas: batch}); err != nil {
+			if err := sess.WriteFrame(conn, proto.MsgUsage, proto.Usage{Deltas: batch}); err != nil {
 				return
 			}
 			// Deliberately not dropped here. A successful write is not delivery
@@ -220,8 +254,7 @@ func (a *Agent) reportLoop(ctx context.Context, conn net.Conn) {
 					Exists:          seen || sysx.IfaceExists(p.Iface),
 				})
 			}
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := proto.WriteFrame(conn, proto.MsgLink, report); err != nil {
+			if err := sess.WriteFrame(conn, proto.MsgLink, report); err != nil {
 				return
 			}
 		}

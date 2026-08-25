@@ -84,14 +84,53 @@ func (l *Linker) session(ctx context.Context) error {
 		return fmt.Errorf("expected a challenge, got %q", env.Type)
 	}
 
+	// Both ends prove themselves, and this end has the most to lose by not
+	// insisting on it. The frame above arrived over a first hop that is
+	// plaintext TCP on the local network - this host reaches the frontend by
+	// routing through the backend as a neighbour, and only enters WireGuard
+	// there - so anything on that segment can answer in the frontend's place.
+	// What it would then be believed about is applyEgress, which loads what it
+	// is told into nftables as root.
+	mine := proto.RandomNonce()
+	mac, err := proto.SignAuth(l.boot.Key(), ch.Nonce, mine)
+	if err != nil {
+		return fmt.Errorf("unusable challenge from %s: %w", addr, err)
+	}
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := proto.WriteFrame(conn, proto.MsgAuth,
-		proto.Auth{MAC: proto.SignChallenge(l.boot.Key(), ch.Nonce)}); err != nil {
+	if err := proto.WriteFrame(conn, proto.MsgAuth, proto.Auth{MAC: mac, Nonce: mine}); err != nil {
 		return fmt.Errorf("send auth: %w", err)
 	}
 
+	// Checked before the hello goes out, so a peer that cannot prove itself is
+	// not even told which overlay address this host holds.
+	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	env, err = readFrame(r)
+	if err != nil {
+		return fmt.Errorf("read auth ack: %w", err)
+	}
+	var ack proto.AuthAck
+	if env.Type != proto.MsgAuthAck || proto.DecodeInto(env, &ack) != nil ||
+		!proto.VerifyAuthAck(l.boot.Key(), ch.Nonce, mine, ack.MAC) {
+		return fmt.Errorf("the peer at %s did not prove it holds the shared secret; "+
+			"refusing to take egress networks from it", addr)
+	}
+
+	// And every frame after it carries its own MAC. Proving who answered the
+	// handshake is not the same as knowing who is writing down the socket
+	// afterwards: the neighbour who could have impersonated the frontend on
+	// this hop could equally have relayed the handshake to the real one and
+	// then sent frames of its own. See proto.Session.
+	sess, err := proto.NewSession(l.boot.Key(), ch.Nonce, mine, true)
+	if err != nil {
+		return fmt.Errorf("cannot establish a session with %s: %w", addr, err)
+	}
+
 	host, _ := os.Hostname()
-	if err := proto.WriteFrame(conn, proto.MsgHello, proto.Hello{
+	// The deadline for this and every later frame is set inside WriteFrame:
+	// the one taken before the auth write above may have been spent waiting
+	// for the frontend's proof, and on a slow link that failed the hello
+	// instantly and redialled forever.
+	if err := sess.WriteFrame(conn, proto.MsgHello, proto.Hello{
 		Version:   Version,
 		Hostname:  host,
 		Role:      model.RoleLinker,
@@ -105,13 +144,12 @@ func (l *Linker) session(ctx context.Context) error {
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(proto.ControlDeadline))
-		env, err := readFrame(r)
+		env, err := sess.ReadFrame(r)
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
 		if env.Type == proto.MsgPing {
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			_ = proto.WriteFrame(conn, proto.MsgPong, nil)
+			_ = sess.WriteFrame(conn, proto.MsgPong, nil)
 			continue
 		}
 		if env.Type != proto.MsgLinkerConfig {
