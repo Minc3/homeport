@@ -61,12 +61,12 @@ type Agent struct {
 	//
 	// The warning is throttled because it is reached from the probe read loop,
 	// which runs at the active cadence: unthrottled it would be the flood
-	// rather than a report of one.
-	seqMu           sync.Mutex
-	seqBase         uint64
-	seqBaseAt       time.Time
-	implausibleAt   time.Time
-	implausibleSeen int
+	// rather than a report of one. Responder.flushThrottles is its trailing
+	// edge, so a burst that stops inside the window is still counted.
+	seqMu       sync.Mutex
+	seqBase     uint64
+	seqBaseAt   time.Time
+	implausible throttle
 
 	// applyMu serialises the shell-outs that write routes, so only one
 	// goroutine is running `ip` at a time.
@@ -668,7 +668,16 @@ func plausibleDecisionSeq(seq, base uint64, baseAt, now time.Time) bool {
 	}
 	ceiling := base + (uint64(elapsed.Milliseconds()) << 16)
 	// A frontend that restarted seeded itself from a clock no later than this
-	// host's own, whatever the two disagree about.
+	// host's own - unless this host's clock is itself stale, which is the one
+	// case neither reference covers. A backend more than the skew behind real
+	// time, whose anchor was also stamped while the frontend had been up
+	// longer than the skew, refuses a restarted frontend's decisions until
+	// the ceiling catches up: staleness minus the skew, at the rate real time
+	// passes. It is bounded and it self-heals - probes arriving means a
+	// tunnel is up, which means a route to NTP exists again - and closing it
+	// outright needs the frontend's clock on the wire, which is a protocol
+	// change. Named here so the residual is a decision rather than a
+	// surprise.
 	//
 	// Bounded by the same horizon the sequences are, because the shift can
 	// overflow. Past about the year 10889 `ms << 16` no longer fits in a
@@ -708,22 +717,21 @@ func (a *Agent) decisionSeqAnchor() (uint64, time.Time) {
 // warnImplausibleSeq reports a refused sequence at a rate that cannot flood
 // the journal. Called from the probe read loop, so it does no work beyond a
 // mutex and a comparison in the common case.
-// The lock covers the counter and nothing else. Logging inside it would put a
-// write to the journal on the probe read loop's path, which is the one thing
-// invariant 16 asks this loop never to do: a slow or full journal would stall
-// replies on every path at once, and three tunnels going quiet together is
-// indistinguishable from three tunnels dying.
+// The throttle's lock covers the counter and nothing else. Logging inside it
+// would put a write to the journal on the probe read loop's path, which is
+// the one thing invariant 16 asks this loop never to do: a slow or full
+// journal would stall replies on every path at once, and three tunnels going
+// quiet together is indistinguishable from three tunnels dying.
+// Responder.flushThrottles carries its trailing edge, so a burst that stops
+// inside the window - a frontend clock corrected minutes after it was wrong -
+// is still counted rather than swallowed.
 func (a *Agent) warnImplausibleSeq(pathID int, seq uint64) {
-	a.seqMu.Lock()
-	a.implausibleSeen++
-	if time.Since(a.implausibleAt) < 30*time.Second {
-		a.seqMu.Unlock()
+	seen := a.implausible.take()
+	if seen == 0 {
 		return
 	}
-	seen := a.implausibleSeen
+	a.seqMu.Lock()
 	base, baseAt := a.seqBase, a.seqBaseAt
-	a.implausibleAt = time.Now()
-	a.implausibleSeen = 0
 	a.seqMu.Unlock()
 
 	// Named for what the check actually measures. The first version of this
@@ -735,6 +743,16 @@ func (a *Agent) warnImplausibleSeq(pathID int, seq uint64) {
 	a.log.Warn("refusing a routing decision whose sequence is beyond the plausible ceiling",
 		"probes", seen, "path_id", pathID, "seq", seq, "anchor", base, "ceiling_from", baseAt,
 		"hint", "the ceiling is the frontend's first sequence this agent saw plus elapsed time, or this host's clock, whichever is higher, plus a week; if the frontend is healthy, restarting failover-backend re-anchors it, and if it recurs something holding the shared secret is forging probes")
+}
+
+// flushImplausibleSeq is warnImplausibleSeq's trailing edge, ticked by
+// Responder.flushThrottles because the refusals arrive on its read loop.
+func (a *Agent) flushImplausibleSeq() {
+	if n := a.implausible.flush(); n > 0 {
+		a.log.Warn("further routing decisions were refused; their sequences were beyond the plausible ceiling",
+			"probes", n, "since", throttleWindow,
+			"hint", "if the frontend is healthy, restarting failover-backend re-anchors the ceiling; if it recurs something holding the shared secret is forging probes")
+	}
 }
 
 // pathDecision is the frontend's choice, waiting to be applied.

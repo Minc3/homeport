@@ -16,6 +16,7 @@ import (
 
 	"github.com/quinlan102/homeport/internal/model"
 	"github.com/quinlan102/homeport/internal/quota"
+	"github.com/quinlan102/homeport/internal/store"
 	"github.com/quinlan102/homeport/internal/sysx"
 )
 
@@ -450,6 +451,18 @@ func validate(cfg *model.Config) error {
 		}
 		if p.Quota.CeilingBytes > 0 && p.Quota.CeilingBytes < p.Quota.LimitBytes {
 			return fmt.Errorf("path %s has a ceiling below its quota", p.Name)
+		}
+		// Bounded above by the ledger's own ceiling, and keyed on it for the
+		// reason the calibration bound is keyed on quota's constants: the
+		// portal's quota boxes clamp to this same value (MAX_QUOTA_GB in
+		// app.js), and a bound that lived only in the browser is decoration
+		// for a hand-written PUT. The ledger saturates at
+		// store.MaxLedgerValue, so a limit above it is one the recorded usage
+		// can never reach: the quota never trips, silently, which is the
+		// under-enforcement direction everything else here refuses.
+		if p.Quota.LimitBytes > store.MaxLedgerValue || p.Quota.CeilingBytes > store.MaxLedgerValue {
+			return fmt.Errorf("path %s has a quota past what the usage ledger can record; "+
+				"the limit and the ceiling must not exceed %d bytes", p.Name, int64(store.MaxLedgerValue))
 		}
 	}
 

@@ -8,6 +8,8 @@ const GB = 1024 * 1024 * 1024;
 // is also what keeps `v * GB` inside an int64 - without a ceiling here, a box
 // overflowed to MAX_SAFE_INTEGER multiplies to 9.67e24, which Go's decoder
 // refuses outright, and that then blocks every later save of the whole form.
+// web.validate enforces the same bound on the same constant, because a bound
+// that lives only in the browser is decoration for a hand-written PUT.
 const MAX_QUOTA_GB = 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------

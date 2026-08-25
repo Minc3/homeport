@@ -747,12 +747,36 @@ func (s *Store) SetMeta(key, value string) error {
 }
 
 // Meta reads a key, returning "" when absent.
+//
+// It also returns "" when the read *fails*, and that fold is fine for every
+// caller that treats the value as a cache or a cosmetic - which is why it
+// survives - and wrong for one that treats "" as a semantic zero. The usage
+// watermark is the one of those: see MetaChecked.
 func (s *Store) Meta(key string) string {
-	var v string
-	if err := s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, key).Scan(&v); err != nil {
-		return ""
-	}
+	v, _ := s.MetaChecked(key)
 	return v
+}
+
+// MetaChecked reads a key, distinguishing an absent row from a read that
+// failed. An absent row is ("", nil); any other error is the caller's to
+// handle.
+//
+// The distinction exists for the usage watermark. applyUsage parses the value
+// into the per-path dedupe floor, so a read error folded into "" is not a
+// missing answer, it is the answer zero - and against a zero floor every
+// already-billed delta in a resent batch reads as new. One transient read
+// failure at the top of a batch was up to five hundred deltas of metered LTE
+// billed a second time, with nothing in the journal naming a fault.
+func (s *Store) MetaChecked(key string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
 }
 
 // Prune drops history past its retention window and expired sessions. Usage

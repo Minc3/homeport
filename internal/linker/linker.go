@@ -146,7 +146,37 @@ func (l *Linker) applyEgress(ctx context.Context, cidrs []string) {
 	l.applyMu.Lock()
 	defer l.applyMu.Unlock()
 
-	if err := l.installEgress(ctx, cidrs); err != nil {
+	// Parsed once, here, and carried down: the branch that decides and the
+	// ruleset that is written must not be able to disagree about what usable
+	// meant. The backend's applyEgress states the same rule, and for a while
+	// the two disagreed about the case that matters most.
+	usable := sysx.EgressNetworks(cidrs)
+	if len(usable) != len(cidrs) {
+		l.log.Warn("ignoring egress networks that are not IPv4 networks",
+			"asked", cidrs, "usable", usable)
+	}
+	// A list that is not empty as sent and is empty as parsed is a fault, not
+	// an instruction. The backend already treats it as one - see its
+	// applyEgress - and this agent used to read it as "the feature is off" and
+	// take a working ruleset down: containers lost their tunnel egress and the
+	// server browser started advertising the house's address, on the word of a
+	// push nothing honest produces. Recorded as handled, deliberately: the
+	// parse of a fixed list is deterministic, so a retry every reconcile tick
+	// could never succeed and would only repeat this line every ten seconds.
+	// An empty list as sent still reaches installEgress and still removes the
+	// rules - that one is the instruction.
+	if len(cidrs) > 0 && len(usable) == 0 {
+		l.log.Error("cannot pull networks onto the overlay: none of them are IPv4 networks; "+
+			"leaving the egress rules as they are",
+			"networks", cidrs)
+		l.mu.Lock()
+		l.egressHave = append([]string(nil), cidrs...)
+		l.egressOK = true
+		l.mu.Unlock()
+		return
+	}
+
+	if err := l.installEgress(ctx, usable); err != nil {
 		l.mu.Lock()
 		l.egressOK = false
 		l.mu.Unlock()
@@ -163,30 +193,30 @@ func (l *Linker) applyEgress(ctx context.Context, cidrs []string) {
 	l.egressOK = true
 	l.mu.Unlock()
 
-	// On what was installed, not on what arrived. A push whose networks are all
-	// unusable takes the rules down, and reporting that as "installed" beside
-	// the list that was refused is the journal disagreeing with the kernel.
-	if installed := sysx.EgressNetworks(cidrs); len(installed) == 0 {
+	// On what was installed, not on what arrived: entries the parse could not
+	// use were dropped on the way in, and naming them here as routed would
+	// have the journal disagree with the kernel.
+	if len(usable) == 0 {
 		l.log.Info("no egress networks configured for this host; source NAT removed")
 	} else {
-		l.log.Info("egress networks installed", "networks", installed,
+		l.log.Info("egress networks installed", "networks", usable,
 			"source", l.boot.Linker.OverlayIP)
 	}
 }
 
 // installEgress does the work, and reports whether the system took it. Split
 // out so applyEgress has exactly one success path to commit on.
-func (l *Linker) installEgress(ctx context.Context, cidrs []string) error {
-	// Filtered here as well as inside the builder, so the early-out below and
-	// the rules that go in ahead of the ruleset agree with what will actually
-	// be rendered. A push whose networks are all unusable has to take the rules
-	// down, not install the mark rule and then load an empty file over a table
-	// that is already there.
-	usable := sysx.EgressNetworks(cidrs)
-	if len(usable) != len(cidrs) {
-		l.log.Warn("ignoring egress networks that are not IPv4 networks",
-			"asked", cidrs, "usable", usable)
-	}
+//
+// It takes the parsed list, not the pushed one: applyEgress filters through
+// sysx.EgressNetworks exactly once and carries the result down, so this
+// function, its early-out and the ruleset builder cannot disagree about what
+// usable meant. An empty list here is therefore an instruction - the pushed
+// list was empty - because applyEgress refuses the all-unusable case before
+// this is called. Acting on it matters: keyed the other way, the mark rule
+// went in and an empty ruleset was loaded over whatever table was already
+// there, and a marked packet with no ruleset behind it is the leak the
+// ordering below exists to prevent.
+func (l *Linker) installEgress(ctx context.Context, usable []string) error {
 	if len(usable) == 0 {
 		sysx.RemoveLinkerEgressRuleset(ctx, l.runner, l.boot.Linker.BackendLAN, l.table())
 		return nil

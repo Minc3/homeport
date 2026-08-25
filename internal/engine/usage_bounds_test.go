@@ -715,3 +715,62 @@ func TestBothUsageEntryPointsShareOneStampWindow(t *testing.T) {
 		})
 	}
 }
+
+// A watermark that cannot be read is not a watermark of zero.
+//
+// Store.Meta folds a failed read into "", which parses as 0, so a corrupted
+// meta row or a transient read failure at the top of a batch handed the dedupe
+// a floor of nothing: every already-billed delta in a resent batch read as
+// strictly newer, and the per-batch memo held that answer for up to five
+// hundred of them - metered LTE billed twice, with nothing in the journal
+// naming a fault. Held back instead, and crucially not acked: the ack is what
+// tells the backend to drop the buffered copy this refusal depends on being
+// resent once the read works again.
+func TestAnUnreadableWatermarkHoldsDeltasBackRatherThanRebilling(t *testing.T) {
+	s, e, p := usageServer(t)
+	now := time.Now()
+	key := "usage_seq:" + strconv.Itoa(p.ID)
+
+	first := proto.Usage{Deltas: []proto.UsageDelta{
+		{PathID: p.ID, Sequence: 40, Bytes: 1 << 20, Packets: 100, AtUnix: now.Unix()},
+	}}
+	if ack := s.applyUsage(first); ack.Seqs[p.ID] != 40 {
+		t.Fatalf("the ordinary delta was not applied; ack = %+v", ack.Seqs)
+	}
+	billed := ledger(t, e, p, now)
+	if billed == 0 {
+		t.Fatal("nothing was billed for the ordinary delta")
+	}
+
+	// The way a broken watermark actually presents through Meta: a value that
+	// does not parse back into a sequence.
+	if err := e.Store().SetMeta(key, "garbage"); err != nil {
+		t.Fatalf("corrupt the watermark: %v", err)
+	}
+
+	ack := s.applyUsage(first) // the backend's resend of the same batch
+	if _, ok := ack.Seqs[p.ID]; ok {
+		t.Errorf("acked a batch whose watermark could not be read; the backend would drop its buffered copy")
+	}
+	if got := ledger(t, e, p, now); got != billed {
+		t.Errorf("ledger moved from %d to %d against an unreadable watermark; the resend was billed again", billed, got)
+	}
+
+	// Repaired, the same resend is a pure duplicate again and a newer delta
+	// still lands: the hold is a refusal to guess, not a stall.
+	if err := e.Store().SetMeta(key, "40"); err != nil {
+		t.Fatalf("repair the watermark: %v", err)
+	}
+	if ack := s.applyUsage(first); ack.Seqs[p.ID] != 40 {
+		t.Errorf("a pure resend against the repaired watermark was not acked at it; ack = %+v", ack.Seqs)
+	}
+	next := proto.Usage{Deltas: []proto.UsageDelta{
+		{PathID: p.ID, Sequence: 41, Bytes: 1 << 20, Packets: 100, AtUnix: now.Unix()},
+	}}
+	if ack := s.applyUsage(next); ack.Seqs[p.ID] != 41 {
+		t.Errorf("the next honest delta was not applied after the repair; ack = %+v", ack.Seqs)
+	}
+	if got := ledger(t, e, p, now); got <= billed {
+		t.Errorf("ledger = %d after the next honest delta, want more than %d", got, billed)
+	}
+}

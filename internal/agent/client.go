@@ -193,7 +193,20 @@ func (a *Agent) runSession(ctx context.Context, conn net.Conn, addr string) erro
 	}
 	a.log.Info("control channel connected", "frontend", addr)
 
-	go a.reportLoop(ctx, conn, sess)
+	// Its exit ends the session. reportLoop returns on a write error, and for a
+	// broken connection that is redundant - the read loop below dies with the
+	// socket. A refused oversized frame is the case that is not: a local
+	// refusal on a healthy socket, after which this loop would go on answering
+	// the frontend's pings indefinitely, a session reporting itself healthy
+	// with usage reporting dead - metered LTE deltas buffering on disk
+	// unshipped for as long as the process lives, and the quota never
+	// tripping. The cancel closes the connection (the watcher above), the read
+	// loop returns, and the redial makes warnUnsendable's story true: this
+	// agent reconnects and fails the same way, with the cause named each time.
+	go func() {
+		a.reportLoop(ctx, conn, sess)
+		cancel()
+	}()
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(proto.ControlDeadline))

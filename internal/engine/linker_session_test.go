@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -280,6 +282,99 @@ func TestTheFrontendRefusesAnUnauthenticatedFrame(t *testing.T) {
 			t.Errorf("an unauthenticated frame registered liveness: %+v", l)
 		}
 	}
+}
+
+// recordingHandler keeps every log message, so a specific line can be
+// asserted from outside. Mutex'd because serve logs from its own goroutine.
+type recordingHandler struct {
+	slog.Handler
+	mu   *sync.Mutex
+	msgs *[]string
+}
+
+func (h recordingHandler) Handle(ctx context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.msgs = append(*h.msgs, r.Message)
+	return nil
+}
+
+// A frame injected after a relayed handshake is named in the journal, not
+// dropped in silence.
+//
+// The refusal itself is pinned above; this is the other half. The hello read
+// is the read the session MAC exists for - a relay that passed the handshake
+// through and then injected its own frame fails exactly here - and serve used
+// to return without a word, discarding the one observable trace of the attack
+// the per-frame MAC was built to detect, while the identical class of evidence
+// one read earlier was named and throttled.
+func TestAnInjectedPostHandshakeFrameIsNamed(t *testing.T) {
+	psk := []byte("shared-secret")
+	e := newTestEngine(linkerCfg(), nil)
+
+	var mu sync.Mutex
+	var msgs []string
+	log := slog.New(recordingHandler{
+		Handler: slog.NewTextHandler(io.Discard, nil),
+		mu:      &mu, msgs: &msgs,
+	})
+
+	srvConn, cliConn := net.Pipe()
+	defer cliConn.Close()
+	s := &ControlServer{eng: e, log: log, psk: psk}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.serve(ctx, srvConn)
+
+	r := bufio.NewReader(cliConn)
+	_ = cliConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	line, err := r.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read challenge: %v", err)
+	}
+	var env proto.Envelope
+	if err := json.Unmarshal(line, &env); err != nil {
+		t.Fatalf("decode challenge: %v", err)
+	}
+	var ch proto.Challenge
+	if err := proto.DecodeInto(env, &ch); err != nil {
+		t.Fatalf("challenge payload: %v", err)
+	}
+	mine := proto.RandomNonce()
+	mac, err := proto.SignAuth(psk, ch.Nonce, mine)
+	if err != nil {
+		t.Fatalf("sign auth: %v", err)
+	}
+	if err := proto.WriteFrame(cliConn, proto.MsgAuth, proto.Auth{MAC: mac, Nonce: mine}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if _, err := r.ReadBytes('\n'); err != nil { // the frontend's proof
+		t.Fatalf("read auth ack: %v", err)
+	}
+
+	// A hello with no session MAC, as a relay's injection arrives.
+	if err := proto.WriteFrame(cliConn, proto.MsgHello, proto.Hello{
+		Role: model.RoleLinker, OverlayIP: "10.99.0.3", Hostname: "relay",
+	}); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+
+	// serve logs before it returns and returning closes the connection, so
+	// once this read has failed the line is either recorded or missing.
+	_ = cliConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := r.ReadBytes('\n'); err == nil {
+		t.Fatal("the frontend answered a frame it had not authenticated")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, m := range msgs {
+		if strings.Contains(m, "failed its authentication") {
+			return
+		}
+	}
+	t.Errorf("no journal line named the injected frame; logged: %q", msgs)
 }
 
 // Every frame the frontend sends goes through the session, not just the ones

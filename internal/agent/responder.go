@@ -32,6 +32,13 @@ type Responder struct {
 	mu      sync.Mutex
 	replies map[int]*net.UDPConn // path id -> marked reply socket
 	reload  chan struct{}
+
+	// Fields rather than locals in listen, for the reason the frontend's are:
+	// Run re-enters listen after a failure, and counters that reset there
+	// forget a burst in progress. See throttle for the trailing edge the
+	// hand-rolled versions of these did not have.
+	noise        throttle // unauthenticated probe packets
+	wrongVersion throttle // probes from a different wire version
 }
 
 // NewResponder builds the probe responder.
@@ -58,6 +65,12 @@ func (r *Responder) Run(ctx context.Context) {
 	// a goroutine on every socket retry, and left several watchers racing to
 	// close the same reply sockets.
 	go r.watchReloads(ctx)
+	// The trailing edge of the throttles below, and of the agent's refused
+	// decision counter, whose events also arrive on this read loop. Without it
+	// a burst that stops inside a window - which is what an upgrade window's
+	// version mismatch does by definition, the moment the other host is
+	// upgraded - is counted and never reported.
+	go r.flushThrottles(ctx)
 
 	for ctx.Err() == nil {
 		if err := r.listen(ctx); err != nil {
@@ -95,11 +108,8 @@ func (r *Responder) listen(ctx context.Context) error {
 	// overlay they are indistinguishable from noise. But the single most
 	// likely cause is a shared secret that does not match the frontend's, and
 	// with no log at all that looks exactly like a dead tunnel. Report it at a
-	// rate that cannot flood the journal.
-	var lastNoise time.Time
-	var noise int
-	var lastVersion time.Time
-	var wrongVersion int
+	// rate that cannot flood the journal: r.noise and r.wrongVersion, with
+	// flushThrottles as their trailing edge.
 	var lastFail time.Time
 	failed := map[int]int{}
 
@@ -121,21 +131,15 @@ func (r *Responder) listen(ctx context.Context) error {
 			// not authenticate there. Told it was a secret mismatch, an
 			// operator goes and checks the one thing that is fine.
 			if errors.Is(err, proto.ErrProbeVersion) {
-				wrongVersion++
-				if time.Since(lastVersion) > 30*time.Second {
+				if n := r.wrongVersion.take(); n > 0 {
 					r.log.Warn("dropping probes from a different wire version; upgrade both hosts to the same build",
-						"packets", wrongVersion, "from", src.String())
-					lastVersion = time.Now()
-					wrongVersion = 0
+						"packets", n, "from", src.String())
 				}
 				continue
 			}
-			noise++
-			if time.Since(lastNoise) > 30*time.Second {
+			if n := r.noise.take(); n > 0 {
 				r.log.Warn("dropping unauthenticated probe packets; check that the shared secret is identical on both hosts",
-					"packets", noise, "from", src.String(), "err", err)
-				lastNoise = time.Now()
-				noise = 0
+					"packets", n, "from", src.String(), "err", err)
 			}
 			continue
 		}
@@ -177,6 +181,36 @@ func (r *Responder) listen(ctx context.Context) error {
 				lastFail = time.Now()
 				failed = map[int]int{}
 			}
+		}
+	}
+}
+
+// flushThrottles is the trailing edge of every throttled report whose events
+// arrive on the probe read loop: the responder's own two, and the agent's
+// refused-decision counter, which SetActivePath feeds from this same loop.
+// Without it a burst that stops inside a window is counted and never reported
+// - during the documented staged upgrade the version-mismatch burst stops the
+// moment the other host is upgraded, which used to erase the tally that
+// explained the outage window. The flush lines carry no `from` address,
+// because the counts may span sources; the leading-edge lines name one.
+func (r *Responder) flushThrottles(ctx context.Context) {
+	t := time.NewTicker(throttleWindow)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if n := r.wrongVersion.flush(); n > 0 {
+				r.log.Warn("further probes from a different wire version were dropped",
+					"packets", n, "since", throttleWindow)
+			}
+			if n := r.noise.flush(); n > 0 {
+				r.log.Warn("further unauthenticated probe packets were dropped",
+					"packets", n, "since", throttleWindow,
+					"hint", "check that the shared secret is identical on both hosts")
+			}
+			r.agent.flushImplausibleSeq()
 		}
 	}
 }

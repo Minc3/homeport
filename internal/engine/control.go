@@ -59,6 +59,14 @@ type ControlServer struct {
 	badPath    throttle // a usage delta naming a path id no configuration holds
 	badSeq     throttle // a usage delta whose sequence would poison the watermark
 	oversized  throttle // a usage batch with more deltas than one frame applies
+	// Two more with remediations of their own, split off `rejected` because a
+	// shared window is won by whichever reason fires first: a backend redialling
+	// with a mismatched secret wins essentially every window, and the one
+	// rejection that means "somebody sent something no honest agent sends" was
+	// folded into its count with no reason attached - which is the opposite of
+	// why ErrFrameTooLarge is its own error.
+	badFrame throttle // a frame past the wire size limit - nothing honest sends one
+	tampered throttle // a post-handshake frame that failed its session authentication
 
 	// usageMu serialises applyUsage across connections.
 	//
@@ -153,6 +161,18 @@ func (s *ControlServer) warnRejected(remote, why string, err error) {
 	}
 }
 
+// warnBadFrame reports a frame past the wire size limit, wherever in a
+// connection's life it arrives. The remediation is the same before and after
+// the handshake - nothing honest sends one, so somebody is probing - which is
+// why it is one counter and warnRejected is another.
+func (s *ControlServer) warnBadFrame(remote string, err error) {
+	if seen := s.badFrame.take(); seen > 0 {
+		s.log.Warn("control frame over the size limit; dropping the connection",
+			"frames", seen, "remote", remote, "limit", proto.MaxFrameBytes, "err", err,
+			"hint", "no honest agent sends one; somebody is probing this listener")
+	}
+}
+
 // reports pairs every throttle with the line its trailing edge emits.
 //
 // A table rather than a run of near-identical blocks, because adding a reason
@@ -178,6 +198,10 @@ func (s *ControlServer) reports() []throttleReport {
 			[]any{"hint", "check meter-state.json on the backend"}},
 		{&s.oversized, slog.LevelError, "further usage batches were larger than one frame applies", "batches",
 			[]any{"limit", maxDeltasPerFrame}},
+		{&s.badFrame, slog.LevelWarn, "further control frames over the size limit were dropped", "frames",
+			[]any{"limit", proto.MaxFrameBytes, "hint", "no honest agent sends one; somebody is probing this listener"}},
+		{&s.tampered, slog.LevelWarn, "further post-handshake frames failed their authentication", "frames",
+			[]any{"hint", "a relayed handshake with injected frames looks exactly like this; see proto.Session"}},
 	}
 }
 
@@ -456,12 +480,17 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 		// before. An oversized frame is the one rejection here that is not a
 		// peer failing to prove itself: proto.ErrFrameTooLarge means somebody
 		// sent something no honest agent sends, and separating it from an
-		// authentication failure is the whole reason it is its own error.
-		why := "unreadable first frame"
+		// authentication failure is the whole reason it is its own error. Its
+		// own counter, too, not just its own wording: on the shared throttle a
+		// backend redialling with a mismatched secret won essentially every
+		// window, and the oversized frame was folded into the generic count
+		// with no reason attached - distinguished in the message and erased in
+		// the arithmetic.
 		if errors.Is(err, proto.ErrFrameTooLarge) {
-			why = "first frame over the size limit"
+			s.warnBadFrame(remote, err)
+		} else {
+			s.warnRejected(remote, "unreadable first frame", err)
 		}
-		s.warnRejected(remote, why, err)
 		return
 	}
 	var auth proto.Auth
@@ -505,6 +534,23 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	first, err := sess.ReadFrame(r)
 	if err != nil {
+		// Not in silence. One read earlier the same errors are named, and this
+		// read is the one the session MAC exists for: a relay that passed the
+		// handshake through and then injected a frame of its own fails here as
+		// proto.ErrBadFrame, and returning quietly discards the one observable
+		// trace of the attack the per-frame MAC was built to detect. A peer
+		// that authenticated and then went away is still allowed to do so
+		// without a line - a timeout or a close is an ordinary disconnect.
+		switch {
+		case errors.Is(err, proto.ErrBadFrame):
+			if seen := s.tampered.take(); seen > 0 {
+				s.log.Warn("a frame after the handshake failed its authentication; dropping the connection",
+					"frames", seen, "remote", remote, "err", err,
+					"hint", "a relayed handshake with injected frames looks exactly like this; see proto.Session")
+			}
+		case errors.Is(err, proto.ErrFrameTooLarge):
+			s.warnBadFrame(remote, err)
+		}
 		return
 	}
 	var hello proto.Hello
@@ -574,8 +620,16 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 		_ = conn.Close()
 	}()
 
-	// Push config immediately, then whenever it changes.
-	go s.pushLoop(ctx, conn, sess)
+	// Push config immediately, then whenever it changes. Its exit takes the
+	// session with it: pushLoop returns on a write error, and a refused
+	// oversized frame is a local refusal on a healthy socket - without the
+	// cancel the read loop below would go on answering pings for a session
+	// that can no longer be configured, until the far end's deadline noticed
+	// the missing keepalives 45 seconds later.
+	go func() {
+		s.pushLoop(ctx, conn, sess)
+		cancel()
+	}()
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(proto.ControlDeadline))
@@ -791,14 +845,6 @@ const (
 	maxDeltasPerFrame = 1000
 )
 
-// clampCounts brings a delta's two counts inside the bounds above and names
-// what it moved.
-//
-// One definition, called from checkDelta and from Engine.addUsageBatch. It was
-// written out twice, and the two agreed only because they happened to name the
-// same constants: a change to the shape of the rule, a floor other than zero or
-// a different answer for one of the four cases, had two places to be found and
-// nothing to make the second one fail.
 // clampStamp brings a delta's timestamp inside the window, and names the
 // direction it came from.
 //
@@ -827,6 +873,14 @@ func clampStamp(atUnix int64, now time.Time) (int64, string) {
 	return atUnix, ""
 }
 
+// clampCounts brings a delta's two counts inside the bounds above and names
+// what it moved.
+//
+// One definition, called from checkDelta and from Engine.addUsageBatch. It was
+// written out twice, and the two agreed only because they happened to name the
+// same constants: a change to the shape of the rule, a floor other than zero or
+// a different answer for one of the four cases, had two places to be found and
+// nothing to make the second one fail.
 func clampCounts(bytes, packets int64) (int64, int64, []string) {
 	var why []string
 	if bytes < 0 {
@@ -954,6 +1008,10 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	// Reconfigure would have to land mid-frame, and a path removed or added
 	// halfway through one is exactly as arbitrary either way.
 	known := map[int]bool{}
+	// Paths whose watermark could not be read this batch. Held back whole: the
+	// alternative on a failed read is a floor of zero, which is the double
+	// billing the memoised read exists to avoid, at batch width.
+	unread := map[int]bool{}
 
 	// Bounded in count as well as in value. The backend batches at most 500
 	// (agent.reportLoop), and nothing here enforced that: a frame is bounded
@@ -1020,10 +1078,33 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 			}
 			continue
 		}
+		if unread[d.PathID] {
+			continue
+		}
 		b := batches[d.PathID]
 		if b == nil {
 			key := "usage_seq:" + strconv.Itoa(d.PathID)
-			last, _ := strconv.ParseUint(st.Meta(key), 10, 64)
+			// A watermark that cannot be read is not a watermark of zero.
+			// st.Meta folds a failed read into "", and "" parses to 0, so a
+			// transient database error at the top of a batch handed the dedupe
+			// a floor of nothing: every already-billed delta in a resent batch
+			// read as new, and the memo held that answer for up to five hundred
+			// of them. The path's deltas are held back instead - never acked,
+			// so the backend resends them and they are billed once the read
+			// succeeds. A stored value that does not parse is the same refusal
+			// with a worse cause, because it will not heal on its own.
+			raw, err := st.MetaChecked(key)
+			var last uint64
+			if err == nil && raw != "" {
+				last, err = strconv.ParseUint(raw, 10, 64)
+			}
+			if err != nil {
+				s.log.Warn("cannot read this path's usage watermark; holding its deltas back",
+					"path_id", d.PathID, "key", key, "err", err,
+					"hint", "the backend resends them, so nothing is lost while this lasts; a value that does not parse means the meta row needs editing")
+				unread[d.PathID] = true
+				continue
+			}
 			b = &pathBatch{key: key, base: last, seen: last}
 			batches[d.PathID] = b
 			order = append(order, d.PathID)
@@ -1235,7 +1316,12 @@ func (s *ControlServer) serveLinker(ctx context.Context, conn net.Conn, r *bufio
 		_ = conn.Close()
 	}()
 
-	go s.pushLinkerLoop(ctx, conn, sess, hello.OverlayIP)
+	// As with pushLoop: when the push loop stops pushing, the session is over,
+	// and the cancel is what says so to the read loop below.
+	go func() {
+		s.pushLinkerLoop(ctx, conn, sess, hello.OverlayIP)
+		cancel()
+	}()
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(proto.ControlDeadline))

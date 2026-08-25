@@ -7,6 +7,7 @@ import (
 
 	"github.com/quinlan102/homeport/internal/model"
 	"github.com/quinlan102/homeport/internal/quota"
+	"github.com/quinlan102/homeport/internal/store"
 	"github.com/quinlan102/homeport/internal/sysx"
 )
 
@@ -129,6 +130,36 @@ func TestValidateRejectsCalibrationAndOverheadAboveTheClamp(t *testing.T) {
 	cfg.Paths[1].Quota.OverheadPerPacket = quota.MaxOverheadPerPacket
 	if err := validate(&cfg); err != nil {
 		t.Errorf("the clamp's own boundary was refused: %v", err)
+	}
+}
+
+// The quota caps are bounded by the ledger's own ceiling, keyed on
+// store.MaxLedgerValue exactly as the portal's boxes are (MAX_QUOTA_GB in
+// app.js), because a bound that lives only in the browser is decoration for a
+// hand-written PUT. The ledger saturates at that value, so a limit above it is
+// one the recorded usage can never reach: the quota never trips, silently,
+// which is the under-enforcement direction everything else in this file
+// refuses. The boundary itself still saves, for the reason the calibration's
+// does.
+func TestValidateRejectsQuotaCapsPastTheLedgerCeiling(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Paths[1].Quota.LimitBytes = store.MaxLedgerValue + 1
+	if err := validate(&cfg); err == nil {
+		t.Error("a limit past the ledger ceiling was accepted; the ledger saturates below it and the quota never trips")
+	}
+
+	cfg = model.Defaults()
+	cfg.Paths[1].Quota.LimitBytes = store.MaxLedgerValue
+	cfg.Paths[1].Quota.CeilingBytes = store.MaxLedgerValue + 1
+	if err := validate(&cfg); err == nil {
+		t.Error("a ceiling past the ledger ceiling was accepted")
+	}
+
+	cfg = model.Defaults()
+	cfg.Paths[1].Quota.LimitBytes = store.MaxLedgerValue
+	cfg.Paths[1].Quota.CeilingBytes = store.MaxLedgerValue
+	if err := validate(&cfg); err != nil {
+		t.Errorf("the ledger ceiling itself was refused: %v", err)
 	}
 }
 

@@ -469,6 +469,17 @@ anything an operator can grow - the config push, the linker push, the usage
 batch and the link report - and they log at `Error`, because nothing here
 recovers on its own.
 
+The writing loop's exit also has to end the session, or the refusal creates a
+zombie instead of a loop. Each of those writes happens on a goroutine beside a
+read loop, and a refused frame is a local refusal on a healthy socket: the
+writer returned, the reader went on answering pings, and the session reported
+itself healthy indefinitely with its reporting dead - on the backend that is
+metered LTE deltas buffering on disk unshipped for as long as the process
+lives, with the quota never tripping. `Agent.runSession` and the two push-loop
+launches in `ControlServer` cancel the session context when their writer
+returns, which closes the connection, ends the read loop, and makes the redial
+the warning describes actually happen.
+
 **And a bound per frame is a bound on one multiplier.** `maxControlConns`
 bounds the other: every accept used to start a goroutine with a reader behind
 it and nothing said no. Refusing is a close rather than a queue, because a
@@ -524,7 +535,17 @@ and counters that reset there would forget a burst in progress.
 The rejection log is also where `proto.ErrFrameTooLarge` is finally
 distinguished from an authentication failure: the first read in `serve` used to
 return in silence, so the one rejection that means "somebody sent something no
-honest agent sends" produced no output at all.
+honest agent sends" produced no output at all. Distinguished in the message and
+in the count: on the shared `rejected` throttle a backend redialling with a
+mismatched secret won essentially every window, and the oversized frame was
+folded into the generic flush count with no reason attached - so it has its own
+counter, `badFrame`. The hello read after the handshake is named too
+(`tampered`), and it is the read the session MAC exists for: a relay that
+passed the handshake through and then injected a frame of its own fails
+exactly there as `proto.ErrBadFrame`, and returning in silence discarded the
+one observable trace of the attack the per-frame MAC was built to detect. A
+peer that authenticated and then went away still leaves without a line, because
+a timeout or a close is an ordinary disconnect.
 
 `ControlServer.listen` fills that channel in when it finds it nil, as its first
 statement and before the bind, and both halves are correctness rather than
@@ -845,6 +866,18 @@ be several hundred transactions into a batch when the new one starts. Without
 billed twice. The per-delta read this replaced had the same race across one
 delta; the lock closes it rather than narrowing it back.
 
+**And the watermark read distinguishes a missing row from a failed read,
+because a watermark that cannot be read is not a watermark of zero.**
+`Store.Meta` folds every error into "", which parses as 0, so a transient read
+failure at the top of a batch - or a corrupted `meta` value - handed the dedupe
+a floor of nothing: every already-billed delta in a resent batch read as
+strictly newer, and the memo held that answer for up to five hundred of them.
+The batching change widened that from one delta to a whole frame, which is why
+it was found there. `Store.MetaChecked` is the error-aware read, and
+`applyUsage` holds a path's deltas back on a failed one - never acked, so the
+backend resends them and they are billed once the read succeeds. `Meta` keeps
+its fold for the callers that treat the value as a cache.
+
 **A bound on one delta is not a bound on the column it accumulates into, and
 that gap was reachable inside a single frame.** SQLite does not error on integer
 overflow: `bytes + excluded.bytes` silently becomes a REAL, and from then on
@@ -907,9 +940,16 @@ every tick and the line repeats with it forever.
 The split is not tidiness. A shared window is won by whichever reason fires
 first, and every other one is folded into a generic count for thirty seconds, so
 an operator with a mismatched `overlay.backend_ip` *and* a mislabelled linker is
-told about one of them and the second is a number with no hint attached. Seven
+told about one of them and the second is a number with no hint attached. Nine
 counters now (`notBackend`, `unknownIP`, `wrongIP`, `clamped`, `badPath`,
-`badSeq`, `oversized`), each with its own trailing edge in `flushThrottles`.
+`badSeq`, `oversized`, `badFrame`, `tampered`), each with its own trailing edge
+in `flushThrottles`. The backend carries the same shape for the same reason:
+`internal/agent` had grown two fresh hand-rolled copies of the defective
+count-and-reset throttle while this one was being fixed, so it now holds a
+mirror of the type (`agent/throttle.go`, mirrored by hand because the engine
+must not be linked into the backend binary), with
+`Responder.flushThrottles` as the trailing edge for the responder's two
+counters and the refused-decision counter beside them.
 
 Remediation rather than reason is what draws the line, and the two places it
 lands differently are worth naming. `badPath` and `badSeq` were one counter, and
@@ -1272,7 +1312,11 @@ decoration: the five probe inputs and the four quality weights declared none, so
 typing 10 into "Active interval (ms)" or 150 into "Switch margin (%)" still built
 a body the endpoint refuses. They carry `validate`'s own floors now, and the two
 quota boxes carry a ceiling of 2^30 GiB, which is `store.MaxLedgerValue` and also
-what keeps `v * GB` inside an int64.
+what keeps `v * GB` inside an int64. That one runs the other way too:
+`validate` refuses quota caps past the same constant, because the ledger
+saturates there, so a limit above it is one the recorded usage can never reach
+- the quota never trips, silently - and a bound that lives only in the browser
+is decoration for a hand-written PUT.
 
 What none of this fixes is an empty box meaning zero. A cleared Overhead box
 stored 0 before this change too, because JSON `null` onto a zero field and a
@@ -1858,6 +1902,17 @@ Breaking any of these is a correctness bug even if the tests pass.
     degrades the check to the horizon. There is no reading of this host's clock
     that makes the bound stricter, and that - rather than not reading it at all
     - is the property to preserve.
+
+    One residual is open, named in `plausibleDecisionSeq` so it stays a
+    decision rather than a surprise: "no later than this host's" is false when
+    this host's clock is itself stale. A backend more than the skew behind
+    real time, whose anchor was also stamped while the frontend had been up
+    longer than the skew, refuses a restarted frontend's decisions until the
+    ceiling catches up - staleness minus the skew, at the rate real time
+    passes. Bounded, and self-healing in practice: probes arriving means a
+    tunnel is up, which means a route to NTP exists again. Closing it outright
+    needs the frontend's clock on the wire, which is a protocol change. Not
+    done, and not an oversight.
 
     That reference is bounded by the same horizon the sequences are, because
     the shift into the sequence's units can overflow. Past about the year 10889
@@ -2533,8 +2588,13 @@ where a subtle regression would be invisible in production until an outage:
   a table that is already loaded, and one the portal accepted is not moved by a
   byte; the overlay address beside them gets the same treatment, so a generator
   handed one it cannot parse renders nothing rather than a file with it in;
-  `linker/linker_test.go` holds that a push with nothing usable in it takes the
-  rules down instead of installing the mark rule, and that an install which
+  `linker/linker_test.go` holds that a push with nothing usable in it leaves
+  the working rules alone - it is a fault, not an instruction, exactly as the
+  backend's `applyEgress` reads the same input, and for a while the linker
+  read it as "feature off" and took a working ruleset down on the word of a
+  push nothing honest produces - while an empty push still removes them and
+  the refusal is remembered rather than retried, because the parse of a fixed
+  list is deterministic; and that an install which
   would render no ruleset at all is not recorded as applied, so the retry that
   exists for a refused install still covers it;
   both mode-gated tables clamp the TCP MSS on SYNs leaving by a tunnel, scoped

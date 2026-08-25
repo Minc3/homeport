@@ -477,17 +477,25 @@ func TestReconcileLeavesEgressAloneUntilTheFrontendHasSpoken(t *testing.T) {
 	}
 }
 
-// A push whose networks are all unusable takes the rules down rather than
-// half-installing.
+// A push whose networks are all unusable is a fault, not an instruction, and
+// leaves the working rules alone.
 //
 // The networks arrive over the wire, so this agent re-parses them rather than
 // trusting that the far end validated anything - see sysx.EgressNetworks. What
 // that leaves is a list which is not empty as sent and is empty as rendered,
-// and the early-out has to be keyed on the second: keyed on the first, the mark
-// rule went in, an empty ruleset was loaded over whatever table was already
-// there, and the agent logged that the networks were installed. A marked packet
-// with no ruleset behind it is the leak the ordering here exists to prevent.
-func TestAnUnusableEgressPushTakesTheRulesDown(t *testing.T) {
+// and the two cases mean different things: an empty list as sent is the
+// feature turned off, while a list that parses to nothing is corruption. The
+// backend's applyEgress already refuses the second (see
+// TestAPushWithNoUsableNetworkDoesNotTearDownEgress in internal/agent), and
+// for a while this agent read it as the first and took a working ruleset down
+// - containers lost their tunnel egress and the server browser started
+// advertising the house's address, silently, on the word of a push nothing
+// honest produces. The refusal still must not half-install: no ruleset built,
+// no mark rule in front of it, and no teardown either. And it is remembered
+// as handled rather than retried, because the parse of a fixed list is
+// deterministic and a retry every reconcile tick could only repeat the error
+// line forever.
+func TestAnUnusableEgressPushLeavesTheRulesAlone(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
 		"ip route get 192.168.1.2": "192.168.1.2 dev eth0 src 192.168.1.50 uid 0",
 	}}
@@ -507,8 +515,34 @@ func TestAnUnusableEgressPushTakesTheRulesDown(t *testing.T) {
 	if f.ran("ip rule add fwmark 0x301") {
 		t.Errorf("the mark rule went in with no ruleset behind it; calls were %v", f.calls)
 	}
+	if f.ran("delete table ip failover_linker_egress") {
+		t.Errorf("a working egress ruleset was torn down on the word of an unusable push; calls were %v", f.calls)
+	}
+
+	f.calls = nil
+	l.retryEgress(context.Background())
+	if len(f.calls) != 0 {
+		t.Errorf("an unusable push is deterministic and must not be retried; calls were %v", f.calls)
+	}
+}
+
+// An empty push is the instruction the unusable one is not: the feature is
+// off, and the rules come down.
+func TestAnEmptyEgressPushRemovesTheRules(t *testing.T) {
+	f := &fakeRunner{replies: map[string]string{
+		"ip route get 192.168.1.2": "192.168.1.2 dev eth0 src 192.168.1.50 uid 0",
+	}}
+	l := testLinker(t, f)
+
+	l.applyEgress(context.Background(), []string{"172.18.0.0/16"})
+	if !f.ran("linker-egress.nft") {
+		t.Fatalf("first push did not install anything; calls were %v", f.calls)
+	}
+
+	f.calls = nil
+	l.applyEgress(context.Background(), nil)
 	if !f.ran("delete table ip failover_linker_egress") {
-		t.Errorf("the previous ruleset was left loaded; calls were %v", f.calls)
+		t.Errorf("an empty push must take the source NAT down; calls were %v", f.calls)
 	}
 }
 
