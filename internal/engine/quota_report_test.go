@@ -67,6 +67,12 @@ func TestAnAcceptableStoredCalibrationIsNotReported(t *testing.T) {
 	}{
 		{"the shipped values", model.Quota{Calibration: 100, OverheadPerPacket: 60}},
 		{"unset, which validate reads as 100", model.Quota{Calibration: 0, OverheadPerPacket: 60}},
+		// validate runs `if Calibration <= 0 { = 100 }` before its range check,
+		// so a negative value saves cleanly and means 100 everywhere, exactly
+		// as an unset one does. The first version of this report fired on it
+		// with a hint saying the settings form would refuse to save, which is
+		// the one thing that is not true of it.
+		{"negative, which validate also reads as 100", model.Quota{Calibration: -5, OverheadPerPacket: 60}},
 		{"no overhead, which is a real setting", model.Quota{Calibration: 100, OverheadPerPacket: 0}},
 		{"both boundaries", model.Quota{Calibration: quota.MinCalibration, OverheadPerPacket: quota.MaxOverheadPerPacket}},
 	} {

@@ -1521,59 +1521,93 @@ func (e *Engine) refreshQuota(now time.Time) {
 	}
 }
 
+// usageSample is one raw metering delta on its way to the ledger: the counts
+// as the backend reported them and the stamp it took them at, before any of
+// this package's bounds or quota's conversion have been applied.
+type usageSample struct {
+	Bytes   int64
+	Packets int64
+	At      time.Time
+}
+
 // AddUsage records a metering delta reported by the backend and advances the
 // caller's dedupe watermark (seqKey/seqVal) in the same transaction. It
 // reports whether both are durable, so the caller only acks once the bytes are
 // safely in the ledger - and the two cannot drift across a crash: a watermark
 // ahead of the ledger loses the bytes, one behind it double-bills a resend.
+//
+// A batch of one. Every bound and every conversion lives in AddUsageBatch, so
+// the exported single-delta entry point cannot come to differ from the one the
+// control channel actually uses, which is what happened to the timestamp window
+// when this method held its own copy of it.
 func (e *Engine) AddUsage(pathID int, bytes, packets int64, at time.Time, seqKey, seqVal string) error {
-	// The one path, not the whole configuration. This runs once per delta and
-	// applyUsage sanctions a thousand of them in a frame, inline on the control
-	// read loop, so copying every path, service, region, linker and egress
-	// header a thousand times to read one entry is the same cost class the
-	// memoised watermark beside it removed.
+	return e.AddUsageBatch(pathID, []usageSample{{Bytes: bytes, Packets: packets, At: at}}, seqKey, seqVal)
+}
+
+// AddUsageBatch records a run of metering deltas for one path and advances that
+// path's dedupe watermark, all inside one transaction.
+//
+// The path is resolved once for the batch rather than once per delta. The
+// configuration is read under a lock on the control read loop, so a five
+// hundred delta batch was five hundred lock acquisitions and five hundred
+// linear scans of Paths to look up the same entry every time.
+func (e *Engine) AddUsageBatch(pathID int, samples []usageSample, seqKey, seqVal string) error {
 	e.mu.RLock()
 	p, ok := e.cfg.PathByID(pathID)
 	e.mu.RUnlock()
 
 	if !ok || !p.Metered {
-		// Nothing to account for; the delta is discarded, and only the
-		// watermark advances so the backend stops resending it.
+		// Nothing to account for; the deltas are discarded, and only the
+		// watermark advances so the backend stops resending them.
 		return e.st.SetMeta(seqKey, seqVal)
 	}
-	// Clamped here as well as inside Metered, because the two columns must not
-	// be able to disagree. Metered clamps its own copy, so a negative packet
-	// count produced zero metered bytes and was then handed to the ledger
-	// unchanged, where it decremented the period's packet total. checkDelta
-	// covers the control path, but this is an exported method and a caller
-	// three files away is not the place its guarantees live.
-	bytes, packets, _ = clampCounts(bytes, packets)
-	// The stamp too, for the reason the counts are: this is exported, and
-	// PeriodBounds takes whatever it is handed. A stamp outside the window puts
-	// the bytes in a period nothing ever reads while the current one stays at
-	// zero and the quota never trips.
-	//
-	// One test for both directions, and clamped to now rather than to either
-	// edge, which is what checkDelta does with the same value. The first
-	// version of this guard clamped to now+skew and tested only `at.After`,
-	// so it caught nothing at all: an overflowed time.Unix compares as *before*
-	// now whichever end it came from, an ordinary stale stamp is in the past,
-	// and clamping a genuine future stamp to now+skew can still land it in the
-	// next billing period when the batch is processed near a reset day.
-	//
-	// The shape differs from checkDelta's deliberately. That one holds the raw
-	// int64 and has to name the direction in a log, so it compares seconds,
-	// which do not wrap. Here the seconds are already unrecoverable - a
-	// time.Time built from an overflowing value does not report it back - and
-	// there is no message to get right, only a value to refuse. Both extremes
-	// land on the same side of this comparison, so one test covers them.
-	if now := time.Now(); at.After(now.Add(maxDeltaSkew)) || at.Before(now.Add(-maxDeltaAge)) {
-		at = now
+
+	now := time.Now()
+	entries := make([]store.UsageEntry, 0, len(samples))
+	for _, s := range samples {
+		// Clamped here as well as inside Metered, because the two columns must
+		// not be able to disagree. Metered clamps its own copy, so a negative
+		// packet count produced zero metered bytes and was then handed to the
+		// ledger unchanged, where it decremented the period's packet total.
+		// checkDelta covers the control path, and this is an exported entry
+		// point: a caller three files away is not the place its guarantees
+		// live.
+		bytes, packets, _ := clampCounts(s.Bytes, s.Packets)
+		// The stamp too, for the reason the counts are. PeriodBounds takes
+		// whatever it is handed, and a stamp outside the window puts the bytes
+		// in a period nothing ever reads while the current one stays at zero
+		// and the quota never trips.
+		//
+		// One test for both directions, and clamped to now rather than to
+		// either edge, which is what checkDelta does with the same value. The
+		// first version of this guard clamped to now+skew and tested only
+		// at.After, so it caught nothing at all: an overflowed time.Unix
+		// compares as *before* now whichever end it came from, an ordinary
+		// stale stamp is in the past, and clamping a genuine future stamp to
+		// now+skew can still land it in the next billing period when the batch
+		// is processed near a reset day.
+		//
+		// The shape differs from checkDelta's deliberately. That one holds the
+		// raw int64 and has to name the direction in a log, so it compares
+		// seconds, which do not wrap. Here the seconds are already
+		// unrecoverable - a time.Time built from an overflowing value does not
+		// report it back - and there is no message to get right, only a value
+		// to refuse. Both extremes land on the same side of this comparison, so
+		// one test covers them.
+		at := s.At
+		if at.After(now.Add(maxDeltaSkew)) || at.Before(now.Add(-maxDeltaAge)) {
+			at = now
+		}
+		start, _ := quota.PeriodBounds(p.Quota, at)
+		entries = append(entries, store.UsageEntry{
+			PeriodStart: start,
+			At:          at,
+			Bytes:       quota.Metered(bytes, packets, p.Quota),
+			Packets:     packets,
+		})
 	}
-	metered := quota.Metered(bytes, packets, p.Quota)
-	start, _ := quota.PeriodBounds(p.Quota, at)
-	if err := e.st.AddUsage(pathID, start, metered, packets, at, seqKey, seqVal); err != nil {
-		e.log.Warn("cannot record usage", "path", p.Name, "err", err)
+	if err := e.st.AddUsageBatch(pathID, entries, seqKey, seqVal); err != nil {
+		e.log.Warn("cannot record usage", "path", p.Name, "deltas", len(entries), "err", err)
 		return err
 	}
 	return nil
@@ -1601,14 +1635,18 @@ func (e *Engine) AddUsage(pathID int, bytes, packets int64, at time.Time, seqKey
 // rewriting the stored blob would change no billing and would take away the
 // save-time error that is how an operator learns which figure to correct.
 //
-// A zero calibration is not reported: validate has always read it as "unset"
-// and filled in 100, so it is a value nobody chose rather than one being
-// ignored. A zero overhead is a real setting and is left alone for the same
-// reason from the other side.
+// Anything at or below zero is not reported, not just zero itself. validate
+// runs `if Calibration <= 0 { = 100 }` before its range check, so a stored -5
+// saves cleanly and means 100 everywhere, exactly as an unset value does. The
+// first version of this tested `cal != 0` and so fired on it with a hint saying
+// the settings form would refuse to save, which is the one thing that is not
+// true of it: an operator following that line finds the form saving fine and no
+// field out of range. A zero overhead is a real setting and is left alone for
+// the same reason from the other side.
 func reportQuotaSubstitutions(log *slog.Logger, cfg model.Config) {
 	for _, p := range cfg.Paths {
 		cal := p.Quota.Calibration
-		if cal != 0 && (math.IsNaN(cal) || cal < quota.MinCalibration || cal > quota.MaxCalibration) {
+		if cal > 0 && (math.IsNaN(cal) || cal < quota.MinCalibration || cal > quota.MaxCalibration) {
 			log.Warn("stored calibration is outside the range this build accepts; billing at 100% instead",
 				"path", p.Name, "stored", cal, "billing_at", 100.0,
 				"min", quota.MinCalibration, "max", quota.MaxCalibration,

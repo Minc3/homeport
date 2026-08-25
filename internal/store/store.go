@@ -336,6 +336,83 @@ func (s *Store) AddUsage(pathID int, periodStart time.Time, bytes, packets int64
 	return tx.Commit()
 }
 
+// UsageEntry is one metered delta as the ledger takes it: already converted,
+// already clamped, already assigned to a billing period.
+type UsageEntry struct {
+	PeriodStart time.Time
+	At          time.Time
+	Bytes       int64
+	Packets     int64
+}
+
+// AddUsageBatch folds a whole batch for one path into the ledger in a single
+// transaction, and advances that path's watermark inside it.
+//
+// One transaction rather than one per delta, and the cost of the old shape was
+// not theoretical. SQLite defaults to synchronous=FULL, so every commit fsyncs
+// the WAL, and Open holds MaxOpenConns at 1 - so a five hundred delta backlog
+// was five hundred fsyncs with every other reader in the process queued behind
+// them: the portal's own API calls, the quota refresh, the path sample writer.
+// A backlog is drained exactly when a failover has just reconnected the control
+// channel, which is when an operator is most likely to be looking at the
+// portal.
+//
+// All or nothing per path, which is what the caller's stall behaviour wants
+// anyway. If the transaction does not commit, the watermark does not move, the
+// caller acks nothing new, and the backend resends the lot. There is no state
+// in which the ledger holds part of a batch while the watermark says all of it
+// was applied - the failure the metaKey argument exists to prevent, now for a
+// batch rather than a delta.
+func (s *Store) AddUsageBatch(pathID int, entries []UsageEntry, metaKey, metaValue string) error {
+	if len(entries) == 0 {
+		if metaKey == "" {
+			return nil
+		}
+		return s.SetMeta(metaKey, metaValue)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	ledger, err := tx.Prepare(
+		`INSERT INTO ledger (path_id, period_start, bytes, packets) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(path_id, period_start) DO UPDATE SET
+		     bytes = MAX(MIN(bytes + excluded.bytes, ?), 0), packets = MAX(MIN(packets + excluded.packets, ?), 0)`)
+	if err != nil {
+		return fmt.Errorf("ledger update: %w", err)
+	}
+	defer ledger.Close()
+	sample, err := tx.Prepare(
+		`INSERT INTO usage_samples (ts, path_id, bytes, packets) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		return fmt.Errorf("usage sample: %w", err)
+	}
+	defer sample.Close()
+
+	for _, e := range entries {
+		// The same bounds one delta gets, because the batch entry point must
+		// not be the way round them. See AddUsage.
+		b, pk := clampLedger(e.Bytes), clampLedger(e.Packets)
+		if _, err := ledger.Exec(pathID, e.PeriodStart.Unix(), b, pk,
+			int64(MaxLedgerValue), int64(MaxLedgerValue)); err != nil {
+			return fmt.Errorf("ledger update: %w", err)
+		}
+		if _, err := sample.Exec(e.At.Unix(), pathID, b, pk); err != nil {
+			return fmt.Errorf("usage sample: %w", err)
+		}
+	}
+	if metaKey != "" {
+		if _, err := tx.Exec(
+			`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			metaKey, metaValue); err != nil {
+			return fmt.Errorf("usage watermark: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
 // Usage returns accumulated bytes for a path in a period.
 func (s *Store) Usage(pathID int, periodStart time.Time) (int64, error) {
 	var b int64

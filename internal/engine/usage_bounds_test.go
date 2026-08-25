@@ -567,3 +567,106 @@ func mustPeriod(t *testing.T, p model.PathConfig, at time.Time) time.Time {
 	start, _ := quota.PeriodBounds(p.Quota, at)
 	return start
 }
+
+// The bound measured against the wrong reference is not a bound.
+//
+// The first version of maxSequenceJump compared each delta against the running
+// watermark, which the same batch advances after every acceptance. A thousand
+// deltas each exactly at the limit were therefore each accepted, and one frame
+// walked the watermark a thousand times the stated distance; eight such frames
+// reached maxDeltaSequence, and the path was then unbillable for good. That is
+// the outcome the bound exists to refuse, reached through the bound itself.
+func TestASequenceCannotBeWalkedPastTheBoundOneDeltaAtATime(t *testing.T) {
+	s, e, p := usageServer(t)
+	now := time.Now()
+
+	s.applyUsage(proto.Usage{Deltas: []proto.UsageDelta{
+		{PathID: p.ID, Bytes: 1 << 20, Packets: 10, AtUnix: now.Unix(), Sequence: 1},
+	}})
+
+	// Each step is exactly at the limit, so every one of them is admissible
+	// against the delta before it and none is admissible against the watermark
+	// the batch started from.
+	var walk []proto.UsageDelta
+	for i := 1; i <= 8; i++ {
+		walk = append(walk, proto.UsageDelta{
+			PathID: p.ID, Bytes: 1 << 20, Packets: 10,
+			AtUnix: now.Unix(), Sequence: 1 + uint64(i)*maxSequenceJump,
+		})
+	}
+	ack := s.applyUsage(proto.Usage{Deltas: walk})
+
+	if got := ack.Seqs[p.ID]; got > 1+maxSequenceJump {
+		t.Errorf("acked sequence %d; the batch walked the watermark past one jump, so the bound moved with it", got)
+	}
+	stored, _ := strconv.ParseUint(e.Store().Meta("usage_seq:"+strconv.Itoa(p.ID)), 10, 64)
+	if stored > 1+maxSequenceJump {
+		t.Errorf("watermark is %d; a single frame walked it %dx the bound and this path is now unbillable for good",
+			stored, stored/maxSequenceJump)
+	}
+}
+
+// A path with no watermark yet is the case the first version left open. It
+// guarded the relative bound with `last > 0` on the grounds that there was
+// nothing to measure from, which handed a fresh database the absolute bound as
+// its only protection - and the absolute bound is 1<<40, which is the poisoned
+// state itself. Zero is a perfectly good base to measure from.
+func TestAFirstContactSequenceIsBoundedToo(t *testing.T) {
+	s, e, p := usageServer(t)
+	now := time.Now()
+
+	// Nothing has ever been written for this path, so the watermark is absent
+	// rather than zero. maxDeltaSequence admits this value: the check is `>`.
+	ack := s.applyUsage(proto.Usage{Deltas: []proto.UsageDelta{
+		{PathID: p.ID, Bytes: 1 << 20, Packets: 10, AtUnix: now.Unix(), Sequence: maxDeltaSequence},
+	}})
+	if got := ack.Seqs[p.ID]; got != 0 {
+		t.Fatalf("acked sequence %d on first contact; the backend now drops a buffer that was never applied", got)
+	}
+	if got := e.Store().Meta("usage_seq:" + strconv.Itoa(p.ID)); got != "" {
+		t.Fatalf("watermark is %q; one first-contact delta ended this path's accounting for good", got)
+	}
+
+	// And a backend that has genuinely been metering for years still connects
+	// to a fresh frontend database and bills, which is what stops this bound
+	// from being a fresh install that never accounts for anything.
+	const fourYears = 4 * 6 * 60 * 24 * 365
+	s.applyUsage(proto.Usage{Deltas: []proto.UsageDelta{
+		{PathID: p.ID, Bytes: 3 << 30, Packets: 100, AtUnix: now.Unix(), Sequence: fourYears},
+	}})
+	if used := ledger(t, e, p, now); used < 3<<30 {
+		t.Errorf("ledger is at %d bytes; a long-running backend meeting a fresh database was refused", used)
+	}
+}
+
+// One transaction per path, and the ack moves only for the paths that
+// committed. The old per-delta loop needed a `stalled` map to hold back every
+// later delta for a path whose write had failed, because otherwise the next
+// success advanced the watermark past the failed one and the ack told the
+// backend to drop it. All-or-nothing per path has to give the same guarantee.
+func TestAMultiPathBatchAcksEachPathAtItsOwnHighWaterMark(t *testing.T) {
+	s, e, _ := usageServer(t)
+	now := time.Now()
+	cfg := e.Config()
+
+	var deltas []proto.UsageDelta
+	for i := 1; i <= 3; i++ {
+		for _, path := range cfg.Paths {
+			deltas = append(deltas, proto.UsageDelta{
+				PathID: path.ID, Bytes: 1 << 20, Packets: 10,
+				AtUnix: now.Unix(), Sequence: uint64(i),
+			})
+		}
+	}
+	ack := s.applyUsage(proto.Usage{Deltas: deltas})
+
+	for _, path := range cfg.Paths {
+		if got := ack.Seqs[path.ID]; got != 3 {
+			t.Errorf("path %d acked at %d, want 3; interleaved paths must each reach their own high-water mark", path.ID, got)
+		}
+		want := int64(3) * ((1 << 20) + 10*60)
+		if used := ledger(t, e, path, now); used != want {
+			t.Errorf("path %d billed %d bytes, want %d", path.ID, used, want)
+		}
+	}
+}

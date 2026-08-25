@@ -791,6 +791,13 @@ function pathRow(p) {
     // refusal blocks the whole save, so an unrelated edit in this form cannot
     // be stored until a field the operator may never have touched is corrected.
     el('td', {}, num('', p.quota.calibration, (v) => (p.quota.calibration = v), { step: 0.5, min: 10, max: 1000, placeholder: '100' })),
+    // Rendered for the same reason the bounds above are declared, and it was
+    // the half that was missing. validate refuses an overhead outside 0 to
+    // 65535, and this value had no input at all - it round-tripped from GET
+    // straight back into the PUT body. A blob carrying one out of range
+    // therefore failed every save, naming a field the operator could not see or
+    // reach, and blocked every unrelated edit with it.
+    el('td', {}, num('', p.quota.overhead_per_packet, (v) => (p.quota.overhead_per_packet = v), { step: 1, min: 0, max: 65535, placeholder: '60' })),
   );
 }
 
@@ -1176,6 +1183,8 @@ function renderSettings() {
       th('Calibration %', 'Scales the measured figure to match what the carrier actually bills. 100 means trust the tunnel counters plus per-packet overhead. '
         + 'After a month of comparison: if this portal says 50 GB and the carrier says 55, set 110. Range 10 to 1000, because a factor of ten either way is a typo '
         + 'rather than a calibration. Below is the dangerous direction: it under-bills every metered byte and the quota never trips.'),
+      th('Overhead B/pkt', 'What each packet costs on the WAN over the payload the tunnel counters see: WireGuard, UDP and IP together, about 60. '
+        + 'The carrier bills the encapsulated datagram, so counting payload alone undercounts by 5 to 15%. 0 to 65535.'),
     )),
     el('tbody', {}, c.paths.map(pathRow)),
   );

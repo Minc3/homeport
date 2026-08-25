@@ -162,18 +162,75 @@ func (m *Meter) Pending() []proto.UsageDelta {
 	return out
 }
 
-// PendingBatch returns a copy of at most n of the oldest buffered deltas.
-// The report loop sends the oldest few hundred per tick, and copying the
-// whole backlog to slice off the front - up to maxBuffered deltas, every ten
-// seconds for the length of a drain - was allocation for nothing.
+// PendingBatch returns a copy of at most n buffered deltas, oldest first, with
+// no one path allowed more than its share of them.
+//
+// The share is the whole point and a flat prefix of the buffer was the bug.
+// `pending` is one FIFO across every path, so a path whose deltas the frontend
+// will not accept - a sequence it refuses, a path id it drops, anything that is
+// never acked - accumulates at the front of it at one per sample interval.
+// After about five hundred samples the oldest n are all that path's, every
+// batch from then on consists solely of deltas that will be refused again, and
+// no delta for *any* path reaches the ledger until maxBuffered evicts them days
+// later. Every metered byte in that window is lost and no quota can trip.
+//
+// The frontend's refusals are per-path and deliberate: a stalled path with an
+// Error beside it is meant to be recoverable. This is what keeps that stall
+// from being deployment-wide.
+//
+// Two passes. The first takes up to an equal share from each path, in buffer
+// order, which is what guarantees a stuck path cannot crowd the others out. The
+// second fills whatever is left over from the front, so a genuine single-path
+// backlog still drains at the full rate and the common case is unchanged.
+// Order within a path is preserved in both, because the frontend's watermark
+// requires it.
 func (m *Meter) PendingBatch(n int) []proto.UsageDelta {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if n > len(m.pending) {
 		n = len(m.pending)
 	}
-	out := make([]proto.UsageDelta, n)
-	copy(out, m.pending[:n])
+	if n == 0 {
+		return nil
+	}
+
+	paths := map[int]bool{}
+	for _, d := range m.pending {
+		paths[d.PathID] = true
+	}
+	// One path in the buffer means the share is the whole batch, so this costs
+	// a map walk and nothing else on the ordinary site.
+	share := n / len(paths)
+	if share < 1 {
+		share = 1
+	}
+
+	out := make([]proto.UsageDelta, 0, n)
+	taken := make(map[int]int, len(paths))
+	// Which entries went in, so the second pass does not send one twice. Indexed
+	// rather than compared, because two deltas for one path are distinguishable
+	// only by sequence and the buffer is not a set.
+	used := make([]bool, len(m.pending))
+	for i, d := range m.pending {
+		if len(out) == n {
+			break
+		}
+		if taken[d.PathID] >= share {
+			continue
+		}
+		taken[d.PathID]++
+		used[i] = true
+		out = append(out, d)
+	}
+	for i, d := range m.pending {
+		if len(out) == n {
+			break
+		}
+		if used[i] {
+			continue
+		}
+		out = append(out, d)
+	}
 	return out
 }
 

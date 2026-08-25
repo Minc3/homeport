@@ -743,6 +743,19 @@ const (
 	// which lands in the previous billing period whenever the outage straddles
 	// a reset day, is never reported because it is inside the window, and
 	// leaves the current period reading empty while the cap is spent.
+	//
+	// Those two figures do not both fit inside seven days and are not meant to.
+	// A single-path site draining a 5.8 day backlog from a host whose clock is
+	// also days behind has its oldest deltas outside the window, and they are
+	// restamped to now rather than refused. That is the intended answer, not a
+	// gap: the two candidate periods are the one the stale clock names, which is
+	// wrong and may be closed, and the current one, which is where the traffic
+	// is actually being spent. Billing to the current period over-attributes at
+	// worst and is visible in the portal; billing to a dead one is the silent
+	// direction this bound exists to close. The Error beside it is not crying
+	// wolf either, because it names the clock as the ordinary cause - a host
+	// whose clock is days out is a real fault whether or not this delta was
+	// stamped in good faith.
 	maxDeltaSkew = time.Hour
 	maxDeltaAge  = 7 * 24 * time.Hour
 
@@ -851,33 +864,51 @@ func (s *ControlServer) checkDelta(d proto.UsageDelta, now time.Time) proto.Usag
 // strictly newer than what was already applied is dropped, which keeps
 // resends from double-counting LTE data.
 func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
-	// One batch at a time across every connection. See usageMu: the memoised
-	// watermark below is only what the database holds if nothing else is
-	// writing it, and two backend sessions at once is what a failover produces.
+	// One batch at a time across every connection. See usageMu: the watermarks
+	// below are database reads held for the length of the batch, and two
+	// backend sessions at once is what a failover produces.
 	s.usageMu.Lock()
 	defer s.usageMu.Unlock()
 
 	st := s.eng.Store()
 	now := time.Now()
 	ack := proto.UsageAck{Seqs: map[int]uint64{}}
-	// Deltas for one path arrive in sequence order, and the watermark is a
-	// single high-water mark. If one write fails, every later delta for that
-	// path must be held back too - otherwise the next success would advance the
-	// watermark past the failed one, the ack would tell the backend to drop it,
-	// and those metered bytes are gone for good.
-	stalled := map[int]bool{}
-	// The per-path watermark this batch has established so far. See its use
-	// below for why it can stand in for a database read.
-	watermark := map[int]uint64{}
-	// Bounded in count as well as in value. The backend caps its own batch at
-	// 500 (agent.reportLoop), and nothing here enforced that: a frame is
-	// bounded only by proto.MaxFrameBytes, and a delta serialises to about a
-	// hundred bytes, so an accepted frame can carry ten thousand of them. Each
-	// is a Meta read plus a full AddUsage transaction, run inline on the read
-	// loop, so the loop cannot answer a ping or read the next frame until the
-	// batch is done. Logged rather than silent, for the reason warnUnsendable
-	// exists: if the sender's 500 is ever raised past this, the excess is
-	// resent forever and truncating it quietly would be the only symptom.
+
+	// Two watermarks per path, and the distinction is the whole of the sequence
+	// bound.
+	//
+	// base is what the database held when this batch started and never moves.
+	// It is what maxSequenceJump is measured against, because measuring against
+	// a value the batch itself advances is not a bound at all: with the running
+	// watermark as the reference, a thousand deltas each exactly at the limit
+	// are each accepted, and one frame walks the watermark a thousand times the
+	// stated distance. Eight such frames reach maxDeltaSequence, and the path is
+	// then unbillable for good - which is the outcome the bound exists to
+	// refuse, reached through the bound itself.
+	//
+	// seen is the running high-water mark, which is what deduplicates resends
+	// inside one frame. It only moves for a delta that was accepted for
+	// billing, and it is committed to the database once per path at the end.
+	base := map[int]uint64{}
+	seen := map[int]uint64{}
+	// The deltas accepted for each path, the key their watermark lives under,
+	// and the sequence that watermark becomes. Written once per path rather
+	// than once per delta: see store.AddUsageBatch for what five hundred
+	// separate transactions cost every other reader in this process.
+	pending := map[int][]usageSample{}
+	keys := map[int]string{}
+	high := map[int]uint64{}
+	// First-seen order, so the ledger is written in the order the backend sent
+	// rather than in map order.
+	order := []int{}
+
+	// Bounded in count as well as in value. The backend batches at most 500
+	// (agent.reportLoop), and nothing here enforced that: a frame is bounded
+	// only by proto.MaxFrameBytes, and a delta serialises to about a hundred
+	// bytes, so an accepted frame can carry ten thousand of them. Logged rather
+	// than silent, for the reason warnUnsendable exists: if the sender's 500 is
+	// ever raised past this, the excess is resent forever and truncating it
+	// quietly would be the only symptom.
 	deltas := u.Deltas
 	if len(deltas) > maxDeltasPerFrame {
 		// Throttled like every other peer-driven line here, and this one needs
@@ -890,10 +921,8 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 		}
 		deltas = deltas[:maxDeltasPerFrame]
 	}
+
 	for _, d := range deltas {
-		if stalled[d.PathID] {
-			continue
-		}
 		// Before anything is read or written for this id, because the write is
 		// the problem. An id no configuration can hold is not merely unknown -
 		// AddUsage acks an unknown id deliberately, so that deltas for a path
@@ -902,6 +931,7 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 		// permanent row per id, chosen by whoever is sending. Nothing honest
 		// reaches this: web.validate keeps real ids below the same bound, and
 		// the backend only meters paths it was pushed.
+		//
 		// An id this configuration actually holds is billed whatever its value.
 		// The range is the fallback for one it does not, and checking the
 		// configuration first is what keeps this from breaking a site the
@@ -919,22 +949,11 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 			}
 			continue
 		}
-		// And the sequence, before it is read against the watermark or written
-		// back as one. This is the field that does the most damage per byte
-		// sent: accepted once, it parks the watermark where no honest delta can
-		// follow, acks the sender's whole buffer as applied, and persists. See
-		// maxDeltaSequence.
-		//
-		// The absolute half, which is all that can be checked here: it is the
-		// only one available for a path with no watermark yet. The relative
-		// half, below, is what actually bounds the hazard once there is one.
-		//
-		// Dropped without an ack, which stalls this path deliberately. Every
-		// other bound here clamps precisely to avoid a stall, and the reasoning
-		// inverts for this one: a sender emitting such a sequence has lost its
-		// meter state, so there is no correct value to clamp to and nothing to
-		// be gained by pretending. A stalled path with an Error beside it is
-		// recoverable in a way a poisoned watermark is not.
+		// The absolute sequence bound, applied before the watermark is read
+		// rather than because it is the real check. It is a pre-filter that
+		// saves a database read for a value no bound could accept; the bound
+		// that does the work is maxSequenceJump below, which applies to every
+		// delta including the first one a path ever sends.
 		if d.Sequence > maxDeltaSequence {
 			if n := s.badSeq.take(); n > 0 {
 				s.log.Error("usage delta carries an implausible sequence; refusing it rather than making it the watermark",
@@ -943,46 +962,44 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 			}
 			continue
 		}
-		key := "usage_seq:" + strconv.Itoa(d.PathID)
-		// Once per path, not once per delta. The watermark this loop keeps is
-		// what the database holds: it is seeded from Meta on first sight, and
-		// AddUsage writes the ledger and the watermark in one transaction, so
-		// it only moves when that transaction committed - and when it does not,
-		// the path is stalled and no later delta for it is read at all. A
-		// 500-delta batch across three paths was issuing 500 queries where
-		// three do, on the goroutine that also has to answer pings. That cost
-		// is the whole justification for maxDeltasPerFrame.
-		//
-		// That first sentence holds because usageMu serialises this function.
-		// Memoising a database read is only sound while this goroutine is the
-		// one moving it, and it is not by construction: see usageMu.
-		last, seen := watermark[d.PathID]
-		if !seen {
-			last, _ = strconv.ParseUint(st.Meta(key), 10, 64)
-			watermark[d.PathID] = last
+		if _, ok := base[d.PathID]; !ok {
+			key := "usage_seq:" + strconv.Itoa(d.PathID)
+			last, _ := strconv.ParseUint(st.Meta(key), 10, 64)
+			base[d.PathID] = last
+			seen[d.PathID] = last
+			keys[d.PathID] = key
+			order = append(order, d.PathID)
 			// A duplicate of something already applied is covered by the
 			// existing watermark, so the ack starts there: a batch of pure
 			// resends still tells the backend it may stop resending them.
 			ack.Seqs[d.PathID] = last
 		}
-		if d.Sequence <= last {
+		if d.Sequence <= seen[d.PathID] {
 			continue
 		}
-		// The relative half of the sequence bound, and the one that closes the
-		// hazard. Tested after the duplicate check rather than before it, so
-		// the subtraction has a sequence strictly above the watermark and
-		// cannot wrap.
+		// The sequence bound that does the work, measured against the watermark
+		// this batch began with. Tested after the duplicate check, so the
+		// subtraction has a sequence strictly above `seen`, and `base` is never
+		// above `seen`, so it cannot wrap.
 		//
-		// Dropped without an ack, exactly as the absolute bound is, and for the
-		// same reason: a sender that has jumped this far has lost its meter
-		// state, so there is no correct value to clamp to. It shares badSeq
-		// because it shares a remediation - both send whoever reads it to
-		// meter-state.json on the backend - which is the line these counters
-		// are split on.
-		if last > 0 && d.Sequence-last > maxSequenceJump {
+		// It applies with no watermark too, where base is zero and the ceiling
+		// is maxSequenceJump outright. The first version guarded this with
+		// `last > 0` on the grounds that the unanchored case had nothing to
+		// measure from, which handed a fresh database the absolute bound as its
+		// only protection: one first-contact delta at 1<<40 was billed, became
+		// the watermark, and left the path unbillable for good. Zero is a
+		// perfectly good base. A sequence counts samples, so it says this path
+		// may arrive already forty years of sampling deep and no further.
+		//
+		// Dropped without an ack, exactly as the absolute bound is: a sender
+		// that has jumped this far has lost its meter state, so there is no
+		// correct value to clamp to. It shares badSeq because it shares a
+		// remediation - both send whoever reads it to meter-state.json on the
+		// backend - which is the line these counters are split on.
+		if d.Sequence-base[d.PathID] > maxSequenceJump {
 			if n := s.badSeq.take(); n > 0 {
 				s.log.Error("usage delta jumps implausibly far past this path's watermark; refusing it rather than making it the watermark",
-					"path_id", d.PathID, "seq", d.Sequence, "watermark", last,
+					"path_id", d.PathID, "seq", d.Sequence, "watermark", base[d.PathID],
 					"limit", uint64(maxSequenceJump), "dropped", n,
 					"hint", "accepting this would silently end this path's accounting for good; check meter-state.json on the backend")
 			}
@@ -990,21 +1007,35 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 		}
 		// Bounded before it is billed, not after. See checkDelta.
 		d = s.checkDelta(d, now)
-		// Only advance the watermark - and the ack - once the bytes are in the
-		// ledger. Acking regardless would discard metered LTE usage for good:
-		// the backend drops its buffered copy on the strength of this number.
-		// AddUsage writes the ledger and the watermark in one transaction; two
-		// separate writes left a crash window between them, and a crash there
-		// had the resent batch pass the stale watermark and bill twice.
-		if err := s.eng.AddUsage(d.PathID, d.Bytes, d.Packets, time.Unix(d.AtUnix, 0),
-			key, strconv.FormatUint(d.Sequence, 10)); err != nil {
-			s.log.Warn("usage delta not recorded, holding back this path's watermark",
-				"path_id", d.PathID, "seq", d.Sequence, "err", err)
-			stalled[d.PathID] = true
+		seen[d.PathID] = d.Sequence
+		high[d.PathID] = d.Sequence
+		pending[d.PathID] = append(pending[d.PathID], usageSample{
+			Bytes: d.Bytes, Packets: d.Packets, At: time.Unix(d.AtUnix, 0),
+		})
+	}
+
+	// One transaction per path, and the ack moves only once it has committed.
+	// Acking regardless would discard metered LTE usage for good: the backend
+	// drops its buffered copy on the strength of this number. The ledger rows
+	// and the watermark go in together, so there is no crash window in which
+	// they disagree - written separately, a crash between them had the resent
+	// batch pass a stale watermark and bill twice.
+	//
+	// All or nothing per path is what the old per-delta `stalled` map was for:
+	// if one delta failed, every later one for that path had to be held back
+	// too, or the next success would advance the watermark past the failed one
+	// and the ack would tell the backend to drop it. A single transaction gives
+	// that for free.
+	for _, id := range order {
+		if len(pending[id]) == 0 {
 			continue
 		}
-		watermark[d.PathID] = d.Sequence
-		ack.Seqs[d.PathID] = d.Sequence
+		if err := s.eng.AddUsageBatch(id, pending[id], keys[id], strconv.FormatUint(high[id], 10)); err != nil {
+			s.log.Warn("usage batch not recorded, holding back this path's watermark",
+				"path_id", id, "deltas", len(pending[id]), "seq", high[id], "err", err)
+			continue
+		}
+		ack.Seqs[id] = high[id]
 	}
 	return ack
 }

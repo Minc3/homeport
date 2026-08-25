@@ -113,3 +113,86 @@ func TestPendingBatchCopiesOnlyTheOldest(t *testing.T) {
 		t.Errorf("a batch larger than the backlog should return all of it, got %d", len(all))
 	}
 }
+
+// A path the frontend will not accept must not take the whole deployment's
+// billing down with it.
+//
+// `pending` is one FIFO across every path, and PendingBatch used to take a flat
+// prefix of it. The frontend's refusals are per-path and deliberate - a bad
+// sequence, a dropped path id - but a refused delta is never acked, so it stays
+// buffered and another arrives every sample interval. Once the oldest n are all
+// that path's, every batch consists solely of deltas that will be refused
+// again, and no delta for any path reaches the ledger until maxBuffered evicts
+// them days later.
+func TestOneStuckPathCannotStarveTheOthersOutOfABatch(t *testing.T) {
+	m := NewMeter(slog.New(slog.NewTextHandler(io.Discard, nil)), filepath.Join(t.TempDir(), "buf.jsonl"))
+
+	// Path 2 is stuck: far more unackable deltas than a batch holds, all older
+	// than anything else in the buffer.
+	var pending []proto.UsageDelta
+	for i := 1; i <= 4000; i++ {
+		pending = append(pending, proto.UsageDelta{PathID: 2, Sequence: uint64(i), Bytes: 1})
+	}
+	for i := 1; i <= 40; i++ {
+		pending = append(pending, proto.UsageDelta{PathID: 1, Sequence: uint64(i), Bytes: 1})
+		pending = append(pending, proto.UsageDelta{PathID: 3, Sequence: uint64(i), Bytes: 1})
+	}
+	m.mu.Lock()
+	m.pending = pending
+	m.mu.Unlock()
+
+	batch := m.PendingBatch(500)
+	if len(batch) != 500 {
+		t.Fatalf("batch = %d deltas, want a full 500; the buffer holds far more", len(batch))
+	}
+
+	seen := map[int]int{}
+	for _, d := range batch {
+		seen[d.PathID]++
+	}
+	if seen[1] != 40 || seen[3] != 40 {
+		t.Errorf("batch carried %d deltas for path 1 and %d for path 3, want all 40 of each; "+
+			"a stuck path crowded out every other path's usage", seen[1], seen[3])
+	}
+	// And the rest of the batch is still filled from the stuck path, so a
+	// genuine single-path backlog drains at the full rate rather than at a
+	// share of it.
+	if seen[2] != 500-80 {
+		t.Errorf("batch carried %d deltas for the stuck path, want %d; the leftover was not filled", seen[2], 500-80)
+	}
+
+	// Order within a path is what the frontend's watermark requires: it applies
+	// deltas in sequence order and skips anything not strictly newer.
+	last := map[int]uint64{}
+	for _, d := range batch {
+		if d.Sequence <= last[d.PathID] {
+			t.Fatalf("path %d went backwards: %d after %d", d.PathID, d.Sequence, last[d.PathID])
+		}
+		last[d.PathID] = d.Sequence
+	}
+}
+
+// The ordinary site, which must not pay for the fairness above. One path in the
+// buffer means the share is the whole batch, and the result has to be the same
+// flat prefix it always was.
+func TestASinglePathBacklogStillDrainsAsAFlatPrefix(t *testing.T) {
+	m := NewMeter(slog.New(slog.NewTextHandler(io.Discard, nil)), filepath.Join(t.TempDir(), "buf.jsonl"))
+
+	var pending []proto.UsageDelta
+	for i := 1; i <= 2000; i++ {
+		pending = append(pending, proto.UsageDelta{PathID: 2, Sequence: uint64(i), Bytes: 1})
+	}
+	m.mu.Lock()
+	m.pending = pending
+	m.mu.Unlock()
+
+	batch := m.PendingBatch(500)
+	if len(batch) != 500 {
+		t.Fatalf("batch = %d deltas, want 500", len(batch))
+	}
+	for i, d := range batch {
+		if d.Sequence != uint64(i+1) {
+			t.Fatalf("batch[%d] has sequence %d, want %d; a single-path backlog must come off the front in order", i, d.Sequence, i+1)
+		}
+	}
+}

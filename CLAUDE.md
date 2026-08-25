@@ -671,16 +671,53 @@ counter of a few million, so it parks the watermark exactly as permanently, with
 every consequence in the paragraph above intact. The damage is not a function of
 how large the number is, it is a function of how far past the watermark it is,
 so that is what `maxSequenceJump` bounds. Both are needed and neither subsumes
-the other: the relative one cannot apply to the first delta a path ever sees,
-because there is no watermark to measure from and refusing that one refuses the
-delta that starts the path's accounting, which is the same shape as
-`decisionSeqHorizonMs` covering the unanchored case on the backend. The slack
-is generous for one reason: the backend keeps sampling while the frontend is
+the other, though not in the way the first version of this assumed. It guarded
+the relative check with `last > 0`, reasoning that a path with no watermark had
+nothing to measure from, which handed a fresh database the absolute bound as its
+only protection: one first-contact delta at `1<<40` was billed, became the
+watermark, and left the path unbillable for good. Zero is a perfectly good base.
+The relative bound applies to every delta, and `maxDeltaSequence` is what it
+always should have been described as, a pre-filter that saves a database read
+for a value no bound could accept. The slack is generous for one reason: the backend keeps sampling while the frontend is
 unreachable and its sequence keeps advancing after `maxBuffered` has dropped the
 oldest deltas off the front, so a legitimate jump is elapsed samples rather than
 buffered ones. A bound derived from the buffer would refuse exactly the delta
 that exists to survive a long outage. Forty years of continuous sampling is
 still four orders of magnitude tighter than the absolute bound beside it.
+
+**And the reference it is measured against has to be the watermark the batch
+began with, not the running one.** The first version compared each delta against
+`watermark[pathID]`, which `applyUsage` advances after every acceptance, so a
+thousand deltas each sitting exactly at the limit were each admissible against
+the delta before them: one frame walked the watermark a thousand jumps, and
+eight frames reached `maxDeltaSequence`. A bound measured against a value the
+thing being bounded moves is not a bound. `base` never moves for the life of the
+batch and is what the jump is taken from; `seen` is the running high-water mark
+and does only what it always did, deduplicate resends inside one frame.
+
+**A refusal stalls one path, and that only holds because the backend's batch is
+shared out.** `Meter.pending` is a single FIFO across every path, and
+`PendingBatch` took a flat prefix of it. A delta the frontend refuses is never
+acked, so it stays buffered and another arrives every sample interval: after
+about five hundred samples the oldest of them fill a whole batch, every batch
+from then on is deltas that will be refused again, and no delta for *any* path
+reaches the ledger until `maxBuffered` evicts them days later. Every metered
+byte in that window is lost and no quota can trip, which is the deployment-wide
+version of the outcome the per-path stall is meant to be a recoverable
+alternative to. `PendingBatch` now takes an equal share per path first and fills
+the remainder from the front, so a single-path backlog still drains at the full
+rate and the ordinary site is unchanged.
+
+**One transaction per path per batch, not one per delta.** SQLite defaults to
+`synchronous=FULL`, so every commit fsyncs the WAL, and `Store.Open` holds
+`MaxOpenConns` at 1: a five hundred delta backlog was five hundred fsyncs with
+every other reader in the process queued behind them, the portal's own API calls
+included. A backlog is drained exactly when a failover has reconnected the
+control channel, which is when somebody is most likely to be looking at the
+portal. `store.AddUsageBatch` writes the rows and the watermark in one
+transaction, which also replaces the `stalled` map the per-delta loop needed: if
+one delta in a path's batch cannot be written, none of them is and the watermark
+does not move, so the backend resends the lot.
 
 What neither bounds is a sequence that has gone *backwards*, and that hole is
 open. A backend that loses `meter-state.json` restarts at 1, every delta is at
@@ -2396,7 +2433,17 @@ where a subtle regression would be invisible in production until an outage:
   build accepts is named at load, with the path in the line, and a configuration
   the portal would accept produces no line at all. Zero is pinned as one of the
   quiet cases: `validate` reads it as unset, so reporting it would fire on every
-  path of any deployment predating the field and bury the line that matters.
+  path of any deployment predating the field and bury the line that matters. A
+  negative value is pinned beside it for a sharper reason: `validate` normalises
+  anything at or below zero to 100 before its range check, so it saves cleanly,
+  and the first version of this report fired on it with a hint saying the form
+  would refuse to save.
+- `agent/meter_buffer_test.go` also holds the batch's fair share: a path with
+  thousands of unackable deltas at the front of the buffer cannot crowd two
+  other paths out of a batch, the leftover is still filled from it so a genuine
+  single-path backlog drains at the full rate, per-path order is preserved
+  because the frontend's watermark requires it, and a buffer holding one path
+  still comes off the front as the flat prefix it always was.
 - `agent/decision_test.go` also holds the sequence bound: an implausible
   sequence is refused *and does not become the ceiling*, which is the half
   that matters, while a real one still lands; the ceiling grows with elapsed
@@ -2648,7 +2695,14 @@ where a subtle regression would be invisible in production until an outage:
   outage produces, is billed rather than refused. Beside them, that the same
   batch applied on four goroutines at once is billed once: two backend sessions
   is what a failover produces, and the per-batch watermark memo is a database
-  read held across five hundred transactions. Then the two the pass after that found: a
+  read held across five hundred transactions. Then the two the bound itself got
+  wrong: a frame of deltas each sitting exactly at the jump limit cannot walk
+  the watermark past one jump, which is what measuring against a running
+  reference allowed, and a first-contact delta on a path with no watermark is
+  bounded too rather than falling back on the absolute limit, with the companion
+  case pinning that a backend four years deep still bills against a fresh
+  database. And that a batch interleaving three paths acks each at its own
+  high-water mark, which is what the per-delta `stalled` map used to hold. Then the two the pass after that found: a
   frame of clamped deltas cannot overflow the ledger column into a SQLite REAL,
   which no per-delta bound could have prevented and which breaks every later
   read of that row; and both overflowing stamps are clamped *and named
