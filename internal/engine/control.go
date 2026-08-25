@@ -926,8 +926,9 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	// services copies exactly what a bare one does. Worth saying, because an
 	// earlier version of this comment said "copies the whole configuration",
 	// which points whoever reads it at a pointer receiver for a win that is not
-	// there. What this removes is the lock traffic and the scans. The configuration cannot change
-	// under this batch in a way that matters: Reconfigure would have to land
+	// there. What this removes is the lock traffic and the scans.
+	//
+	// The configuration cannot change under this batch in a way that matters: Reconfigure would have to land
 	// mid-frame, and a path removed or added halfway through one is exactly as
 	// arbitrary either way.
 	known := map[int]bool{}

@@ -1484,10 +1484,7 @@ func (e *Engine) refreshQuota(now time.Time) {
 
 	decisions := map[int]quota.Decision{}
 	for _, p := range cfg.Paths {
-		// Once per path, not twice: Evaluate below used to work the same
-		// bounds out again from the same quota and the same instant, and each
-		// pass is a real tzdata parse.
-		start, end := quota.PeriodBounds(p.Quota, now)
+		start, _ := quota.PeriodBounds(p.Quota, now)
 		used, err := e.st.Usage(p.ID, start)
 		if err != nil {
 			// Carry the last known verdict forward rather than omitting the
@@ -1501,7 +1498,7 @@ func (e *Engine) refreshQuota(now time.Time) {
 			continue
 		}
 		g, has := grants[p.ID]
-		decisions[p.ID] = quota.EvaluateIn(p, used, g, has, now, start, end)
+		decisions[p.ID] = quota.Evaluate(p, used, g, has, now)
 	}
 
 	e.mu.Lock()
@@ -1663,6 +1660,26 @@ func reportQuotaSubstitutions(log *slog.Logger, cfg model.Config) {
 				"path", p.Name, "stored", cal, "billing_at", 100.0,
 				"min", quota.MinCalibration, "max", quota.MaxCalibration,
 				"hint", "every metered byte on this path is now billed differently than it was. Set a calibration inside the range in the portal; until you do, the settings form refuses to save")
+		}
+		// The timezone, for the same reason and with a worse outcome. Location
+		// answers a zone it cannot load with time.UTC and says nothing, and that
+		// decides which billing period every metered byte lands in: eleven hours
+		// out for this deployment's own zone, so the rows land under a
+		// period_start the quota read never asks for, the current period reads
+		// empty and the cap never trips.
+		//
+		// Embedding tzdata removes one of the three ways to get here, a host
+		// with no database at all. The other two are a stored blob nothing
+		// re-validates: a zone name this build's database does not hold, which
+		// is a rename between tzdata releases or a typo saved before the check
+		// existed, and a blank, which validate fills with the deployment's own
+		// zone on save but which Location reads as UTC.
+		if tz := p.Quota.Timezone; tz == "" || quota.Location(p.Quota).String() != tz {
+			log.Warn("stored timezone is not one this host can resolve; billing this path in UTC instead",
+				"path", p.Name, "stored", tz, "billing_in", quota.Location(p.Quota).String(),
+				"hint", "the billing period turns over at UTC midnight rather than where the carrier draws it, "+
+					"and usage already recorded is under the other boundary. Set an IANA zone in the portal, "+
+					"or install tzdata on this host")
 		}
 		if o := p.Quota.OverheadPerPacket; o < 0 || o > quota.MaxOverheadPerPacket {
 			log.Warn("stored per-packet overhead is outside the range this build accepts; clamping it",

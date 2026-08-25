@@ -13,6 +13,28 @@ import (
 	"math"
 	"time"
 
+	// The timezone database, embedded, used only when the host has none.
+	//
+	// Location answers a zone it cannot load with time.UTC, silently, and that
+	// answer decides which billing period every metered byte lands in. A host
+	// whose /usr/share/zoneinfo goes away mid-life - a rebuilt image, a minimal
+	// container - therefore starts drawing the boundary eleven hours from where
+	// the carrier draws it, reads the current period as empty because the rows
+	// are under a different period_start, and never trips a quota again.
+	// web.validate cannot catch it, because it runs at save time on a host that
+	// still had the file.
+	//
+	// Here rather than in cmd/failover-frontend, which is where it went first.
+	// The thing that degrades is Location, so the guarantee belongs beside it:
+	// at the caller it covers whichever binary happens to import this today and
+	// silently stops covering the next one, and it did not cover this package's
+	// own tests or web's, which are what pin the billing boundaries and the
+	// timezone validation rules. It costs nothing elsewhere - the backend, the
+	// linker and failoverctl do not link this package - and about 405 KB in the
+	// frontend's eleven megabyte static binary. The standard library prefers the
+	// system copy whenever there is one, so a host with tzdata behaves as before.
+	_ "time/tzdata"
+
 	"github.com/quinlan102/homeport/internal/model"
 	"github.com/quinlan102/homeport/internal/store"
 )
@@ -259,19 +281,25 @@ type Decision struct {
 // A path over its limit is blocked unless a live approval covers it. The
 // absolute ceiling, if set, overrides even an approval: it exists so that a
 // runaway cannot cost unbounded money no matter what was clicked at 2am.
+// It works the billing period out itself rather than taking one, and that is a
+// decision rather than an oversight.
+//
+// There was an EvaluateIn beside this for one commit, taking the bounds its
+// caller had just computed, because Engine.refreshQuota works them out on the
+// statement before and each pass is a real time.LoadLocation. Two things were
+// wrong with it. The saving is about 150us per five second tick, which the
+// comment then oversold as relief for a loop that has to decide a failover
+// every 500ms - that is the sample ticker, not the decide ticker, and 150us
+// against 5s is nothing. And the signature could express a period that does not
+// belong to the path beside it: a caller hoisting one out of a loop over paths
+// compiles, and every path then gets somebody else's billing window, with the
+// wrong reset date on the portal card and in the block reason. Three adjacent
+// time.Time parameters could be transposed into the bargain.
+//
+// That is the same trap PeriodBoundsIn's signature was reshaped to make
+// inexpressible, and it is not worth reintroducing for a saving this size.
 func Evaluate(p model.PathConfig, used int64, grant store.Grant, hasGrant bool, now time.Time) Decision {
 	start, end := PeriodBounds(p.Quota, now)
-	return EvaluateIn(p, used, grant, hasGrant, now, start, end)
-}
-
-// EvaluateIn is Evaluate with the billing period already worked out.
-//
-// Its caller has almost always just computed the same bounds for the same path
-// at the same instant: Engine.refreshQuota did exactly that, on consecutive
-// statements, so every path paid two time.LoadLocation calls per tick where one
-// would do. That is about fifty microseconds each and it is on the engine's own
-// goroutine, which is the one that has to make a failover decision every 500ms.
-func EvaluateIn(p model.PathConfig, used int64, grant store.Grant, hasGrant bool, now, start, end time.Time) Decision {
 	d := Decision{
 		Used:        used,
 		Limit:       p.Quota.LimitBytes,

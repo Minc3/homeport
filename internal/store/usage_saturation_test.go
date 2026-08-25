@@ -90,8 +90,8 @@ func TestOrdinaryUsageIsUnaffectedBySaturation(t *testing.T) {
 // own bounds when it enforced half of them. The floor matters more than the
 // ceiling does: this column accumulates, so a negative figure does not record a
 // wrong number for one sample, it erases usage already billed and the first
-// anybody hears of it is the carrier's invoice. the engine clamps before
-// it calls this, which is exactly why the omission survived - the guarantee was
+// anybody hears of it is the carrier's invoice. The engine clamps before it
+// calls this, which is exactly why the omission survived - the guarantee was
 // living in a caller three files away.
 func TestTheLedgerCannotBeDrivenBelowZero(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -184,15 +184,25 @@ func TestTheBatchEntryPointCarriesTheSameBounds(t *testing.T) {
 	// statement outright rather than being promoted.
 	points, err := st.UsageHistory(2, now.Add(-time.Hour), 3600)
 	if err != nil {
-		t.Errorf("the portal's usage graph is broken: %v", err)
+		t.Fatalf("the portal's usage graph is broken: %v", err)
+	}
+	// A range over nothing is a pass, and this assertion exists precisely
+	// because "the query ran" is not the property. If the bucketing expression
+	// or the ts filter ever stops returning a row for this window, the loop
+	// below never executes and the overflow it guards goes unchecked.
+	if len(points) == 0 {
+		t.Fatalf("usage graph returned no buckets, so the assertion below checks nothing")
 	}
 	// Not merely that the query ran. The float branch that reads the sum back
 	// could be replaced by a bare int64(sum) and the query would still succeed,
 	// handing the graph a bucket that overflowed on conversion - so the value
 	// has to be asserted, not just the absence of an error.
+	// And that it actually saturated, not merely that it landed in range: the
+	// twenty entries sum past an int64 on purpose, so anything below the cap
+	// means the clamp was not what produced this number.
 	for _, pt := range points {
-		if pt.Bytes < 0 || pt.Bytes > store.MaxLedgerValue {
-			t.Errorf("usage graph bucket = %d bytes, want it clamped into [0, %d]",
+		if pt.Bytes != store.MaxLedgerValue {
+			t.Errorf("usage graph bucket = %d bytes, want it saturated at %d",
 				pt.Bytes, int64(store.MaxLedgerValue))
 		}
 	}

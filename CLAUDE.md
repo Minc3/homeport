@@ -767,17 +767,42 @@ ignore: written the other way, a caller resolving one zone outside a loop over
 paths would draw every boundary in somebody else's, with the rows landing under
 a `period_start` up to eleven hours off and nothing reporting it.
 
-**The frontend carries its own copy of the timezone database.** `quota.Location`
+**`internal/quota` carries its own copy of the timezone database.** `quota.Location`
 answers a zone it cannot load with `time.UTC`, silently, and that answer decides
 which billing period every metered byte lands in. A host whose
 `/usr/share/zoneinfo` goes away mid-life - a rebuilt image, a minimal container -
 therefore starts drawing the boundary eleven hours from where the carrier draws
 it, reads the current period as empty because the rows are under a different
 `period_start`, and never trips a quota again. `web.validate` cannot catch it,
-because it runs at save time on a host that still had the file. `time/tzdata` in
-`cmd/failover-frontend` costs about 450 KB in an eleven megabyte static binary,
-and the standard library prefers the system copy whenever there is one, so a
-host with tzdata behaves exactly as it did.
+because it runs at save time on a host that still had the file. `time/tzdata`
+costs about 405 KB in an eleven megabyte static binary, and the standard library
+prefers the system copy whenever there is one, so a host with tzdata behaves
+exactly as it did. It is imported in `quota` rather than in
+`cmd/failover-frontend`, where it went first: the thing that degrades is
+`Location`, so the guarantee belongs beside it rather than at whichever binary
+happens to import the package today, and at the caller it did not cover this
+package's own tests or `web`'s. It costs nothing elsewhere, because the backend,
+the linker and `failoverctl` do not link `quota`.
+
+Embedding it removes one of the three routes to that fallback, a host with no
+database at all. The other two are a stored blob nothing re-validates on load: a
+zone name this build cannot resolve, which is a rename between tzdata releases or
+a typo saved before `validate` checked, and a blank, which `validate` fills with
+the deployment's own zone on save but which `Location` reads as UTC.
+`Engine.reportQuotaSubstitutions` reports both, beside the two quota multipliers
+it already covered and for the identical reason.
+
+**The billing period is worked out once, inside `Evaluate`, and an `EvaluateIn`
+taking pre-computed bounds is not worth having.** There was one for a commit,
+because `Engine.refreshQuota` computes the same bounds on the statement before
+and each pass is a real `time.LoadLocation`. The saving is about 150us per five
+second tick, which its own comment then oversold as relief for a loop that has to
+decide a failover every 500ms - that is the sample ticker, not the decide ticker.
+And the signature could express a period belonging to a different path: a caller
+hoisting one out of a loop over `cfg.Paths` compiles, and every path then gets
+somebody else's billing window, with the wrong reset date on the portal card and
+in the block reason. That is the same trap `PeriodBoundsIn` was reshaped to make
+inexpressible, and 150us in five seconds does not buy it back.
 
 What neither bounds is a sequence that has gone *backwards*, and that hole is
 open. A backend that loses `meter-state.json` restarts at 1, every delta is at
@@ -2530,6 +2555,11 @@ where a subtle regression would be invisible in production until an outage:
   batch path only while `AddUsage` remains a batch of one; for one commit it was
   not, and every bound in this file was being pinned on a method nothing
   called.
+- `engine/quota_report_test.go` also holds the timezone, which has the worst
+  outcome of the three values that function covers: a zone this build cannot
+  resolve and a blank one are both answered with UTC in silence, and that decides
+  which billing period every metered byte lands in. Exactly one path is reported,
+  so the line names which one to correct.
 - `engine/quota_report_test.go` - a stored calibration outside the range this
   build accepts is named at load, with the path in the line, and a configuration
   the portal would accept produces no line at all. Zero is pinned as one of the
@@ -2574,6 +2604,16 @@ where a subtle regression would be invisible in production until an outage:
   two quota caps whose boxes are in gigabytes while their fields are `int64`.
   It is the only thing holding a rule that spans thirty call sites in a file
   with no test framework of its own.
+
+  Which is why it also asserts that it found anything. A text scan over a file
+  with no parser behind it fails by matching nothing, and the first version did
+  exactly that in three ways: it never saw the five probe inputs, because those
+  are built through a wrapper whose own `num(` call carries neither the binding
+  nor the options; renaming the helper made it scan zero calls and still report
+  ok; and balancing parens without regard for string literals meant one
+  unbalanced paren in a label would swallow the calls after it. It scans both
+  names now, counts what it found, and requires every fractional field to have
+  been matched by something.
 - `web/password_test.go` - a password can be changed, doing so logs out every
   other session while keeping the caller signed in, the current password is
   required, an unauthenticated request cannot change one, the local socket can

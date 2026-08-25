@@ -21,23 +21,6 @@ import (
 	"github.com/quinlan102/homeport/internal/notify"
 	"github.com/quinlan102/homeport/internal/store"
 	"github.com/quinlan102/homeport/internal/web"
-
-	// The timezone database, embedded, used only when the host has none.
-	//
-	// quota.Location answers a zone it cannot load with time.UTC, silently, and
-	// that answer decides which billing period every metered byte lands in. A
-	// frontend whose /usr/share/zoneinfo goes missing mid-life - a tzdata
-	// removed by a rebuilt image, a minimal container - therefore starts drawing
-	// the boundary eleven hours from where the carrier draws it, reads the
-	// current period as empty because the rows are under a different
-	// period_start, and never trips a quota again, with nothing anywhere saying
-	// so. web.validate cannot catch it because it runs at save time on a host
-	// that still had the file.
-	//
-	// This is the whole of the cost: about 450 KB in a static binary that is
-	// already eleven megabytes, and the stdlib prefers the system copy whenever
-	// there is one, so a host with tzdata behaves exactly as before.
-	_ "time/tzdata"
 )
 
 var version = "dev"

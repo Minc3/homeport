@@ -43,6 +43,13 @@ func TestAnOutOfRangeStoredCalibrationIsReportedAtLoad(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := testConfig()
+			// A resolvable zone on every path, so the only thing this case can
+			// report is the calibration. The shared fixture leaves Timezone
+			// blank, which no real configuration does - Defaults sets it and
+			// validate fills it - and which is itself reported, below.
+			for i := range cfg.Paths {
+				cfg.Paths[i].Quota.Timezone = "UTC"
+			}
 			cfg.Paths[1].Quota.Calibration = tc.cal
 
 			var buf bytes.Buffer
@@ -87,11 +94,58 @@ func TestAnAcceptableStoredCalibrationIsNotReported(t *testing.T) {
 			cfg := testConfig()
 			for i := range cfg.Paths {
 				cfg.Paths[i].Quota = tc.q
+				cfg.Paths[i].Quota.Timezone = "UTC"
 			}
 			var buf bytes.Buffer
 			reportQuotaSubstitutions(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
 			if buf.Len() != 0 {
 				t.Errorf("a configuration the portal accepts produced a report:\n%s", buf.String())
+			}
+		})
+	}
+}
+
+// The timezone is the third value reportQuotaSubstitutions covers, and the one
+// with the worst outcome of the three. quota.Location answers a zone it cannot
+// resolve with time.UTC and says nothing, and that decides which billing period
+// every metered byte lands in: eleven hours out for this deployment, so the rows
+// land under a period_start the quota read never asks for, the current period
+// reads empty, and the cap never trips.
+//
+// Embedding tzdata removes one of the three routes here, a host with no database
+// at all. These are the other two, and both are a stored blob nothing
+// re-validates on load.
+func TestAnUnresolvableStoredTimezoneIsReportedAtLoad(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tz   string
+	}{
+		// A rename between tzdata releases, or a typo saved before validate
+		// checked the zone.
+		{"a zone this build cannot resolve", "Mars/Olympus_Mons"},
+		// validate fills a blank with the deployment's own zone on save, so a
+		// stored blank predates that - and Location reads it as UTC, not as the
+		// default, which is a ten hour difference nobody is told about.
+		{"blank, which Location reads as UTC rather than the default", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			for i := range cfg.Paths {
+				cfg.Paths[i].Quota.Timezone = "UTC"
+			}
+			cfg.Paths[1].Quota.Timezone = tc.tz
+
+			var buf bytes.Buffer
+			reportQuotaSubstitutions(slog.New(slog.NewTextHandler(&buf, nil)), cfg)
+			out := buf.String()
+			if !strings.Contains(out, "timezone") {
+				t.Fatalf("a stored timezone of %q was substituted with nothing said; the journal held:\n%s", tc.tz, out)
+			}
+			if !strings.Contains(out, cfg.Paths[1].Name) {
+				t.Errorf("the report does not name the path, so an operator cannot tell which one to correct:\n%s", out)
+			}
+			if strings.Count(out, "timezone") != 1 {
+				t.Errorf("want exactly one path reported, got:\n%s", out)
 			}
 		})
 	}
