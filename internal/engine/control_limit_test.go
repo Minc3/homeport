@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -236,5 +237,49 @@ func TestOneAddressCannotHoldTheWholePool(t *testing.T) {
 	s.srcMu.Unlock()
 	if left != 0 {
 		t.Fatalf("per-source map kept %d entries after every connection finished", left)
+	}
+}
+
+// Every throttle on the server has a trailing edge, checked by counting the
+// fields rather than by reading the list.
+//
+// The failure this guards is silent by construction: a new reason needs a field
+// and an entry in reports(), and omitting the entry compiles, passes every other
+// test, and leaves a counter that fills up and never emits - which is precisely
+// the defect the trailing edge was added to fix. Reflection is what makes the
+// check independent of the thing it is checking.
+func TestEveryThrottleHasATrailingEdge(t *testing.T) {
+	s := &ControlServer{}
+	v := reflect.ValueOf(s).Elem()
+	throttleType := reflect.TypeOf(throttle{})
+
+	var fields []string
+	for i := 0; i < v.NumField(); i++ {
+		if v.Type().Field(i).Type == throttleType {
+			fields = append(fields, v.Type().Field(i).Name)
+		}
+	}
+	if len(fields) == 0 {
+		t.Fatal("no throttle fields found; this test is not looking at the right struct")
+	}
+
+	reported := map[uintptr]bool{}
+	for _, r := range s.reports() {
+		reported[reflect.ValueOf(r.t).Pointer()] = true
+		if r.msg == "" || r.countKey == "" {
+			t.Errorf("a report has no message or no count key: %+v", r)
+		}
+	}
+	for i := 0; i < v.NumField(); i++ {
+		f := v.Type().Field(i)
+		if f.Type != throttleType {
+			continue
+		}
+		if !reported[v.Field(i).Addr().Pointer()] {
+			t.Errorf("throttle %q has no entry in reports(), so a burst that stops is counted and never reported", f.Name)
+		}
+	}
+	if len(s.reports()) != len(fields) {
+		t.Errorf("reports() has %d entries for %d throttles: %v", len(s.reports()), len(fields), fields)
 	}
 }

@@ -27,6 +27,14 @@ import (
 // ErrNotFound is returned when a lookup misses.
 var ErrNotFound = errors.New("store: not found")
 
+// MaxLedgerValue is the ceiling on one accumulated ledger figure.
+//
+// 2^60 is an exbibyte, so no real deployment approaches it and the cap never
+// bites anything honest. It is low enough that adding one more bounded delta to
+// a column already at the cap cannot overflow an int64, which is the property
+// that matters: see the note in AddUsage on what SQLite does with an overflow.
+const MaxLedgerValue = 1 << 60
+
 // Store wraps the SQLite database.
 type Store struct {
 	db *sql.DB
@@ -272,13 +280,47 @@ func (s *Store) AddUsage(pathID int, periodStart time.Time, bytes, packets int64
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Both directions, on the parameters and again on the sum below.
+	//
+	// The ceiling was here first and the floor is not symmetry for its own
+	// sake: this column accumulates, so a negative delta does not record a
+	// wrong figure for one sample, it erases usage already billed. That is the
+	// silent direction, and the one the carrier's invoice is the first news of.
+	// Engine.AddUsage clamps before it calls this, which is what makes the
+	// omission easy to miss - the guarantee was living in a caller three files
+	// away while this method advertised a bound of its own and enforced half of
+	// it. A method one call from the ledger is not the place to leave that for
+	// whoever adds the second caller, which is the reasoning saturatingAdd
+	// carries in quota for the same reason.
+	bytes = clampLedger(bytes)
+	packets = clampLedger(packets)
+	// Saturating in SQL, not merely bounded per delta by the caller.
+	//
+	// SQLite does not error on integer overflow: `bytes + excluded.bytes`
+	// silently becomes a REAL, and from then on every Scan into an int64
+	// returns "converting driver.Value type float64 to a int64". That is
+	// permanent, because the column now holds a float, and Engine.refreshQuota
+	// carries the previous verdict forward on a read error, so the path's quota
+	// freezes at whatever it last was and only editing the database clears it.
+	//
+	// A per-delta bound cannot prevent it, which is the trap: the callers bound
+	// one delta and this column accumulates them, so thirteen clamped deltas
+	// reach the overflow inside a single frame. The cap has to be on the sum.
+	//
+	// MAX(..., 0) for the same reason the parameters have a floor: the sum is
+	// where a negative would land, and a row driven below zero under-reports
+	// the month for as long as the period lasts.
 	if _, err := tx.Exec(
 		`INSERT INTO ledger (path_id, period_start, bytes, packets) VALUES (?, ?, ?, ?)
 		 ON CONFLICT(path_id, period_start) DO UPDATE SET
-		     bytes = bytes + excluded.bytes, packets = packets + excluded.packets`,
-		pathID, periodStart.Unix(), bytes, packets); err != nil {
+		     bytes = MAX(MIN(bytes + excluded.bytes, ?), 0), packets = MAX(MIN(packets + excluded.packets, ?), 0)`,
+		pathID, periodStart.Unix(), bytes, packets, int64(MaxLedgerValue), int64(MaxLedgerValue)); err != nil {
 		return fmt.Errorf("ledger update: %w", err)
 	}
+	// The same values, so the same ceiling. This row is only ever read back
+	// through UsageHistory for the portal's graph, which made it look like the
+	// harmless half of the pair and it is not: the cap on `ledger` above bounds
+	// an accumulating column, and these rows accumulate inside a query instead.
 	if _, err := tx.Exec(
 		`INSERT INTO usage_samples (ts, path_id, bytes, packets) VALUES (?, ?, ?, ?)`,
 		at.Unix(), pathID, bytes, packets); err != nil {
@@ -309,6 +351,38 @@ func (s *Store) Usage(pathID int, periodStart time.Time) (int64, error) {
 	return b, nil
 }
 
+// UsagePackets returns the accumulated packet count for a path in a period.
+//
+// It exists because the ledger's two columns are written together and only one
+// of them could be read back. The packets column is not decoration: it is what
+// quota.Metered multiplies by the per-packet overhead, so a wrong figure there
+// under-bills every metered byte exactly as a wrong byte count does, and until
+// this there was no way for a test to say so.
+func (s *Store) UsagePackets(pathID int, periodStart time.Time) (int64, error) {
+	var p int64
+	err := s.db.QueryRow(
+		`SELECT packets FROM ledger WHERE path_id = ? AND period_start = ?`,
+		pathID, periodStart.Unix()).Scan(&p)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read usage packets: %w", err)
+	}
+	return p, nil
+}
+
+// clampLedger brings one figure inside the bounds a ledger column may hold.
+func clampLedger(v int64) int64 {
+	if v < 0 {
+		return 0
+	}
+	if v > MaxLedgerValue {
+		return MaxLedgerValue
+	}
+	return v
+}
+
 // UsagePoint is one bucket of the usage history.
 type UsagePoint struct {
 	TS    int64 `json:"ts"`
@@ -317,8 +391,22 @@ type UsagePoint struct {
 
 // UsageHistory returns bucketed usage for a path over a window.
 func (s *Store) UsageHistory(pathID int, since time.Time, bucketSec int) ([]UsagePoint, error) {
+	// SUM over REAL rather than over INTEGER, and scanned as a float.
+	//
+	// SQLite does not promote an overflowing SUM the way it promotes a bare
+	// `+`: it fails the whole statement with "integer overflow", so one bucket
+	// holding more than an int64 can carry takes the portal's usage graph off
+	// the air for that path until the rows age out, which is thirteen months.
+	// A per-row ceiling cannot prevent it, because the rows accumulate inside
+	// the query - the same trap as the ledger column, reached through a read
+	// instead of a write.
+	//
+	// A float is the right answer here and would not be in the ledger: this
+	// feeds a graph, not an enforcement decision, and float64 is exact to about
+	// 9e15, which is four orders of magnitude above any bucket a real
+	// deployment produces.
 	rows, err := s.db.Query(
-		`SELECT (ts / ?) * ?, SUM(bytes) FROM usage_samples
+		`SELECT (ts / ?) * ?, SUM(CAST(bytes AS REAL)) FROM usage_samples
 		 WHERE path_id = ? AND ts >= ? GROUP BY 1 ORDER BY 1`,
 		bucketSec, bucketSec, pathID, since.Unix())
 	if err != nil {
@@ -328,8 +416,17 @@ func (s *Store) UsageHistory(pathID int, since time.Time, bucketSec int) ([]Usag
 	var out []UsagePoint
 	for rows.Next() {
 		var p UsagePoint
-		if err := rows.Scan(&p.TS, &p.Bytes); err != nil {
+		var sum float64
+		if err := rows.Scan(&p.TS, &sum); err != nil {
 			return nil, err
+		}
+		switch {
+		case sum >= MaxLedgerValue:
+			p.Bytes = MaxLedgerValue
+		case sum <= 0:
+			p.Bytes = 0
+		default:
+			p.Bytes = int64(sum)
 		}
 		out = append(out, p)
 	}

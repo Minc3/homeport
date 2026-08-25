@@ -323,6 +323,15 @@ if [ "$START" -eq 1 ]; then
 		echo "    journalctl -u $UNIT -n 30 --no-pager"
 		echo "  'i/o timeout' means the frontend cannot route back to $BACKEND_IP."
 		echo "  Repeated 'dropping unauthenticated probe packets' means the psk differs."
+		echo "  'claimed to be the backend from an address that is not the backend's',"
+		echo "  in the frontend's journal, means overlay.backend_ip differs between the"
+		echo "  two bootstrap files. This host was installed with $BACKEND_IP. The"
+		echo "  frontend serves the backend half of the control protocol only to the"
+		echo "  address it has configured, so this does not resolve itself. The"
+		echo "  frontend's copy is the authority - it is what the DNAT rules point at"
+		echo "  and what its WireGuard peers admit - so read it there and make this"
+		echo "  host match, rather than the other way round:"
+		echo "    ssh <frontend> grep backend_ip /etc/failover/frontend.json"
 	fi
 else
 	echo "  --no-start given; run: systemctl enable --now $UNIT"

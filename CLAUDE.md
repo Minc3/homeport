@@ -538,6 +538,305 @@ server in which the accept loop is reachable without a limit, and it is what
 lets the test assert this without a sleep: once `listen` has returned, that
 statement has run, whether the bind succeeded, failed, or was never attempted.
 
+**A peer's role arrives in its own Hello, so the address it connects from is
+what settles which half of the protocol it is served.** The handshake proves
+the peer belongs to this deployment and nothing more, which is exactly the
+reasoning already written for a linker's claimed overlay address. It was
+applied to linkers and not to the backend: `serve` dispatched on
+`hello.Role`, and anything that was not `"linker"` fell through to the backend
+branch with no test of any kind. Omitting one JSON field was therefore enough
+to be served as the backend, and an empty role is not an exotic frame, it is
+what a backend from before linkers existed sends.
+
+What that branch does is write the usage ledger, which is authoritative for
+quota enforcement. Every host in the deployment holds the identical key,
+because `Bootstrap.Key` is `sha256(psk)` whatever the role and
+`install-linker.sh` takes the frontend's psk verbatim, so the peer best placed
+to use this is a linker: the least trusted of the three by this system's own
+reasoning, sitting on somebody's game server and reaching the listener over a
+plaintext LAN hop.
+
+`Engine.KnownBackend` is the check, and the address is what it checks because
+the backend already proves it for free: `Agent.controlSession` binds its socket
+to the overlay address, and the frontend's WireGuard peer only admits that
+range. `KnownLinker` gained the matching half in the other direction, because
+being on the configured list only says an address belongs to *some* linker: a
+linker must also be connecting *from* the address it claims, or one of them
+could name another and be handed that host's egress networks, which it loads
+into nftables as root for a machine it is not. Neither needs a wire change and
+neither costs more than a comparison.
+
+It costs one thing, and it is worth knowing before an install goes wrong. A
+backend whose bootstrap file disagreed with the frontend's about
+`overlay.backend_ip` used to converge on its own: it was served, the push told
+it which address it was, `Agent.Overlay` prefers the pushed value, and
+`applyPlumbing` put that address on `dummy0`, so the next dial came from the
+right place. That convergence is the hole, stated as a feature, so it is gone.
+A fresh install with mismatched files now never connects at all, which is why
+both `deploy/SETUP.md` and `install-backend.sh` name this among the reasons a
+channel stays down. Two hosts that already agree see no change.
+
+**This is a fence around a shared credential rather than a replacement for
+one.** Every role derives the same key, so the address is doing work a
+credential should be doing, and an address is a weaker thing to rest on than a
+MAC: a root-compromised linker can add the backend's overlay address to its own
+`dummy0` and dial from it, because `rp_filter` is 0 on both hosts by necessity
+(§8) and the backend forwards the overlay range in both directions. What the
+check buys is that the attack now needs root on that host and a deliberate
+spoof, rather than one omitted JSON field. The real fix is a per-role key, some
+`HKDF(psk, role)` with the role coming from each host's own bootstrap file
+rather than from the Hello, which `proto` already has the label vocabulary for.
+It is a wire break, because the frontend has to know which key to verify a
+handshake against before the Hello has arrived, so it wants a `proto.Version`
+bump and a coordinated upgrade. Not done here.
+
+**A usage delta is bounded before it is billed, and every other value on this
+channel already was.** The egress networks go through `EgressNetworks`, the
+overlay address through `AddressLiteral`, the subnet through `NetworkLiteral`.
+The numbers in a usage frame went through nothing, and they are not inert data:
+a large one takes every metered path out of the selector while the links
+themselves go on measuring perfectly, and a negative one erases the record the
+data cap depends on. The second is the worse direction, because over-billing is
+at least visible in the portal with an approve button beside it.
+
+`ControlServer.checkDelta` clamps rather than refuses, and that is the design
+rather than a shortcut. Refusing would leave the watermark where it was, so the
+backend would resend the same delta on every tick and have it refused every
+time: that path's accounting would stall for good, which is worse than billing
+a bounded wrong number at `Error`. The ceilings are sanity bounds and not tight
+ones, deliberately: `Meter` persists its per-interface baseline across restarts
+so that usage accrued while the agent was stopped is still accounted for, which
+means the first sample after an outage is a *single* delta covering the whole
+of it. There is no interval here to multiply a line rate by, and a bound
+derived from one would refuse exactly the delta that exists to survive a long
+outage.
+
+**The stamp is bounded in both directions, and the past side is the one that
+happens by accident.** `AddUsage` picks the billing period from it, so a stamp
+outside the window writes the bytes to a period nothing reads while the current
+period stays where it was and the quota never trips. The future side is the
+obvious half. The past side is reached by invariant 11's own scenario: the
+house loses power, comes back with every link down, so there is no route to
+NTP, so the backend's clock is stale, and it is the backend's clock that stamps
+every delta. Such a host bills a month of metered LTE into 1970 with the portal
+showing the period empty. The comparison is made on the raw seconds, not on
+the `time.Time`, and that is the correct way round rather than the obvious one.
+`time.Unix` overflows at both extremes and lands both in the same place:
+`MinInt64` and `MaxInt64` alike render as the year 292277026596 and both compare
+as *before* now. A `time.Time` comparison therefore misses `MaxInt64` in the
+future branch entirely and catches it in the past branch, reporting a stamp
+tens of billions of years ahead as one too far in the past to bill. Seconds do
+not wrap.
+
+The past window is a week, taken from the backlog rather than picked round. The
+backend buffers at most `maxBuffered` deltas at one per path per ten seconds, so
+the oldest an honest one can be is 5.8 days on a single-path site. A month, the
+first value here, was five times that, and the slack was not free: a backend
+whose clock is a week stale, which is an ordinary amount for an RTC after the
+power cut invariant 11 describes, stamps current traffic a week back, lands it
+in the previous billing period whenever the outage straddles a reset day, is
+never reported because it is inside the window, and leaves the current period
+reading empty while the cap is spent.
+
+**The path id is dropped rather than clamped, and never acked.** It is one of
+two fields that reach the database whatever else they say: `AddUsage` acks an id
+it does not recognise on purpose, so deltas for a path the operator has just
+removed stop being resent, and that ack is a row in `meta`, which has no
+retention. Acking an id no configuration can hold is therefore a permanent row
+per id with the key chosen by whoever is sending, so an id outside the range
+`web.validate` allows is dropped before anything is read or written for it.
+Clamping it onto a valid id would be worse than dropping: that bills one path's
+traffic to another.
+
+**The sequence is the other, and it is the field that does the most damage per
+byte sent.** It is a per-path dedupe watermark: `applyUsage` skips anything not
+strictly newer, writes the accepted value into `meta`, and acks it so the
+backend may drop its buffered copy. All three are permanent. One delta carrying
+a sequence near `MaxUint64` therefore parks the watermark where no honest delta
+can ever follow, so every later delta for that path is skipped in silence, the
+ack tells the backend its entire buffer is applied so the bytes are gone, and
+the `meta` row survives every restart. That path is never billed again, the
+quota never trips, all three paths go on measuring perfectly, and only editing
+the database clears it. It is the one direction that is both silent and
+unrecoverable, which is why `maxDeltaSequence` refuses rather than clamps and
+does not ack: the resulting stall is deliberate, because a sender emitting such
+a sequence has lost its meter state and there is no correct value to clamp to.
+A sequence counts samples, so at the ten-second cadence the bound is about three
+hundred thousand years of continuous sampling.
+
+**An absolute bound alone does not close that, and reading it as though it did
+is the trap.** `maxDeltaSequence` rules out only the top of the range. A
+sequence of `1<<39` is comfortably inside it and just as far past an honest
+counter of a few million, so it parks the watermark exactly as permanently, with
+every consequence in the paragraph above intact. The damage is not a function of
+how large the number is, it is a function of how far past the watermark it is,
+so that is what `maxSequenceJump` bounds. Both are needed and neither subsumes
+the other: the relative one cannot apply to the first delta a path ever sees,
+because there is no watermark to measure from and refusing that one refuses the
+delta that starts the path's accounting, which is the same shape as
+`decisionSeqHorizonMs` covering the unanchored case on the backend. The slack
+is generous for one reason: the backend keeps sampling while the frontend is
+unreachable and its sequence keeps advancing after `maxBuffered` has dropped the
+oldest deltas off the front, so a legitimate jump is elapsed samples rather than
+buffered ones. A bound derived from the buffer would refuse exactly the delta
+that exists to survive a long outage. Forty years of continuous sampling is
+still four orders of magnitude tighter than the absolute bound beside it.
+
+What neither bounds is a sequence that has gone *backwards*, and that hole is
+open. A backend that loses `meter-state.json` restarts at 1, every delta is at
+or below the watermark, `applyUsage` skips them all, and the ack seeded from the
+existing watermark tells the backend its buffer is applied, so `Meter.AckApplied`
+drops them. That path bills nothing until the sequence climbs back past where it
+was, which takes as long as the original run did. It is the same silent
+under-billing reached from below, and closing it needs the backend to say that
+its meter reset, which is a wire change.
+
+**One usage batch is applied at a time, across every connection.** The
+per-path watermark is memoised for the batch rather than re-read per delta, and
+a memoised database read is only sound while this goroutine is the one moving
+it. More than one connection from the backend is the ordinary case rather than
+the exotic one: a silently dead session sits on its read deadline while its
+replacement dials in, which is what `backendConns` and `maxPerSource` are both
+written for, and the connection dies at every failover. The replacement resends
+everything unacked, so two goroutines apply the same deltas, and the old one may
+be several hundred transactions into a batch when the new one starts. Without
+`ControlServer.usageMu` neither sees the other's commits and the whole batch is
+billed twice. The per-delta read this replaced had the same race across one
+delta; the lock closes it rather than narrowing it back.
+
+**A bound on one delta is not a bound on the column it accumulates into, and
+that gap was reachable inside a single frame.** SQLite does not error on integer
+overflow: `bytes + excluded.bytes` silently becomes a REAL, and from then on
+every `Scan` into an int64 fails with "converting driver.Value type float64 to a
+int64". It is permanent, because the column now holds a float, and
+`Engine.refreshQuota` carries the previous verdict forward on a read error, so
+that path's quota freezes where it stood and only editing the database clears
+it. Thirteen deltas clamped to the ceilings above reach it, well inside one
+accepted frame. `store.MaxLedgerValue` saturates the sum in SQL, at 2^60, which
+is an exbibyte and therefore never bites anything honest while staying low
+enough that one more bounded delta on top of it cannot overflow.
+
+**And that column has a floor as well as a ceiling, which took a second pass.**
+The ceiling was written first, which left `store.AddUsage` advertising a bound
+of its own and enforcing half of it: `MIN(bytes + excluded.bytes, ?)` caps only
+upward, and the parameter check tested only the high side, so a negative delta
+decremented a column that accumulates. That does not record a wrong figure for
+one sample, it erases usage already billed, which is the silent direction and
+the one the carrier's invoice is the first news of. Nothing reached it, because
+`Engine.AddUsage` clamps first, and that is exactly what made it easy to miss:
+the guarantee was living in a caller three files away while this method looked
+complete. `clampLedger` and `MAX(MIN(...), 0)` make it total, on the parameters
+and on the sum, for the reason `quota.saturatingAdd` carries the same note.
+
+`usage_samples` is the same hazard reached through a read, and fixing only the
+write half missed it. Its rows accumulate inside `SUM(bytes)` rather than in a
+column, and SQLite does not promote an overflowing `SUM` the way it promotes a
+bare `+`: it fails the statement outright, so one bucket past an int64 takes the
+portal's usage graph off the air for that path until the rows age out, which is
+thirteen months. The sum is taken over `REAL` there, which is right for a graph
+and would be wrong in the ledger: this feeds a picture rather than an
+enforcement decision, and float64 is exact to about 9e15, four orders of
+magnitude above any bucket a deployment produces.
+
+**What these bounds do not do is worth stating, because the temptation is to
+read them as more.** A delta clamped to `maxDeltaBytes` and `maxDeltaPackets`
+still exhausts any real quota thousands of times over, and that is deliberate
+rather than an oversight: the two directions do not cost the same. Over-billing
+is visible, since the portal names the blocked path and puts an approve button
+beside it, while under-billing is silent until the carrier's invoice. So the
+negative direction is refused outright and this one is only kept away from a
+number that would overflow the arithmetic downstream. What keeps a hostile peer
+away from the ledger is `KnownBackend`, not these.
+
+**And the batch is bounded in count as well as each delta in value.** The
+backend caps its own at 500, and the frontend enforced nothing: a frame is
+bounded only by `proto.MaxFrameBytes`, and a delta is about a hundred bytes, so
+one accepted frame can carry ten thousand. Each is a `Meta` read plus a full
+transaction, run inline on the control read loop, which cannot answer a ping or
+read the next frame while it works.
+
+**Every one of these reports goes through `ControlServer.throttle`, and there is
+one counter per remediation rather than one per family.** The count is chosen by the
+peer, so a line per clamped delta is hundreds per frame, repeated on every send
+tick: the same unbounded peer-driven journal volume the throttles were added
+for, arriving through a new door. The oversized-batch report needed it most,
+because the excess is never acked, so the sender rebuilds the identical frame on
+every tick and the line repeats with it forever.
+
+The split is not tidiness. A shared window is won by whichever reason fires
+first, and every other one is folded into a generic count for thirty seconds, so
+an operator with a mismatched `overlay.backend_ip` *and* a mislabelled linker is
+told about one of them and the second is a number with no hint attached. Seven
+counters now (`notBackend`, `unknownIP`, `wrongIP`, `clamped`, `badPath`,
+`badSeq`, `oversized`), each with its own trailing edge in `flushThrottles`.
+
+Remediation rather than reason is what draws the line, and the two places it
+lands differently are worth naming. `badPath` and `badSeq` were one counter, and
+they send an operator to different files with different hints, so a burst of
+garbage path ids must not silence the line that says to go and look at
+`meter-state.json`. `clamped` stays single although six conditions reach it,
+because they all mean the same thing to whoever reads it and its line already
+enumerates every one that fired for that delta: splitting it six ways would buy
+nothing and cost the shape of the rule.
+
+**The stamp window is deliberately asymmetric, and the future side is an hour
+rather than five minutes.** What the window protects is which *period* a delta
+lands in, and a period is a month, so an hour either side changes nothing except
+within an hour of a boundary. Five minutes was too tight against the premise of
+the past-side bound: a backend that may have no route to NTP, up for months,
+drifts minutes. Every honest delta from such a host tripped the check and was
+reported at `Error` with a hint saying no working backend emits this, which is
+how an operator learns to ignore the one line that means the ledger was written
+wrong.
+
+`quota.Metered` is the second half and neither is redundant. It multiplies
+every byte by two configuration values that had no ceiling of their own, and an
+int64 that wraps does not announce itself: it produces a plausible number, or a
+negative one that credits the month back. It now clamps both, saturates the
+arithmetic and refuses a negative count outright. NaN is tested before the
+ordered comparisons rather than after, because both of them are false for it:
+a NaN calibration would sail through, stay NaN through the multiply, and reach
+`int64(NaN)`, which on the deployment platform is `MinInt64`. `Engine.AddUsage`
+clamps too, because `Metered` clamps only its own copy and the raw packet count
+went on to the ledger's second column unchanged.
+
+An out-of-range calibration falls back to 100 rather than to the nearest edge,
+and the difference is the whole point of the floor. Clamping up to
+`MinCalibration` left the case it was added for intact: a stored 1, a fraction
+typed where a percent was wanted, became 10 and went on under-billing tenfold,
+while a stored 0 took the neutral branch and billed correctly. Neutral is the
+only fail-safe answer for a value that is not a calibration at all, and it errs
+toward the visible direction.
+
+The calibration is bounded on both sides, and only the ceiling existed at first.
+That left the whole of the silent direction open: 100 typed as 10 bills a
+gigabyte of LTE as a hundred megabytes, the ledger never approaches the cap, the
+quota never trips, and the portal shows the path healthy and under quota
+throughout. It is the same failure a negative byte count is refused for, reached
+through the multiplier instead of the operand, so `quota.MinCalibration` refuses
+it in the portal and clamps it at the boundary.
+
+`web.validate` bounds the same values with a message an operator can act
+on; the clamp is the boundary, for a value stored by an older build or arriving
+from a socket, where there is nobody to tell.
+
+Between those two sits the stored blob, and it is seen by neither.
+`store.LoadConfig` unmarshals it, `model.Normalise` does not touch `Quota`, and
+nothing re-validates it, so a config saved under a build whose only rule was
+"above zero" carries a calibration the portal would now refuse. That is not
+cosmetic, because `MinCalibration` is newer than the field it bounds: a site
+storing 5 billed at 5% before it existed and bills at 100% after, a factor of
+twenty from one restart to the next. `Engine.reportQuotaSubstitutions` says so
+at load. It reports rather than repairs, deliberately: `Metered` already
+substitutes, so rewriting the blob would change no billing and would take away
+the save-time error that is how an operator learns which figure to correct. A
+zero calibration is not reported, because `validate` has always read it as unset
+and filled in 100, so it is a value nobody chose rather than one being ignored. It keys on `quota.MaxCalibration`
+and `quota.MaxOverheadPerPacket` rather than on a copy of the numbers, the way
+the region checks key on `sysx.GeoSetName`: raise one alone and the portal
+accepts a figure the clamp silently reduces, which under-bills every metered
+byte with nothing anywhere saying so.
+
 **Everything this key authenticates carries a label, because two of them used
 to be the same function.** The probe MAC covers the first 50 bytes of the
 packet; the handshake MAC covered a nonce string the peer supplied. Same key,
@@ -2087,6 +2386,17 @@ where a subtle regression would be invisible in production until an outage:
 - `store/perms_test.go` - the database and its journal carry no group or world
   bits. They hold live session tokens, so this is the file mode standing
   between a local account and the portal.
+- `store/usage_saturation_test.go` - the ledger column survives at both ends:
+  forty saturated deltas leave it readable and capped rather than promoted to a
+  REAL, and a negative delta neither drives it below zero nor takes the packet
+  column with it. The floor is pinned here rather than only in the engine
+  because `Engine.AddUsage` clamps first, so an engine-level test passes whether
+  or not this method holds its own bound.
+- `engine/quota_report_test.go` - a stored calibration outside the range this
+  build accepts is named at load, with the path in the line, and a configuration
+  the portal would accept produces no line at all. Zero is pinned as one of the
+  quiet cases: `validate` reads it as unset, so reporting it would fire on every
+  path of any deployment predating the field and bury the line that matters.
 - `agent/decision_test.go` also holds the sequence bound: an implausible
   sequence is refused *and does not become the ceiling*, which is the half
   that matters, while a real one still lands; the ceiling grows with elapsed
@@ -2297,6 +2607,73 @@ where a subtle regression would be invisible in production until an outage:
   socket: authentication, the first push, liveness registration, a linker
   claiming an address nobody configured being refused, and a roleless hello
   still being understood as the backend.
+- `engine/control_identity_test.go` - which half of the protocol a peer is
+  served is decided by where it connects from, not by what it says it is: a
+  configured linker sending a roleless hello is refused rather than served as
+  the backend, a linker naming another linker's address is refused rather than
+  handed that host's networks, and the real backend dialling from the overlay
+  address with no role at all is still served exactly as it was. Plus
+  `KnownBackend` itself, so an unset address cannot become a wildcard.
+  A refusal is asserted as a *closed connection* rather than as a read that did
+  not finish, and that distinction is the test: `pushLoop` has no immediate
+  push the way `pushLinkerLoop` does, so a served backend sends nothing for two
+  seconds, and any deadline near that passes against unguarded code on a busy
+  machine. A timeout is reported as inconclusive rather than as success.
+- `engine/usage_bounds_test.go` - the ledger is not writable to arbitrary
+  values by whatever reaches this socket: a delta past the ceiling is clamped
+  rather than billed as sent, a negative one cannot credit the ledger, a
+  stamp in the future is pulled back to now while a backdated one keeps its own
+  billing period, and a clamped delta still advances the watermark, because a
+  refusal would have the backend resend it forever and stall that path's
+  accounting for good. The one that guards every working deployment is that an
+  ordinary delta is not moved by a byte, including the single large one a
+  restart after a long outage legitimately produces. Then the four the first
+  version of the bound missed: a stamp before the window is billed to the
+  current period rather than into 1970, which is where a backend with a stale
+  clock puts a month of LTE; both overflowing stamps are clamped and
+  named for the direction they came from; a path id
+  outside any valid configuration never touches the database, since acking one
+  is a permanent `meta` row keyed by whatever the sender chose; and an
+  oversized batch is truncated, because a frame bounded only by
+  `proto.MaxFrameBytes` can carry ten thousand transactions onto the read loop.
+  Then the one that outranks all of them, because it is silent *and*
+  unrecoverable: an implausible sequence cannot become the watermark, since one
+  that did would end that path's accounting for good and survive every restart,
+  with the companion case pinning that an ordinary sequence, ten years of
+  sampling deep, is still accepted. Then the same hazard measured the way it
+  actually bites: a sequence well inside the absolute bound but hundreds of
+  millions of samples past the watermark is refused and does not become it,
+  while the path still bills the next honest delta - and a jump of a year's
+  sampling, which is what a backend that kept metering through a long frontend
+  outage produces, is billed rather than refused. Beside them, that the same
+  batch applied on four goroutines at once is billed once: two backend sessions
+  is what a failover produces, and the per-batch watermark memo is a database
+  read held across five hundred transactions. Then the two the pass after that found: a
+  frame of clamped deltas cannot overflow the ledger column into a SQLite REAL,
+  which no per-delta bound could have prevented and which breaks every later
+  read of that row; and both overflowing stamps are clamped *and named
+  correctly*, `MaxInt64` as the future and `MinInt64` as the past, which a
+  `time.Time` comparison gets wrong in exactly one of the two directions. Beside them, that every clamp reason reaches
+  the log rather than only the last, that the reporting is throttled like every
+  other peer-driven line in that file, and that `quota.Metered` saturates rather
+  than wrapping, since an int64 that wraps here credits the month back.
+- `web/validate_test.go` also holds the high side of the two quota multipliers,
+  and it has to: the reason validate keys on `quota.MaxCalibration` and
+  `quota.MaxOverheadPerPacket` is that the portal's refusal and `Metered`'s
+  clamp must not drift, and without a test here loosening either leaves the
+  suite green. The clamp's own boundary still saves, so the message cannot be
+  reached by a value the clamp would have left alone, and a NaN calibration is
+  refused rather than saved: every ordered comparison is false for it, so it
+  slips past the low check and the high one alike and is then silently turned
+  into 100 by the clamp. Nothing can deliver one today - JSON has no NaN
+  literal, so neither a PUT body nor the stored blob decodes into one, and
+  `json.Marshal` refuses to write one - and the guard is kept for the shape of
+  the comparison rather than for a reachable input, which is what the next float
+  bound added beside it will inherit.
+  The backdated case anchors its stamp an hour before the current period's own
+  boundary rather than reaching a fixed span into the past, so it is a
+  different billing period without sitting on the age bound and becoming a
+  question about the calendar.
 - `sysx/forward_test.go` - the Docker forward exceptions widen when the overlay
   subnet is set, leave an already-correct chain alone, and never touch a rule
   they do not own. Also that the prefix is re-parsed before it is handed to

@@ -265,6 +265,7 @@ func New(log *slog.Logger, st *store.Store, notifier *notify.Notifier, cfg model
 		ifaceExists: sysx.IfaceExists,
 	}
 	e.runner = runnerFor(cfg.Mode, log)
+	reportQuotaSubstitutions(log, cfg)
 	e.loadLinkerSeen()
 	// A latch left by a previous process. See the field: without this,
 	// Restart=always turned every crash after a revert into a full reinstall.
@@ -1526,15 +1527,48 @@ func (e *Engine) refreshQuota(now time.Time) {
 // safely in the ledger - and the two cannot drift across a crash: a watermark
 // ahead of the ledger loses the bytes, one behind it double-bills a resend.
 func (e *Engine) AddUsage(pathID int, bytes, packets int64, at time.Time, seqKey, seqVal string) error {
+	// The one path, not the whole configuration. This runs once per delta and
+	// applyUsage sanctions a thousand of them in a frame, inline on the control
+	// read loop, so copying every path, service, region, linker and egress
+	// header a thousand times to read one entry is the same cost class the
+	// memoised watermark beside it removed.
 	e.mu.RLock()
-	cfg := e.cfg
+	p, ok := e.cfg.PathByID(pathID)
 	e.mu.RUnlock()
 
-	p, ok := cfg.PathByID(pathID)
 	if !ok || !p.Metered {
 		// Nothing to account for; the delta is discarded, and only the
 		// watermark advances so the backend stops resending it.
 		return e.st.SetMeta(seqKey, seqVal)
+	}
+	// Clamped here as well as inside Metered, because the two columns must not
+	// be able to disagree. Metered clamps its own copy, so a negative packet
+	// count produced zero metered bytes and was then handed to the ledger
+	// unchanged, where it decremented the period's packet total. checkDelta
+	// covers the control path, but this is an exported method and a caller
+	// three files away is not the place its guarantees live.
+	bytes, packets, _ = clampCounts(bytes, packets)
+	// The stamp too, for the reason the counts are: this is exported, and
+	// PeriodBounds takes whatever it is handed. A stamp outside the window puts
+	// the bytes in a period nothing ever reads while the current one stays at
+	// zero and the quota never trips.
+	//
+	// One test for both directions, and clamped to now rather than to either
+	// edge, which is what checkDelta does with the same value. The first
+	// version of this guard clamped to now+skew and tested only `at.After`,
+	// so it caught nothing at all: an overflowed time.Unix compares as *before*
+	// now whichever end it came from, an ordinary stale stamp is in the past,
+	// and clamping a genuine future stamp to now+skew can still land it in the
+	// next billing period when the batch is processed near a reset day.
+	//
+	// The shape differs from checkDelta's deliberately. That one holds the raw
+	// int64 and has to name the direction in a log, so it compares seconds,
+	// which do not wrap. Here the seconds are already unrecoverable - a
+	// time.Time built from an overflowing value does not report it back - and
+	// there is no message to get right, only a value to refuse. Both extremes
+	// land on the same side of this comparison, so one test covers them.
+	if now := time.Now(); at.After(now.Add(maxDeltaSkew)) || at.Before(now.Add(-maxDeltaAge)) {
+		at = now
 	}
 	metered := quota.Metered(bytes, packets, p.Quota)
 	start, _ := quota.PeriodBounds(p.Quota, at)
@@ -1543,6 +1577,49 @@ func (e *Engine) AddUsage(pathID int, bytes, packets int64, at time.Time, seqKey
 		return err
 	}
 	return nil
+}
+
+// reportQuotaSubstitutions says out loud where a stored configuration carries a
+// quota multiplier quota.Metered will refuse to use.
+//
+// The two bounds on those multipliers are enforced in two places and neither
+// covers this one. web.validate rejects an out-of-range value with a message an
+// operator can act on, and it runs only on PUT /api/config. Metered clamps
+// whatever it is handed, silently, because there is nobody at a socket to tell.
+// Between them sits the config blob: it is unmarshalled by store.LoadConfig,
+// model.Normalise does not touch Quota, and nothing re-validates it, so a value
+// stored by an older build is never seen by either.
+//
+// That gap is not cosmetic, because MinCalibration is newer than the field it
+// bounds. A site that saved 5 under a build whose only rule was "above zero"
+// went on billing at 5% until this change and bills at 100% after it, a factor
+// of twenty, from one restart to the next with nothing anywhere saying so. The
+// portal does refuse the next save and name the path, which is the other half
+// of the story and no use at all until somebody opens the form.
+//
+// It reports rather than repairs, deliberately. Metered already substitutes, so
+// rewriting the stored blob would change no billing and would take away the
+// save-time error that is how an operator learns which figure to correct.
+//
+// A zero calibration is not reported: validate has always read it as "unset"
+// and filled in 100, so it is a value nobody chose rather than one being
+// ignored. A zero overhead is a real setting and is left alone for the same
+// reason from the other side.
+func reportQuotaSubstitutions(log *slog.Logger, cfg model.Config) {
+	for _, p := range cfg.Paths {
+		cal := p.Quota.Calibration
+		if cal != 0 && (math.IsNaN(cal) || cal < quota.MinCalibration || cal > quota.MaxCalibration) {
+			log.Warn("stored calibration is outside the range this build accepts; billing at 100% instead",
+				"path", p.Name, "stored", cal, "billing_at", 100.0,
+				"min", quota.MinCalibration, "max", quota.MaxCalibration,
+				"hint", "every metered byte on this path is now billed differently than it was. Set a calibration inside the range in the portal; until you do, the settings form refuses to save")
+		}
+		if o := p.Quota.OverheadPerPacket; o < 0 || o > quota.MaxOverheadPerPacket {
+			log.Warn("stored per-packet overhead is outside the range this build accepts; clamping it",
+				"path", p.Name, "stored", o, "max", quota.MaxOverheadPerPacket,
+				"hint", "WireGuard, UDP and IP together come to about 60 bytes")
+		}
+	}
 }
 
 // SetHandshakeAges records the backend's tunnel report.
@@ -1734,6 +1811,51 @@ func (e *Engine) LinkerConfigFor(overlayIP string) proto.LinkerConfig {
 		}
 	}
 	return out
+}
+
+// KnownBackend reports whether a control connection from this address is the
+// backend's.
+//
+// The companion to KnownLinker, and it exists for the same reason: a peer's
+// role arrives in its own Hello, and every host in the deployment holds the
+// identical key. Without this the linker branch was checked and the backend
+// branch was not, so omitting one JSON field was enough to be served as the
+// backend and to write to the usage ledger.
+//
+// An address rather than a second credential because the backend already
+// proves this for free: Agent.controlSession binds its socket to the overlay
+// address, so a connection from anywhere else is not the backend whatever it
+// says. Empty is refused rather than treated as "any", which cannot happen on
+// a loaded configuration - LoadBootstrap defaults and then parses the field -
+// but must not read as a wildcard if it ever does.
+func (e *Engine) KnownBackend(host string) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.cfg.Overlay.BackendIP != "" && host == e.cfg.Overlay.BackendIP
+}
+
+// HasPath reports whether the running configuration holds this path id.
+//
+// Deliberately not "is this id in range": a configuration the portal accepted
+// before the range existed is still a configuration this frontend is routing
+// and metering, and its deltas have to keep reaching the ledger.
+func (e *Engine) HasPath(id int) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	_, ok := e.cfg.PathByID(id)
+	return ok
+}
+
+// BackendOverlayIP is the address the backend is expected to connect from.
+//
+// A field accessor rather than a Config() call at the one site that wants it:
+// Config copies the whole configuration - every path, service, region, linker
+// and egress row - under the state lock, and the caller is a refusal log on a
+// path whose rate a peer chooses.
+func (e *Engine) BackendOverlayIP() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.cfg.Overlay.BackendIP
 }
 
 // KnownLinker reports whether this overlay address is a configured, enabled

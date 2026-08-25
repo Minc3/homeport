@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -392,8 +393,51 @@ func validate(cfg *model.Config) error {
 			return fmt.Errorf("path %s reuses fwmark %#x", p.Name, p.Mark)
 		}
 		seenMark[p.Mark] = true
+		// NaN first, because every ordered comparison below is false for it, so
+		// it would pass the low bound and the high one alike and quota.Metered
+		// would then substitute 100 with nothing said.
+		//
+		// Nothing can deliver one today and the check is kept anyway: JSON has
+		// no NaN literal, so neither a PUT body nor the stored blob can decode
+		// into one, and json.Marshal refuses to write one, so SaveConfig could
+		// never have produced it either. What this guards is the shape of the
+		// comparison rather than a reachable input - the next float bound added
+		// beside it inherits the same trap, and Metered carries the matching
+		// guard for the same reason.
+		if math.IsNaN(p.Quota.Calibration) {
+			return fmt.Errorf("path %s has a calibration that is not a number", p.Name)
+		}
 		if p.Quota.Calibration <= 0 {
 			p.Quota.Calibration = 100
+		}
+		// Bounded above as well as below, because both of these are
+		// multipliers on every metered byte and neither had a ceiling. A
+		// calibration is a correction for what the carrier counts against what
+		// the interface does, so a factor of ten in either direction is a typo
+		// rather than a setting; an overhead is the per-packet cost of
+		// WireGuard, UDP and IP together, which is about sixty bytes, and a
+		// kilobyte is already past anything real.
+		//
+		// quota.Metered clamps the same two values, and neither check is
+		// redundant. This one is the message an operator can act on. That one
+		// is the boundary, for a value stored by an older build or arriving
+		// from a socket, and it clamps silently because there is nobody there
+		// to tell.
+		//
+		// Keyed on quota's own constants rather than on a copy of the numbers,
+		// the way the region checks key on sysx.GeoSetName: raise one alone and
+		// the portal accepts a figure Metered silently clamps, which under-bills
+		// every metered byte with nothing anywhere saying so.
+		if p.Quota.Calibration > quota.MaxCalibration || p.Quota.Calibration < quota.MinCalibration {
+			return fmt.Errorf("path %s has a calibration of %g%%; it corrects for what the carrier counts "+
+				"against what the interface does, so anything outside %g%% to %g%% is a typo. "+
+				"Below it is the dangerous direction: it under-bills every metered byte and the quota never trips",
+				p.Name, p.Quota.Calibration, quota.MinCalibration, quota.MaxCalibration)
+		}
+		if p.Quota.OverheadPerPacket < 0 || p.Quota.OverheadPerPacket > quota.MaxOverheadPerPacket {
+			return fmt.Errorf("path %s has a per-packet overhead of %d bytes; it must be between 0 and %d, "+
+				"and WireGuard, UDP and IP together come to about 60",
+				p.Name, p.Quota.OverheadPerPacket, quota.MaxOverheadPerPacket)
 		}
 		if p.Quota.ResetDay < 1 {
 			p.Quota.ResetDay = 1

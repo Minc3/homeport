@@ -20,9 +20,37 @@ import (
 // pair, doing the whole handshake the way an agent would: both proofs, then a
 // session whose key comes from both nonces, under which every later frame is
 // authenticated.
+// fromAddr gives a net.Pipe connection a remote address.
+//
+// serve checks where a peer connected from as well as what it claims to be, so
+// a pipe reporting "pipe" as its address is refused like any other stranger.
+// Stamping the address the real agent would dial from is what keeps these
+// tests exercising the same path a deployment does.
+type fromAddr struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c fromAddr) RemoteAddr() net.Addr { return c.remote }
+
 func dialSession(t *testing.T, e *Engine, psk []byte, hello proto.Hello) (net.Conn, *bufio.Reader, *proto.Session, func()) {
 	t.Helper()
-	srvConn, cliConn := net.Pipe()
+	// A linker dials from the address it claims and the backend from the
+	// overlay address, both because their sockets are bound to them - which is
+	// also what puts the channel on the tunnel.
+	from := e.Config().Overlay.BackendIP
+	if hello.OverlayIP != "" {
+		from = hello.OverlayIP
+	}
+	return dialSessionFrom(t, e, psk, hello, from)
+}
+
+// dialSessionFrom is dialSession with the peer address chosen, for the tests
+// that are about that address rather than about what travels over the channel.
+func dialSessionFrom(t *testing.T, e *Engine, psk []byte, hello proto.Hello, from string) (net.Conn, *bufio.Reader, *proto.Session, func()) {
+	t.Helper()
+	rawSrv, cliConn := net.Pipe()
+	srvConn := fromAddr{Conn: rawSrv, remote: &net.TCPAddr{IP: net.ParseIP(from), Port: 40000}}
 
 	s := &ControlServer{eng: e, log: slog.New(slog.NewTextHandler(io.Discard, nil)), psk: psk}
 	ctx, cancel := context.WithCancel(context.Background())

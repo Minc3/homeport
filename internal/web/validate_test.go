@@ -1,10 +1,12 @@
 package web
 
 import (
+	"math"
 	"strings"
 	"testing"
 
 	"github.com/quinlan102/homeport/internal/model"
+	"github.com/quinlan102/homeport/internal/quota"
 	"github.com/quinlan102/homeport/internal/sysx"
 )
 
@@ -74,6 +76,72 @@ func TestValidateNormalisesCalibration(t *testing.T) {
 	// quota would never trip.
 	if cfg.Paths[1].Quota.Calibration != 100 {
 		t.Errorf("calibration = %v, want it normalised to 100", cfg.Paths[1].Quota.Calibration)
+	}
+}
+
+// The high side of the same two values, which quota.Metered clamps silently.
+// The pair is only worth having if both halves exist: without a test here,
+// loosening either check leaves the whole suite green, and the portal then
+// accepts a figure Metered reduces, under-billing every metered byte with
+// nothing anywhere saying so.
+//
+// Keyed on quota's own constants, exactly as validate is, so the two cannot
+// drift apart through this test either.
+func TestValidateRejectsCalibrationAndOverheadAboveTheClamp(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Paths[1].Quota.Calibration = quota.MaxCalibration + 1
+	if err := validate(&cfg); err == nil {
+		t.Error("a calibration past the clamp was accepted; Metered would silently reduce it")
+	}
+
+	// The low side, which is the dangerous one: 100 typed as 10 under-bills
+	// every metered byte by a factor of ten, the quota never trips, and the
+	// portal shows the path healthy and under quota the whole time. Only the
+	// upper bound existed at first.
+	cfg = model.Defaults()
+	cfg.Paths[1].Quota.Calibration = quota.MinCalibration - 1
+	if err := validate(&cfg); err == nil {
+		t.Error("a calibration below the floor was accepted; it under-bills silently")
+	}
+
+	cfg = model.Defaults()
+	cfg.Paths[1].Quota.Calibration = quota.MinCalibration
+	if err := validate(&cfg); err != nil {
+		t.Errorf("the floor itself was refused: %v", err)
+	}
+
+	cfg = model.Defaults()
+	cfg.Paths[1].Quota.OverheadPerPacket = quota.MaxOverheadPerPacket + 1
+	if err := validate(&cfg); err == nil {
+		t.Error("a per-packet overhead past the clamp was accepted")
+	}
+
+	cfg = model.Defaults()
+	cfg.Paths[1].Quota.OverheadPerPacket = -1
+	if err := validate(&cfg); err == nil {
+		t.Error("a negative per-packet overhead was accepted")
+	}
+
+	// And the boundary itself still saves, so the message cannot be reached by
+	// a value the clamp would have left alone.
+	cfg = model.Defaults()
+	cfg.Paths[1].Quota.Calibration = quota.MaxCalibration
+	cfg.Paths[1].Quota.OverheadPerPacket = quota.MaxOverheadPerPacket
+	if err := validate(&cfg); err != nil {
+		t.Errorf("the clamp's own boundary was refused: %v", err)
+	}
+}
+
+// NaN is false for every ordered comparison, so it slips past both the low and
+// the high check. quota.Metered was given an explicit guard for it; without the
+// same guard here the portal saves it, shows it back as typed, and Metered
+// quietly substitutes 100 - the validate-and-clamp disagreement the pair exists
+// to prevent.
+func TestValidateRejectsACalibrationThatIsNotANumber(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Paths[1].Quota.Calibration = math.NaN()
+	if err := validate(&cfg); err == nil {
+		t.Error("a NaN calibration saved; Metered would silently substitute 100")
 	}
 }
 

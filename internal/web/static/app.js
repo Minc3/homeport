@@ -732,6 +732,7 @@ function field(label, value, onInput, opts = {}) {
     value: value ?? '',
     step: opts.step,
     min: opts.min,
+    max: opts.max,
     placeholder: opts.placeholder,
   });
   input.addEventListener('input', () => onInput(opts.type === 'number' ? parseFloat(input.value) : input.value));
@@ -783,7 +784,13 @@ function pathRow(p) {
     el('td', {}, num('', p.shape.to_frontend_mbit, (v) => (p.shape.to_frontend_mbit = v || 0), { min: 0, step: 1, placeholder: '0 = off' })),
     el('td', {}, num('', p.quota.reset_day, (v) => (p.quota.reset_day = v), { min: 1, placeholder: '1' })),
     el('td', {}, field('', p.quota.timezone, (v) => (p.quota.timezone = v), { placeholder: 'Australia/Melbourne' })),
-    el('td', {}, num('', p.quota.calibration, (v) => (p.quota.calibration = v), { step: 0.5, placeholder: '100' })),
+    // The bounds are quota.MinCalibration and quota.MaxCalibration, mirrored
+    // here by hand because the page cannot call Go, exactly as the detection
+    // figure mirrors ProbeConfig.DetectMs. Keep the two in step: without them
+    // the form accepts a figure PUT /api/config refuses outright, and the
+    // refusal blocks the whole save, so an unrelated edit in this form cannot
+    // be stored until a field the operator may never have touched is corrected.
+    el('td', {}, num('', p.quota.calibration, (v) => (p.quota.calibration = v), { step: 0.5, min: 10, max: 1000, placeholder: '100' })),
   );
 }
 
@@ -1167,7 +1174,8 @@ function renderSettings() {
       th('Timezone', 'The zone that reset day is counted in, so the period turns over where the carrier draws it rather than at UTC midnight. '
         + 'IANA name, and blank means Australia/Melbourne. Example: Australia/Melbourne.'),
       th('Calibration %', 'Scales the measured figure to match what the carrier actually bills. 100 means trust the tunnel counters plus per-packet overhead. '
-        + 'After a month of comparison: if this portal says 50 GB and the carrier says 55, set 110.'),
+        + 'After a month of comparison: if this portal says 50 GB and the carrier says 55, set 110. Range 10 to 1000, because a factor of ten either way is a typo '
+        + 'rather than a calibration. Below is the dangerous direction: it under-bills every metered byte and the quota never trips.'),
     )),
     el('tbody', {}, c.paths.map(pathRow)),
   );

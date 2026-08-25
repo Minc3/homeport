@@ -341,6 +341,25 @@ if [ "$START" -eq 1 ]; then
 	else
 		warn "table $TABLE has no route to $BACKEND_LAN - check: journalctl -u $UNIT -n 30"
 	fi
+	# Both of the frontend's reasons for refusing a linker are invisible from
+	# this host. It is closed on sight before anything is pushed, which from
+	# here is an ordinary disconnect, so the agent redials forever and this
+	# journal says nothing that names the cause. The only record is on the
+	# frontend, on a different machine, and the checks above do not catch
+	# either case: they pass whenever the address is up and the table has a
+	# route, which is exactly the state a wrongly *configured* address is in.
+	echo "  If this host never appears under Linkers in the portal, the frontend's"
+	echo "  journal is where the reason is. Two lines to look for, neither of which"
+	echo "  reaches this host:"
+	echo "    'linker claimed an address that is not configured' - $OVERLAY_IP has no"
+	echo "      row under Linkers in the portal. Add it there, or correct"
+	echo "      linker.overlay_ip in $CONFIG to the address that does."
+	echo "    'linker claimed an address it is not connecting from' - linker.overlay_ip"
+	echo "      is $OVERLAY_IP but the channel is leaving from something else. That is"
+	echo "      the address dummy0 must hold, because the agent binds its socket to it."
+	echo "      Usually a role change that left an old overlay address behind:"
+	echo "        ip -br addr show dummy0"
+	echo "    On the frontend:  journalctl -u failover-frontend -n 50 --no-pager | grep linker"
 else
 	echo "  --no-start given; run: systemctl enable --now $UNIT"
 fi

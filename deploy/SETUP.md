@@ -949,6 +949,8 @@ keep working off the old agent's rules while the portal says nothing is armed.
 | Rules configured in the portal do nothing | `nft list table ip failover_egress` | still in observe mode (step 9) |
 | Extra host unreachable, routing correct everywhere | `iptables -S FORWARD` on the backend | Docker's drop policy (step 14.7) |
 | Agent logs `File exists` for rules that are present | the table has a name in `rt_tables` | a table number this system uses is already taken (step 1.4) |
+| Backend never connects; frontend logs `claimed to be the backend from an address that is not the backend's` | `grep backend_ip /etc/failover/*.json` on both hosts | `overlay.backend_ip` differs between them. The frontend serves the backend half of the control protocol only to the address it has configured, so a peer holding the shared secret cannot talk its way into it. This does not resolve itself. The frontend's copy is the authority, since it is what the DNAT rules point at and what its WireGuard peers admit, so correct the backend to match it and restart that unit. |
+| Linker never connects; frontend logs `claimed an address it is not connecting from` | `grep overlay_ip /etc/failover/linker.json`, then `ip -br addr show dummy0` on that host | `linker.overlay_ip` is not the address that host actually holds, so its socket binds elsewhere. Being on the portal's Linkers list is not enough: a linker must connect from the address it claims, or one could be handed another's egress networks. |
 
 ## Reference
 

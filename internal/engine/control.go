@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,12 +42,40 @@ type ControlServer struct {
 	srcMu     sync.Mutex
 	perSource map[string]int
 
-	// The throttles for the three reports a peer can drive the rate of. They
-	// are fields rather than locals because listen is re-entered after a failed
+	// The throttles for the reports a peer can drive the rate of. They are
+	// fields rather than locals because listen is re-entered after a failed
 	// bind, and counters that reset there would forget a burst in progress.
 	rejected   throttle // dropped before authentication
 	refused    throttle // no slot in the pool
 	oversubbed throttle // one address holding its share
+	// One per reason, not one per family. A shared window means the first
+	// report wins it and every other reason is folded into a generic count for
+	// thirty seconds, so an operator with two faults at once is told about one
+	// of them - which is the opposite of what these are for.
+	notBackend throttle // claimed the backend role from another address
+	unknownIP  throttle // a linker address that is not configured
+	wrongIP    throttle // a linker connecting from an address it does not claim
+	clamped    throttle // a usage delta outside the bounds a meter can produce
+	badPath    throttle // a usage delta naming a path id no configuration holds
+	badSeq     throttle // a usage delta whose sequence would poison the watermark
+	oversized  throttle // a usage batch with more deltas than one frame applies
+
+	// usageMu serialises applyUsage across connections.
+	//
+	// A batch is applied on the connection's own goroutine, and more than one
+	// connection from the backend is the normal case rather than the exotic
+	// one: a silently dead session sits on its read deadline while its
+	// replacement dials in, which is what backendConns and maxPerSource are
+	// both written for, and the connection dies at every failover. The
+	// replacement resends everything unacked, so two goroutines can be applying
+	// the same deltas at once - and the batch is exactly when that happens,
+	// because the old goroutine may be several hundred transactions into one.
+	//
+	// Without this the per-batch watermark memo below is read once per path and
+	// never sees the other goroutine's commits, so a whole resent batch is
+	// billed twice. The per-delta Meta read it replaced had the same race
+	// across one delta; this closes it rather than narrowing it back.
+	usageMu sync.Mutex
 }
 
 // throttleWindow is how often any one of those reports may reach the journal.
@@ -124,22 +153,54 @@ func (s *ControlServer) warnRejected(remote, why string, err error) {
 	}
 }
 
+// reports pairs every throttle with the line its trailing edge emits.
+//
+// A table rather than a run of near-identical blocks, because adding a reason
+// used to take three coordinated edits - a field, a take() site, and a flush
+// block - and omitting the third compiled, passed every test, and produced
+// exactly the defect the trailing edge exists to fix: a burst that stops inside
+// the window is counted and never reported. Here the field and its line are one
+// entry, so there is no third edit to forget.
+func (s *ControlServer) reports() []throttleReport {
+	return []throttleReport{
+		{&s.rejected, slog.LevelWarn, "further control connections rejected before authentication", "attempts",
+			[]any{"hint", "is the shared secret identical, and is that host running this build?"}},
+		{&s.refused, slog.LevelWarn, "further control connections refused; the concurrency limit was full", "refused",
+			[]any{"limit", maxControlConns}},
+		{&s.oversubbed, slog.LevelWarn, "further control connections refused; one address held its whole share", "refused",
+			[]any{"per_source", maxPerSource}},
+		{&s.notBackend, slog.LevelWarn, "further control connections refused; a peer claimed the backend role from another address", "refused", nil},
+		{&s.unknownIP, slog.LevelWarn, "further linker connections refused; the address claimed is not configured", "refused", nil},
+		{&s.wrongIP, slog.LevelWarn, "further linker connections refused; the address claimed is not the one connecting", "refused", nil},
+		{&s.clamped, slog.LevelError, "further usage deltas were outside the bounds a meter can produce and were clamped", "clamped", nil},
+		{&s.badPath, slog.LevelError, "further usage deltas named path ids that are neither configured nor in range", "dropped", nil},
+		{&s.badSeq, slog.LevelError, "further usage deltas carried sequences that would have ended a path's accounting", "dropped",
+			[]any{"hint", "check meter-state.json on the backend"}},
+		{&s.oversized, slog.LevelError, "further usage batches were larger than one frame applies", "batches",
+			[]any{"limit", maxDeltasPerFrame}},
+	}
+}
+
+// throttleReport is one throttle and the line it emits when its window closes.
+type throttleReport struct {
+	t        *throttle
+	level    slog.Level
+	msg      string
+	countKey string
+	extra    []any
+}
+
 // flushThrottles reports what each throttle has counted since it last spoke.
 // Run on a ticker for as long as the listener lives, because otherwise a burst
 // that ends inside a window is never reported - see throttle.
 func (s *ControlServer) flushThrottles() {
-	if n := s.rejected.flush(); n > 0 {
-		s.log.Warn("further control connections rejected before authentication",
-			"attempts", n, "since", throttleWindow,
-			"hint", "is the shared secret identical, and is that host running this build?")
-	}
-	if n := s.refused.flush(); n > 0 {
-		s.log.Warn("further control connections refused; the concurrency limit was full",
-			"refused", n, "limit", maxControlConns, "since", throttleWindow)
-	}
-	if n := s.oversubbed.flush(); n > 0 {
-		s.log.Warn("further control connections refused; one address held its whole share",
-			"refused", n, "per_source", maxPerSource, "since", throttleWindow)
+	for _, r := range s.reports() {
+		n := r.t.flush()
+		if n == 0 {
+			continue
+		}
+		args := append([]any{r.countKey, n, "since", throttleWindow}, r.extra...)
+		s.log.Log(context.Background(), r.level, r.msg, args...)
 	}
 }
 
@@ -313,7 +374,7 @@ func (s *ControlServer) listen(ctx context.Context) error {
 		_ = ln.Close()
 	}()
 
-	// The trailing edge of the three throttles. Without it a burst that stops
+	// The trailing edge of every throttle. Without it a burst that stops
 	// inside a window is counted and never reported, which is the half of a
 	// throttle that says a flood happened at all.
 	flush := time.NewTicker(throttleWindow)
@@ -456,6 +517,42 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 		return
 	}
 
+	// The peer says it is the backend, and saying so is not evidence.
+	//
+	// The linker branch above holds a claimed address against the configured
+	// list, for the reason stated there: the shared secret proves a peer
+	// belongs to this deployment, not that it is entitled to a particular
+	// address. This branch applied no such test, so a peer that simply left
+	// the role field out walked past the one check into the branch that writes
+	// the usage ledger - and an empty role is not an exotic frame, it is what
+	// a backend from before linkers existed sends.
+	//
+	// Every host in the deployment holds the identical key: Bootstrap.Key is
+	// sha256 of the psk whatever the role, and install-linker.sh takes the
+	// frontend's psk verbatim. A linker is the least trusted of the three by
+	// this system's own reasoning - it sits on somebody's game server and
+	// reaches this listener over a plaintext LAN hop - so leaving the backend
+	// role unchecked handed it the ledger, which is authoritative for quota
+	// enforcement.
+	//
+	// The address is the check because the backend's connection is sourced
+	// from the overlay address by construction: Agent.controlSession binds
+	// LocalAddr to it, and the frontend's WireGuard peer only admits that
+	// range in the first place. It costs one comparison and needs no wire
+	// change.
+	if peer := sourceIP(conn); !s.eng.KnownBackend(peer) {
+		// Throttled like every other refusal here, and for the same reason: a
+		// refused peer redials on a backoff, so one line per attempt is
+		// journal volume driven by whoever is dialling.
+		if n := s.notBackend.take(); n > 0 {
+			s.log.Warn("a peer claimed to be the backend from an address that is not the backend's; refusing",
+				"remote", remote, "expected", s.eng.BackendOverlayIP(), "attempts", n,
+				"hint", "overlay.backend_ip must be identical in both hosts' bootstrap files; "+
+					"any other host holding the shared secret is refused here on purpose")
+		}
+		return
+	}
+
 	s.log.Info("backend connected", "remote", remote, "version", hello.Version)
 	if first.Type == proto.MsgHello {
 		s.eng.SetBackendInfo(hello.Version, hello.Hostname)
@@ -521,6 +618,230 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// The bounds one usage delta has to fall inside before it reaches the ledger.
+//
+// Every other value that arrives on this channel is re-parsed at the boundary
+// before it is used - the egress networks through EgressNetworks, the overlay
+// address through AddressLiteral, the subnet through NetworkLiteral - and the
+// numbers in a usage frame went through nothing at all. They are not inert
+// data: the ledger is authoritative for quota enforcement, so a large one
+// takes every metered path out of the selector while the links themselves read
+// perfectly healthy, and a negative one erases the record the data cap depends
+// on. The second is the worse direction, because over-billing is at least
+// visible in the portal and has an approve button beside it.
+const (
+	// maxDeltaBytes and maxDeltaPackets are sanity ceilings rather than tight
+	// bounds, and the difference decides what they can be. A delta is not one
+	// sample interval of traffic: Meter persists its per-interface baseline
+	// across restarts, deliberately, so that usage accrued while the agent was
+	// stopped is still accounted for - which means the first sample after an
+	// outage emits a single delta covering the whole of it. There is no
+	// interval here to multiply a line rate by, so a bound derived from one
+	// would refuse exactly the delta that exists to survive a long outage.
+	//
+	// What these do catch is the value no counter difference on a home
+	// internet service ever produces. 16 TiB is a saturated gigabit line, both
+	// directions, for about twenty hours, which is already well past any
+	// outage this system is meant to survive on a metered link.
+	//
+	// Be clear about what this does not do, because the paragraph above is
+	// easy to read as more than it is: a delta clamped to these ceilings still
+	// exhausts any real quota several thousand times over. That is deliberate
+	// rather than an oversight. The two directions are not symmetric in what
+	// they cost, and the asymmetry is the whole design. Over-billing is
+	// visible: the portal shows the path blocked by quota, says which, and
+	// puts an approve button beside it. Under-billing is silent, and the first
+	// anybody hears of it is the carrier's invoice. So the negative direction
+	// is refused outright and this one is only kept from reaching a number
+	// that would overflow the arithmetic downstream. What keeps a hostile peer
+	// away from the ledger is KnownBackend, not this.
+	maxDeltaBytes   = 1 << 44
+	maxDeltaPackets = 1 << 40
+
+	// maxDeltaSequence bounds the field that does the most damage per byte
+	// sent, and it was the last one left unbounded.
+	//
+	// The sequence is a per-path dedupe watermark: applyUsage skips anything
+	// not strictly newer, writes the accepted value into `meta`, and acks it
+	// so the backend may drop its buffered copy. All three of those are
+	// permanent. One delta carrying a sequence near MaxUint64 therefore parks
+	// the watermark where no honest delta can ever exceed it, so every later
+	// delta for that path is skipped in silence, the ack tells the backend its
+	// entire buffer is applied, and the `meta` row survives every restart.
+	// That path is never billed again, the quota never trips, all three paths
+	// go on measuring perfectly, and only editing the database clears it. It
+	// is the one direction that is both silent and unrecoverable.
+	//
+	// A sequence counts samples, one per path per interval, and is persisted
+	// across restarts. At the ten-second cadence this is roughly three hundred
+	// thousand years of continuous sampling, so nothing that has ever run can
+	// approach it, and a corrupted meter-state.json cannot quietly walk past
+	// it either.
+	maxDeltaSequence = 1 << 40
+
+	// maxSequenceJump bounds how far past the recorded watermark one delta may
+	// carry the sequence, and it is the half of that bound which does the work.
+	//
+	// maxDeltaSequence is absolute, so it rules out only the top of the range.
+	// Anything between the honest counter, which is a few million after years
+	// of running, and 1<<40 is admitted and parks the watermark exactly as
+	// effectively: every later delta for the path is skipped in silence, the
+	// ack tells the backend its whole buffer is applied, and the meta row
+	// survives every restart. The damage is not a function of how large the
+	// number is. It is a function of how far ahead of the real one it is, so
+	// that is what has to be bounded.
+	//
+	// The slack has to survive a long frontend outage. The backend goes on
+	// sampling while the frontend is unreachable and the sequence keeps
+	// advancing even after maxBuffered drops the oldest deltas off the front,
+	// so a legitimate jump equals elapsed samples rather than buffered ones. At
+	// the ten-second cadence this is about forty years of continuous sampling
+	// with nothing acked, which no outage reaches, while still being four
+	// orders of magnitude tighter than the absolute bound beside it.
+	//
+	// Both are needed and neither subsumes the other. This one cannot apply to
+	// the first delta a path ever sees, because there is no watermark to
+	// measure from, and refusing that one refuses the delta that starts the
+	// path's accounting - so the absolute bound covers the unanchored case,
+	// exactly as decisionSeqHorizonMs does for the agent's decision sequence.
+	maxSequenceJump = 1 << 27
+
+	// maxDeltaSkew is how far ahead of this host's clock a delta may be
+	// stamped, and maxDeltaAge how far behind. AddUsage picks the billing
+	// period from this stamp, so a stamp outside the window is not cosmetic:
+	// the bytes are written to a period nothing reads, the current period
+	// stays where it was, and the quota never trips.
+	//
+	// The two are wildly different sizes and both are chosen, not inherited.
+	// What the window has to protect is which *period* a delta lands in, and a
+	// period is a month, so an hour either side of the truth changes nothing
+	// except within an hour of a boundary. An hour ahead is therefore generous
+	// where five minutes was not: the premise of the past-side bound is that
+	// the backend may have no route to NTP, and a host that has been up for
+	// months without it drifts minutes. At five minutes every honest delta
+	// from such a backend tripped the check and was reported at Error with a
+	// hint saying no working backend emits this, which trains an operator to
+	// ignore the one line that means the ledger was written wrong.
+	//
+	// Both ends are needed and only one was there at first. The future side is
+	// the obvious one. The past side is the one that happens by accident, and
+	// invariant 11 describes the exact route: the house loses power, comes back
+	// with every link down, so there is no route to NTP, so the backend's clock
+	// is stale - and it is the backend's clock that stamps every delta
+	// (agent/meter.go). Left unbounded, such a host bills a month of metered
+	// LTE into 1970 while the portal shows the period empty. An extreme value
+	// is worse still, because time.Unix overflows: MinInt64 seconds is not far
+	// in the past, it is the year 292277026596.
+	//
+	// A week, which is chosen from the backlog rather than picked round. The
+	// backend's buffer holds at most maxBuffered deltas at one per path per
+	// ten seconds, so the oldest an honest delta can be is 5.8 days on a
+	// single-path site and under two on a three-path one. A month, the first
+	// value here, was five times that, and the slack was not free: a backend
+	// whose clock is stale by a week - an ordinary amount for an RTC after the
+	// power cut invariant 11 describes - stamps current traffic a week back,
+	// which lands in the previous billing period whenever the outage straddles
+	// a reset day, is never reported because it is inside the window, and
+	// leaves the current period reading empty while the cap is spent.
+	maxDeltaSkew = time.Hour
+	maxDeltaAge  = 7 * 24 * time.Hour
+
+	// maxDeltaPathID bounds the one field of a delta that reaches the database
+	// whatever else it says. An unknown path id is not dropped - AddUsage acks
+	// it deliberately, so that deltas for a path an operator has just removed
+	// stop being resent - and the ack is a row in `meta`, which has no
+	// retention. Unbounded ids are therefore unbounded rows. web.validate
+	// keeps real ids below sysx.ProbeDenyBandSize, so nothing legitimate is
+	// anywhere near this.
+	maxDeltaPathID = sysx.ProbeDenyBandSize
+
+	// maxDeltasPerFrame bounds how many deltas one frame may apply. The
+	// backend batches at most 500; twice that leaves room for a change to that
+	// number without this becoming the thing that breaks, while keeping one
+	// frame's worth of database work bounded. See applyUsage.
+	maxDeltasPerFrame = 1000
+)
+
+// clampCounts brings a delta's two counts inside the bounds above and names
+// what it moved.
+//
+// One definition, called from checkDelta and from Engine.AddUsage. It was
+// written out twice, and the two agreed only because they happened to name the
+// same constants: a change to the shape of the rule, a floor other than zero or
+// a different answer for one of the four cases, had two places to be found and
+// nothing to make the second one fail.
+func clampCounts(bytes, packets int64) (int64, int64, []string) {
+	var why []string
+	if bytes < 0 {
+		bytes, why = 0, append(why, "negative bytes")
+	} else if bytes > maxDeltaBytes {
+		bytes, why = maxDeltaBytes, append(why, "implausible byte count")
+	}
+	if packets < 0 {
+		packets, why = 0, append(why, "negative packets")
+	} else if packets > maxDeltaPackets {
+		packets, why = maxDeltaPackets, append(why, "implausible packet count")
+	}
+	return bytes, packets, why
+}
+
+// checkDelta brings one usage delta inside those bounds.
+//
+// It clamps rather than refuses, and that is the important half. Refusing
+// would leave the watermark where it was, so the backend would resend the same
+// delta on every tick and have it refused every time: this path's accounting
+// would stall for good, which is a worse outcome than billing a bounded wrong
+// number and saying so. Clamping keeps the channel moving and leaves the fault
+// in the journal at Error, where nothing here recovers on its own.
+//
+// Nothing an honest backend sends reaches any of these: Meter.sample refuses
+// to emit a negative delta at all, rebaselining instead, and stamps every one
+// with its own clock at the moment it is taken.
+//
+// Every reason is collected, not just the last one. A delta is quite capable of
+// tripping two bounds at once, and a line naming one clamp beside values that
+// show another sends whoever reads it after the wrong half.
+func (s *ControlServer) checkDelta(d proto.UsageDelta, now time.Time) proto.UsageDelta {
+	out := d
+	var why []string
+	out.Bytes, out.Packets, why = clampCounts(out.Bytes, out.Packets)
+	// Both directions, compared as raw seconds against raw bounds rather than
+	// as time.Time values, and that is the correct way round rather than the
+	// obvious one.
+	//
+	// time.Unix overflows at both extremes, and it overflows to the same place:
+	// MinInt64 and MaxInt64 both render as the year 292277026596, and both
+	// compare as *before* now. So a time.Time comparison misses MaxInt64 in the
+	// future branch entirely and catches it in the past branch, which then
+	// reports a stamp tens of billions of years ahead as one too far in the
+	// past to bill, sending whoever reads the journal after the wrong fault.
+	// Seconds do not wrap, so comparing them classifies both extremes
+	// correctly and needs no reasoning about the wrap at all.
+	newest, oldest := now.Add(maxDeltaSkew).Unix(), now.Add(-maxDeltaAge).Unix()
+	if out.AtUnix > newest {
+		out.AtUnix, why = now.Unix(), append(why, "a timestamp in the future")
+	} else if out.AtUnix < oldest {
+		out.AtUnix, why = now.Unix(), append(why, "a timestamp too far in the past to bill")
+	}
+	if len(why) == 0 {
+		return out
+	}
+	// Throttled, because the count is chosen by the peer: a batch is hundreds
+	// of deltas and every one of them can trip a bound, so an unthrottled line
+	// each is peer-driven journal volume - the thing ControlServer.throttle was
+	// added for. The first is reported in full and the rest are counted behind
+	// it.
+	if seen := s.clamped.take(); seen > 0 {
+		s.log.Error("usage delta outside the bounds a meter can produce, clamping it",
+			"reason", strings.Join(why, ", "), "clamped", seen,
+			"path_id", d.PathID, "seq", d.Sequence,
+			"bytes", d.Bytes, "packets", d.Packets, "at", d.AtUnix,
+			"clamped_bytes", out.Bytes, "clamped_packets", out.Packets,
+			"hint", "the ledger is what quotas are enforced against. A count outside its bounds means the meter, not the link; a stamp outside them usually means the backend's clock, which has no route to NTP while every path is down")
+	}
+	return out
+}
+
 // applyUsage folds buffered metering deltas into the ledger and returns, per
 // path in the batch, the highest sequence now safely recorded - which is what
 // the backend needs in order to drop its buffered copies and nothing more.
@@ -530,7 +851,14 @@ func (s *ControlServer) serve(ctx context.Context, conn net.Conn) {
 // strictly newer than what was already applied is dropped, which keeps
 // resends from double-counting LTE data.
 func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
+	// One batch at a time across every connection. See usageMu: the memoised
+	// watermark below is only what the database holds if nothing else is
+	// writing it, and two backend sessions at once is what a failover produces.
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+
 	st := s.eng.Store()
+	now := time.Now()
 	ack := proto.UsageAck{Seqs: map[int]uint64{}}
 	// Deltas for one path arrive in sequence order, and the watermark is a
 	// single high-water mark. If one write fails, every later delta for that
@@ -538,21 +866,130 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 	// watermark past the failed one, the ack would tell the backend to drop it,
 	// and those metered bytes are gone for good.
 	stalled := map[int]bool{}
-	for _, d := range u.Deltas {
+	// The per-path watermark this batch has established so far. See its use
+	// below for why it can stand in for a database read.
+	watermark := map[int]uint64{}
+	// Bounded in count as well as in value. The backend caps its own batch at
+	// 500 (agent.reportLoop), and nothing here enforced that: a frame is
+	// bounded only by proto.MaxFrameBytes, and a delta serialises to about a
+	// hundred bytes, so an accepted frame can carry ten thousand of them. Each
+	// is a Meta read plus a full AddUsage transaction, run inline on the read
+	// loop, so the loop cannot answer a ping or read the next frame until the
+	// batch is done. Logged rather than silent, for the reason warnUnsendable
+	// exists: if the sender's 500 is ever raised past this, the excess is
+	// resent forever and truncating it quietly would be the only symptom.
+	deltas := u.Deltas
+	if len(deltas) > maxDeltasPerFrame {
+		// Throttled like every other peer-driven line here, and this one needs
+		// it most: the excess is never acked, so the sender resends the
+		// identical frame on every tick and the report repeats with it.
+		if n := s.oversized.take(); n > 0 {
+			s.log.Error("usage batch is larger than this frontend will apply in one frame; ignoring the excess",
+				"deltas", len(deltas), "limit", maxDeltasPerFrame, "batches", n,
+				"hint", "a backend batches at most 500; anything past this limit is resent until it fits")
+		}
+		deltas = deltas[:maxDeltasPerFrame]
+	}
+	for _, d := range deltas {
 		if stalled[d.PathID] {
 			continue
 		}
+		// Before anything is read or written for this id, because the write is
+		// the problem. An id no configuration can hold is not merely unknown -
+		// AddUsage acks an unknown id deliberately, so that deltas for a path
+		// an operator has just removed stop being resent, and that ack is a row
+		// in `meta`, which has no retention. Acking a garbage id is therefore a
+		// permanent row per id, chosen by whoever is sending. Nothing honest
+		// reaches this: web.validate keeps real ids below the same bound, and
+		// the backend only meters paths it was pushed.
+		// An id this configuration actually holds is billed whatever its value.
+		// The range is the fallback for one it does not, and checking the
+		// configuration first is what keeps this from breaking a site the
+		// portal itself accepted: web.validate has only bounded ids below
+		// ProbeDenyBandSize since 2026-08-22, nothing re-validates a stored
+		// blob on load, and Normalise does not touch ids - so a config saved
+		// before that carries a legal path at, say, 200. Dropping its deltas
+		// without an ack would leave the backend resending them forever and
+		// that path's ledger at zero, which is the silent under-billing this
+		// whole check exists to prevent, reintroduced from the other side.
+		if !s.eng.HasPath(d.PathID) && (d.PathID <= 0 || d.PathID >= maxDeltaPathID) {
+			if n := s.badPath.take(); n > 0 {
+				s.log.Error("usage delta names a path id that is neither configured nor in range; dropping it",
+					"path_id", d.PathID, "seq", d.Sequence, "limit", maxDeltaPathID, "dropped", n)
+			}
+			continue
+		}
+		// And the sequence, before it is read against the watermark or written
+		// back as one. This is the field that does the most damage per byte
+		// sent: accepted once, it parks the watermark where no honest delta can
+		// follow, acks the sender's whole buffer as applied, and persists. See
+		// maxDeltaSequence.
+		//
+		// The absolute half, which is all that can be checked here: it is the
+		// only one available for a path with no watermark yet. The relative
+		// half, below, is what actually bounds the hazard once there is one.
+		//
+		// Dropped without an ack, which stalls this path deliberately. Every
+		// other bound here clamps precisely to avoid a stall, and the reasoning
+		// inverts for this one: a sender emitting such a sequence has lost its
+		// meter state, so there is no correct value to clamp to and nothing to
+		// be gained by pretending. A stalled path with an Error beside it is
+		// recoverable in a way a poisoned watermark is not.
+		if d.Sequence > maxDeltaSequence {
+			if n := s.badSeq.take(); n > 0 {
+				s.log.Error("usage delta carries an implausible sequence; refusing it rather than making it the watermark",
+					"path_id", d.PathID, "seq", d.Sequence, "limit", uint64(maxDeltaSequence), "dropped", n,
+					"hint", "accepting this would silently end this path's accounting for good; check meter-state.json on the backend")
+			}
+			continue
+		}
 		key := "usage_seq:" + strconv.Itoa(d.PathID)
-		last, _ := strconv.ParseUint(st.Meta(key), 10, 64)
-		// A duplicate of something already applied is covered by the existing
-		// watermark, so the ack starts there: a batch of pure resends still
-		// tells the backend it may stop resending them.
-		if _, seen := ack.Seqs[d.PathID]; !seen {
+		// Once per path, not once per delta. The watermark this loop keeps is
+		// what the database holds: it is seeded from Meta on first sight, and
+		// AddUsage writes the ledger and the watermark in one transaction, so
+		// it only moves when that transaction committed - and when it does not,
+		// the path is stalled and no later delta for it is read at all. A
+		// 500-delta batch across three paths was issuing 500 queries where
+		// three do, on the goroutine that also has to answer pings. That cost
+		// is the whole justification for maxDeltasPerFrame.
+		//
+		// That first sentence holds because usageMu serialises this function.
+		// Memoising a database read is only sound while this goroutine is the
+		// one moving it, and it is not by construction: see usageMu.
+		last, seen := watermark[d.PathID]
+		if !seen {
+			last, _ = strconv.ParseUint(st.Meta(key), 10, 64)
+			watermark[d.PathID] = last
+			// A duplicate of something already applied is covered by the
+			// existing watermark, so the ack starts there: a batch of pure
+			// resends still tells the backend it may stop resending them.
 			ack.Seqs[d.PathID] = last
 		}
 		if d.Sequence <= last {
 			continue
 		}
+		// The relative half of the sequence bound, and the one that closes the
+		// hazard. Tested after the duplicate check rather than before it, so
+		// the subtraction has a sequence strictly above the watermark and
+		// cannot wrap.
+		//
+		// Dropped without an ack, exactly as the absolute bound is, and for the
+		// same reason: a sender that has jumped this far has lost its meter
+		// state, so there is no correct value to clamp to. It shares badSeq
+		// because it shares a remediation - both send whoever reads it to
+		// meter-state.json on the backend - which is the line these counters
+		// are split on.
+		if last > 0 && d.Sequence-last > maxSequenceJump {
+			if n := s.badSeq.take(); n > 0 {
+				s.log.Error("usage delta jumps implausibly far past this path's watermark; refusing it rather than making it the watermark",
+					"path_id", d.PathID, "seq", d.Sequence, "watermark", last,
+					"limit", uint64(maxSequenceJump), "dropped", n,
+					"hint", "accepting this would silently end this path's accounting for good; check meter-state.json on the backend")
+			}
+			continue
+		}
+		// Bounded before it is billed, not after. See checkDelta.
+		d = s.checkDelta(d, now)
 		// Only advance the watermark - and the ack - once the bytes are in the
 		// ledger. Acking regardless would discard metered LTE usage for good:
 		// the backend drops its buffered copy on the strength of this number.
@@ -566,6 +1003,7 @@ func (s *ControlServer) applyUsage(u proto.Usage) proto.UsageAck {
 			stalled[d.PathID] = true
 			continue
 		}
+		watermark[d.PathID] = d.Sequence
 		ack.Seqs[d.PathID] = d.Sequence
 	}
 	return ack
@@ -665,9 +1103,27 @@ func (s *ControlServer) serveLinker(ctx context.Context, conn net.Conn, r *bufio
 	// could name itself could be handed another linker's networks - so the
 	// address is checked against the configured list rather than trusted.
 	if !s.eng.KnownLinker(hello.OverlayIP) {
-		s.log.Warn("linker claimed an address that is not configured; refusing",
-			"remote", remote, "claimed", hello.OverlayIP,
-			"hint", "add it under Linkers in the portal, or correct linker.overlay_ip on that host")
+		if n := s.unknownIP.take(); n > 0 {
+			s.log.Warn("linker claimed an address that is not configured; refusing",
+				"remote", remote, "claimed", hello.OverlayIP, "attempts", n,
+				"hint", "add it under Linkers in the portal, or correct linker.overlay_ip on that host")
+		}
+		return
+	}
+	// And it has to be connecting from the address it claims, which the check
+	// above does not establish. Being on the configured list only says the
+	// address belongs to some linker; every linker holds the same key, so
+	// without this one of them could name another and be handed that host's
+	// egress networks - rules it loads into nftables as root, for a machine it
+	// is not. Its socket is bound to its own overlay address (linker.client
+	// sets LocalAddr, which is also what puts the channel on the tunnel), so
+	// the claim and the source agree on any correctly configured host.
+	if peer := sourceIP(conn); peer != hello.OverlayIP {
+		if n := s.wrongIP.take(); n > 0 {
+			s.log.Warn("linker claimed an address it is not connecting from; refusing",
+				"remote", remote, "claimed", hello.OverlayIP, "connected_from", peer, "attempts", n,
+				"hint", "linker.overlay_ip on that host must be the address it holds on dummy0")
+		}
 		return
 	}
 
