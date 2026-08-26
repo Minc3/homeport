@@ -480,19 +480,21 @@ function renderQueryCache(states) {
       el('td', { text: q.unanswered.toLocaleString() }),
       el('td', { text: age(q.info_age_sec) }),
       el('td', { text: age(q.player_age_sec) }),
-      el('td', { title: q.error || q.refresh_error || '',
-        text: q.error ? `cannot bind: ${q.error}`
-          : q.refresh_error ? `no answer from ${q.target}: ${q.refresh_error}`
-          : '' })))))));
+      // An icon with the message on hover, not the message itself: the error
+      // strings carry whole socket addresses and were wider than the rest of
+      // the table put together.
+      el('td', q.error ? { text: '✖', title: `cannot bind: ${q.error}` }
+        : q.refresh_error ? { text: '⚠', title: `no answer from ${q.target}: ${q.refresh_error}` }
+        : { text: '' })))))));
   const hidden = all.length - list.length;
   if (hidden > 0) {
     body.append(el('p', { class: 'hint', text: `${hidden} cached port${hidden === 1 ? '' : 's'} with no activity hidden.` }));
   }
   body.append(el('p', { class: 'hint', text: 'Answered is payloads served from cache; Challenged counts the challenge every new source gets first, so under a '
-    + 'spoofed flood it is the number climbing while Answered stays flat, which is the cache doing its job. Counters climbing on a port with "no answer '
-    + 'from" beside them usually means nothing is listening on that port at the far end - internet scanners query every published port and complete '
-    + 'challenges like anybody else. The same line on a port whose game server is really running is the cache unable to reach it, and the port answers '
-    + 'nothing rather than advertising a server that may be gone.' }));
+    + 'spoofed flood it is the number climbing while Answered stays flat, which is the cache doing its job. Hover a ⚠ for the error: counters climbing '
+    + 'on a ⚠ port usually mean nothing is listening there at the far end - internet scanners query every published port and complete challenges like '
+    + 'anybody else - while a ⚠ on a port whose game server is really running is the cache unable to reach it, and the port answers nothing rather than '
+    + 'advertising a server that may be gone. A ✖ is a port something else on the frontend holds, redirecting its queries to nothing.' }));
 }
 
 // counterInfo turns a rule comment into a readable label and an explanation.
