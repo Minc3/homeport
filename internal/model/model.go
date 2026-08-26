@@ -205,6 +205,16 @@ type ProtectConfig struct {
 	DropBogusTCP bool `json:"drop_bogus_tcp,omitempty"` // flag combinations no stack sends
 	DropSpoofed  bool `json:"drop_spoofed,omitempty"`   // private and reserved sources from the internet
 
+	// DropLegacyQueries drops the two deprecated Source connectionless
+	// queries at the edge: A2S_SERVERQUERY_GETCHALLENGE (0x57) and A2A_PING
+	// (0x69). No client has sent either in over a decade - the challenge was
+	// folded into the queries themselves, and Valve removed ping responses
+	// engine-wide - and both are small-request, larger-reply shapes, so a
+	// server that still answers them (GETCHALLENGE returns a 9-byte
+	// challenge to a 5-byte request, a 1.8x amplifier) is a reflector.
+	// Scoped to the Source-engine ports, dropped before conntrack.
+	DropLegacyQueries bool `json:"drop_legacy_queries,omitempty"`
+
 	// Regions are the named network lists that Service.GeoRegions locks ports
 	// to. Empty, like every other field here, means the feature does not
 	// exist: no set is generated, no rule mentions one, and an older config

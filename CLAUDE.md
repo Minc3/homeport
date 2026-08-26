@@ -1514,6 +1514,24 @@ sequence numbered. That is what makes a limit of two or three per second safe:
 it cannot touch the traffic of a player already connected. Without the payload
 match the same rule would throttle gameplay at a rate chosen for queries.
 
+**The legacy-query drop is edge hygiene, not a limiter, so it is a plain
+toggle.** `Protect.DropLegacyQueries` drops the two deprecated Source
+connectionless queries before conntrack: A2S_SERVERQUERY_GETCHALLENGE (0x57)
+and A2A_PING (0x69). Both were confirmed against the live servers - ping
+draws no reply at all, and GETCHALLENGE returns a 9-byte challenge to a
+5-byte request, a 1.8x amplifier - and neither has been sent by any client
+since the challenge was folded into the queries themselves and Valve removed
+ping responses engine-wide. It matches the same way the query-rate limiter
+does, the connectionless header then the type byte (`@th,96,8 { 0x57, 0x69 }`),
+so the three live query types (0x54-0x56) and in-game traffic are untouched,
+and it is scoped to the Source-engine ports like that limiter: with none
+configured it activates nothing rather than dropping on every UDP port. In
+the raw chain because junk must not cost a conntrack entry. This is the
+complementary half of the query cache's choice not to answer these two: the
+cache stays silent on them (answering 0x57 would make the frontend the same
+1.8x reflector), and this drops them outright where the operator wants them
+gone rather than merely unanswered.
+
 **The query cache terminates A2S queries at the edge, and that is a carve-out
 from "no userspace handling of published traffic", not a breach of it.** What
 invariant 2 protects is the conntrack property of §3: a player's flow must
@@ -2846,9 +2864,12 @@ where a subtle regression would be invisible in production until an outage:
   addresses never appear; the table never translates an address; the chains run
   before dstnat; sources are parked only when a block time is set; the blocklist
   is consulted first; query limiting matches only connectionless packets and
-  needs a service to opt in; every drop is counted; the blocklist set is dynamic
-  and bounded; two services on one port still produce a set nftables will
-  accept; and the counters and blocklist parse back out of `nft -j`.
+  needs a service to opt in; the legacy-query drop takes only the two
+  deprecated type bytes before conntrack, leaves the live queries and game
+  traffic alone, and needs a Source-engine port to scope to; every drop is
+  counted; the blocklist set is dynamic and bounded; two services on one port
+  still produce a set nftables will accept; and the counters and blocklist
+  parse back out of `nft -j`.
 
   The region locks are pinned in the same file: a lock alone activates the
   table, matches statelessly before conntrack, and its set carries `flags

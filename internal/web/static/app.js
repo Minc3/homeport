@@ -507,6 +507,7 @@ function counterInfo(name) {
     invalid: ['invalid packets', 'Packets connection tracking could not place in any connection: late fragments, out-of-window segments, crafted floods.'],
     'bogus-tcp': ['bogus TCP flags', 'Flag combinations no real stack sends: SYN+FIN, null and Xmas packets, port scans. Seven rules, counted together.'],
     spoofed: ['spoofed sources', 'Source addresses that cannot legitimately arrive from the internet: private, loopback, link-local, multicast, reserved.'],
+    'legacy-query': ['legacy queries', 'The two deprecated Source connectionless queries, GETCHALLENGE and A2A_PING, dropped before conntrack. No client sends them; a server that answers them is a reflector.'],
     'conn-rate': ['connection rate', 'TCP connection attempts over the per-source rate. Established connections are never touched.'],
     'conn-count': ['connections held', 'Connection attempts from sources already holding too many open connections.'],
     'packet-rate': ['packet rate', 'UDP packets over the per-source rate to a published port.'],
@@ -1783,6 +1784,10 @@ function renderSettings() {
       checkbox('Drop spoofed sources', pr.drop_spoofed, (v) => (pr.drop_spoofed = v),
         'Source addresses that cannot legitimately arrive from the internet: the private ranges, loopback, link-local, multicast and reserved space. '
         + 'Leave it off if anything reaches this box\'s public interface from a private network.'),
+      checkbox('Drop legacy Source queries', pr.drop_legacy_queries, (v) => (pr.drop_legacy_queries = v),
+        'The two deprecated connectionless queries no client has sent in over a decade: A2S_SERVERQUERY_GETCHALLENGE and A2A_PING. '
+        + 'Both are small-request, larger-reply shapes, so a server that still answers them is a reflector others can bounce a flood off. '
+        + 'Applies only to ports ticked as Source engine, and only to those two query types: the live queries and in-game traffic are untouched.'),
     ),
     el('p', { class: 'hint', text: 'There is no SYN-proxy option, and that is not an omission. SYN proxying needs the handshake to be untracked, and this frontend has to track every connection in order to translate it, so the two cannot both be true. Per-source connection limiting above is what covers the same ground here.' }),
 

@@ -62,9 +62,10 @@ type ProtectSpec struct {
 	QueriesPerSec     int
 	BlockSeconds      int
 
-	DropInvalid  bool
-	DropBogusTCP bool
-	DropSpoofed  bool
+	DropInvalid       bool
+	DropBogusTCP      bool
+	DropSpoofed       bool
+	DropLegacyQueries bool
 
 	GeoLockSeconds int
 	Regions        []model.GeoRegion
@@ -107,6 +108,12 @@ func (s ProtectSpec) active(geoSvcs []ProtectService) bool {
 		return true
 	}
 	if s.QueriesPerSec > 0 && len(s.sourceEnginePorts()) > 0 {
+		return true
+	}
+	// Like the query-rate limiter, this drop scopes to the Source-engine
+	// ports, so with none configured there is nothing for it to match and it
+	// activates nothing.
+	if s.DropLegacyQueries && len(s.sourceEnginePorts()) > 0 {
 		return true
 	}
 	for _, sv := range s.Services {
@@ -395,6 +402,7 @@ func ProtectSpecFrom(cfg model.Config) ProtectSpec {
 		DropInvalid:       p.DropInvalid,
 		DropBogusTCP:      p.DropBogusTCP,
 		DropSpoofed:       p.DropSpoofed,
+		DropLegacyQueries: p.DropLegacyQueries,
 		Regions:           p.Regions,
 	}
 	for _, s := range cfg.Services {
@@ -422,6 +430,7 @@ const (
 	CounterInvalid    = "invalid"
 	CounterBogusTCP   = "bogus-tcp"
 	CounterSpoofed    = "spoofed"
+	CounterLegacyQ    = "legacy-query"
 	CounterConnRate   = "conn-rate"
 	CounterConnCount  = "conn-count"
 	CounterPacketRate = "packet-rate"
@@ -573,6 +582,16 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	if spec.DropSpoofed {
 		b.WriteString("\t\t# Source addresses that cannot legitimately arrive from the internet.\n")
 		fmt.Fprintf(&b, "\t\tip saddr %s counter drop comment %q\n", martianSet(), CounterSpoofed)
+	}
+	if se := spec.sourceEnginePorts(); spec.DropLegacyQueries && len(se) > 0 {
+		b.WriteString("\t\t# The two deprecated Source connectionless queries, dropped before\n")
+		b.WriteString("\t\t# conntrack: GETCHALLENGE (0x57) and A2A_PING (0x69). No client has\n")
+		b.WriteString("\t\t# sent either in over a decade, and both are reflector shapes. The\n")
+		b.WriteString("\t\t# match is the connectionless header then the type byte, exactly as\n")
+		b.WriteString("\t\t# the query-rate limiter reads it, so the live queries (0x54-0x56)\n")
+		b.WriteString("\t\t# and in-game traffic are untouched.\n")
+		fmt.Fprintf(&b, "\t\tudp dport %s @th,64,32 0xffffffff @th,96,8 { 0x57, 0x69 } counter drop comment %q\n",
+			portSet(se), CounterLegacyQ)
 	}
 	if len(geoSvcs) > 0 {
 		b.WriteString("\t\t# Region locks: an allow lock drops everything outside its regions,\n")

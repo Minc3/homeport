@@ -199,6 +199,63 @@ func TestQueryLimitingNeedsAServiceToOptIn(t *testing.T) {
 	}
 }
 
+// The legacy-query drop takes only the two deprecated type bytes, before
+// conntrack, on the Source-engine ports. It must not touch the three live
+// query types (0x54-0x56) or in-game traffic, and it must match the
+// connectionless header first, exactly as the query-rate limiter does.
+func TestLegacyQueryDropIsNarrowAndStateless(t *testing.T) {
+	cfg := protectCfg()
+	cfg.Protect.DropLegacyQueries = true
+	for i := range cfg.Services {
+		if cfg.Services[i].Proto == "udp" {
+			cfg.Services[i].SourceEngine = true
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	var rule string
+	for _, line := range strings.Split(ruleset, "\n") {
+		if strings.Contains(line, CounterLegacyQ) {
+			rule = line
+			break
+		}
+	}
+	if rule == "" {
+		t.Fatalf("no legacy-query drop was generated:\n%s", ruleset)
+	}
+	if !strings.Contains(rule, "@th,64,32 0xffffffff") {
+		t.Errorf("the drop matches more than connectionless packets: %q", rule)
+	}
+	if !strings.Contains(rule, "{ 0x57, 0x69 }") {
+		t.Errorf("the drop is not scoped to the two legacy type bytes: %q", rule)
+	}
+	if !strings.Contains(rule, "drop") {
+		t.Errorf("the legacy-query rule does not drop: %q", rule)
+	}
+	// It belongs in the raw chain, before conntrack: these are junk, and a
+	// junk packet must not cost a conntrack entry.
+	rawEnd := strings.Index(ruleset, "chain filter")
+	if rawEnd < 0 || strings.Index(ruleset, CounterLegacyQ) > rawEnd {
+		t.Errorf("the legacy-query drop is not in the raw chain:\n%s", ruleset)
+	}
+	// The live queries must survive: no rule may match their type bytes.
+	for _, live := range []string{"0x54", "0x55", "0x56"} {
+		if strings.Contains(rule, live) {
+			t.Errorf("the drop mentions a live query type %s: %q", live, rule)
+		}
+	}
+}
+
+// Like the query-rate limiter, the drop needs a Source-engine port to scope
+// to: with none it activates nothing rather than dropping on every UDP port.
+func TestLegacyQueryDropNeedsASourceEnginePort(t *testing.T) {
+	cfg := protectCfg()
+	cfg.Protect.DropLegacyQueries = true // and no service marked Source engine
+	if got := BuildProtectRuleset(ProtectSpecFrom(cfg)); got != "" {
+		t.Errorf("the legacy-query drop generated a ruleset with nothing opted in:\n%s", got)
+	}
+}
+
 // Every limiter is counted, because a limit whose effect cannot be seen turns a
 // tuning mistake into an unexplained outage: "players cannot connect" looks
 // exactly like the service being down.
