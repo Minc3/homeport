@@ -39,6 +39,14 @@ func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, model.DetectionPresets())
 }
 
+// handleProtectPresets serves the shipped per-source limit tunings for the
+// protection section's dropdown, on the same contract as handlePresets: the
+// portal is only a consumer, and the stored configuration never carries a
+// preset name.
+func (s *Server) handleProtectPresets(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, model.ProtectPresets())
+}
+
 // handlePutConfig replaces the whole configuration. The portal is the single
 // source of truth, so this is the only way settings change; the backend picks
 // up its half over the control channel within a couple of seconds.

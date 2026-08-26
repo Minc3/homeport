@@ -456,6 +456,23 @@ func TestEveryDetectionPresetSurvivesValidate(t *testing.T) {
 	}
 }
 
+// Every per-source preset has to come out of validation clean with protection
+// enabled, for the reason the detection presets do: a copy of the bounds here
+// would keep passing after the real rule moved, and the first anybody heard
+// would be a preset the dropdown offers that Save refuses. Enabled is what
+// makes the check real, since it is what brings the public interface rule and
+// the threshold checks into play.
+func TestEveryProtectPresetSurvivesValidate(t *testing.T) {
+	for _, p := range model.ProtectPresets() {
+		cfg := model.Defaults()
+		cfg.Protect.Enabled = true
+		p.Apply(&cfg.Protect)
+		if err := validate(&cfg); err != nil {
+			t.Errorf("protect preset %s on the shipped config does not validate: %v", p.Name, err)
+		}
+	}
+}
+
 // A DNAT rule with no interface to scope it to matches its port on every
 // interface the frontend has, the admin tunnel included - and that is the
 // tunnel the portal is reached over. A row naming the portal's own port would

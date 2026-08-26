@@ -1242,6 +1242,25 @@ exists for the opposite problem: a link that is condemned and recovers on its
 own is one the standard tuning is too tight for, and the fix is a longer streak
 and a longer timeout, not a lower loss threshold.
 
+**The per-source limits carry the same kind of preset, for the same reason.**
+`model.ProtectPresets` fills the five numbers under "Per-source limits"
+(connection rate, concurrent connections, UDP packets, Source queries, block
+seconds); the stored configuration carries only the numbers and the engine has
+never heard of a preset. The figures are sized from what real clients send
+rather than guessed, because a limit set from a guess produces "some players
+cannot connect": a browser holds at most six connections to one host, a Source
+client sends its commands at 30 to 66 packets a second capped by the tick
+rate, the engine's own out-of-band throttle gives up near 60 queries a second,
+and a carrier NAT routinely puts 16 to 64 subscribers behind one address, so
+every figure leaves room for several clients sharing an address. The Off
+preset is all zeros and is pinned equal to the shipped `ProtectConfig`, so a
+fresh install reads "Off" and not "Custom". `Apply` writes the five limits and
+nothing else: not the master switch, not the edge filtering, not the regions,
+because a dropdown that armed the feature as a side effect would drop packets
+nobody asked it to. The most generous preset parks a tripping source for the
+shortest time, deliberately: on a shared address one park is every household
+behind that NAT.
+
 **No eligible path means keep the last route.** `selectPath` returns `0`, the
 caller leaves `e.active` alone, and the installed route stays. Withdrawing it
 would blackhole traffic; leaving it means a path that recovers finds the route
@@ -2838,9 +2857,18 @@ where a subtle regression would be invisible in production until an outage:
   time `DetectMs` gives for its numbers, applying a preset lifts a standby
   interval the new active one would overtake and leaves a slower one alone,
   and `DetectMs` counts the streak plus the last timeout.
+- `model/protect_presets_test.go`: the Off preset is the shipped all-zero
+  state, so a fresh install reads Off rather than Custom and choosing Off
+  really disables every limit; the presets after Off are ordered tightest to
+  most generous in every limit while block seconds runs the other way, since
+  the generous preset is for shared addresses where one park is every
+  household behind the NAT; and `Apply` touches only the five limits, never
+  the master switch, the edge filtering or the regions.
 - `web/validate_test.go` also runs every preset through `validate`, on the
   shipped configuration and on one with a short standby interval, because a
-  copy of the bounds would keep passing after the real rule moved.
+  copy of the bounds would keep passing after the real rule moved. The
+  per-source presets go through the same check with protection enabled, which
+  is what brings the public interface rule and the threshold checks into play.
 - `agent/decision_test.go`: a stale decision arriving after a newer one is
   queued cannot replace it, while a newer one still can; an equal sequence on
   another path, which is a restarted frontend's first switch, is still queued;

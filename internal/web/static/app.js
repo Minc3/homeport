@@ -598,6 +598,9 @@ let config = null;
 // The shipped detection tunings, from /api/presets. Only the settings page
 // reads them, and an empty list just leaves the dropdown showing Custom.
 let presets = [];
+// The shipped per-source limit tunings, from /api/protect-presets. Same
+// contract as the detection list above.
+let protectPresets = [];
 
 // ---------------------------------------------------------------------------
 // Unsaved-changes tracking
@@ -1584,6 +1587,71 @@ function renderSettings() {
   };
   renderRegions();
 
+  // Per-source limit presets. Same contract as the detection dropdown above:
+  // choosing one fills the five numbers below, the stored configuration
+  // carries only the numbers, and editing any of them shows Custom. The Off
+  // preset is all zeros, which is also the shipped state, so a fresh install
+  // reads Off rather than Custom.
+  const PROTECT_KEYS = ['new_conns_per_sec', 'max_conns_per_source', 'packets_per_sec', 'queries_per_sec', 'block_seconds'];
+  // The match compares these against preset numbers, and a config that has
+  // never set one omits the field entirely, so normalise undefined to the 0
+  // it means before anything reads it.
+  for (const k of PROTECT_KEYS) pr[k] = pr[k] || 0;
+  const protectInputs = {};
+  const protectSel = el('select', {});
+  for (const d of protectPresets) protectSel.append(el('option', { value: d.name, text: d.label }));
+  protectSel.append(el('option', { value: 'custom', text: 'Custom' }));
+  const protectPresetNote = el('p', { class: 'hint' });
+  const matchingProtectPreset = () => protectPresets.find((d) => PROTECT_KEYS.every((k) => d[k] === pr[k]));
+  const refreshProtectPreset = () => {
+    const m = matchingProtectPreset();
+    protectSel.value = m ? m.name : 'custom';
+    protectPresetNote.textContent = m ? m.note
+      : 'Custom numbers. Keep each one well clear of what the dashboard counters show in normal use: several players or '
+        + 'browsers routinely share one address behind a carrier or office NAT, and a limit that is right for one client '
+        + 'is far too tight for all of them together.';
+  };
+  protectSel.addEventListener('change', () => {
+    const d = protectPresets.find((x) => x.name === protectSel.value);
+    if (!d) { refreshProtectPreset(); return; }
+    for (const k of PROTECT_KEYS) {
+      pr[k] = d[k];
+      protectInputs[k].value = d[k];
+    }
+    refreshProtectPreset();
+  });
+  const fNewConns = num('New connections per second', pr.new_conns_per_sec, (v) => { pr.new_conns_per_sec = v || 0; refreshProtectPreset(); }, {
+    min: 0, placeholder: '0 = off',
+    help: 'TCP connection attempts from one address, per second. Established connections are never touched, so this only affects how fast a client may open new ones. '
+      + 'A browser opens a handful per page; 20 is generous. Stops connection floods and a stuck client reconnecting in a loop.',
+  });
+  protectInputs.new_conns_per_sec = fNewConns.querySelector('input');
+  const fMaxConns = num('Concurrent connections per source', pr.max_conns_per_source, (v) => { pr.max_conns_per_source = v || 0; refreshProtectPreset(); }, {
+    min: 0, placeholder: '0 = off',
+    help: 'How many tracked TCP connections one address may hold open at once. Shared connections behind one office or carrier NAT can be surprisingly many, '
+      + 'so keep it well clear of what you see in normal use: 50 to 100 for a web service.',
+  });
+  protectInputs.max_conns_per_source = fMaxConns.querySelector('input');
+  const fPPS = num('UDP packets per second per source', pr.packets_per_sec, (v) => { pr.packets_per_sec = v || 0; refreshProtectPreset(); }, {
+    min: 0, placeholder: '0 = off',
+    help: 'Packets per second from one address to a published UDP port. A player in a game sends tens per second, so this wants to be generous: 400 is far above normal play '
+      + 'and still stops a single source saturating the tunnel. This is the one that protects against one client hurting everyone else.',
+  });
+  protectInputs.packets_per_sec = fPPS.querySelector('input');
+  const fQPS = num('Source-engine queries per second per source', pr.queries_per_sec, (v) => { pr.queries_per_sec = v || 0; refreshProtectPreset(); }, {
+    min: 0, placeholder: '0 = off',
+    help: 'Applies only to services ticked as Source engine, and only to their connectionless packets, the A2S queries and connection attempts. '
+      + 'Players already in the game are unaffected, which is what makes a tight number safe here: 2 or 3 per second is ample, and this is the usual flood vector for a Source server.',
+  });
+  protectInputs.queries_per_sec = fQPS.querySelector('input');
+  const fBlock = num('Block a tripping source for (s)', pr.block_seconds, (v) => { pr.block_seconds = v || 0; refreshProtectPreset(); }, {
+    min: 0, placeholder: '0 = never block',
+    help: 'When a source trips any limit above, park it for this long: everything from that address is dropped on sight until it expires, cheaply, before conntrack. '
+      + '0 drops only the excess and never parks anybody, which is gentler and much less effective. 600 is a reasonable start. Parked addresses are listed on the dashboard.',
+  });
+  protectInputs.block_seconds = fBlock.querySelector('input');
+  refreshProtectPreset();
+
   form.append(section('Protection (rate limiting and edge filtering)',
     // Stated before the switches, not after them. Everything in this section
     // drops packets somebody sent, and the difference between a limit that is
@@ -1610,33 +1678,11 @@ function renderSettings() {
 
     el('h3', { class: 'sub-head', text: 'Per-source limits' }),
     el('p', { class: 'hint', text: 'Each of these applies to one client address at a time, and each does nothing at zero. They are counted against the ports of your enabled published services, nothing else.' }),
-    el('div', { class: 'grid' },
-      num('New connections per second', pr.new_conns_per_sec, (v) => (pr.new_conns_per_sec = v || 0), {
-        min: 0, placeholder: '0 = off',
-        help: 'TCP connection attempts from one address, per second. Established connections are never touched, so this only affects how fast a client may open new ones. '
-          + 'A browser opens a handful per page; 20 is generous. Stops connection floods and a stuck client reconnecting in a loop.',
-      }),
-      num('Concurrent connections per source', pr.max_conns_per_source, (v) => (pr.max_conns_per_source = v || 0), {
-        min: 0, placeholder: '0 = off',
-        help: 'How many tracked TCP connections one address may hold open at once. Shared connections behind one office or carrier NAT can be surprisingly many, '
-          + 'so keep it well clear of what you see in normal use: 50 to 100 for a web service.',
-      }),
-      num('UDP packets per second per source', pr.packets_per_sec, (v) => (pr.packets_per_sec = v || 0), {
-        min: 0, placeholder: '0 = off',
-        help: 'Packets per second from one address to a published UDP port. A player in a game sends tens per second, so this wants to be generous: 400 is far above normal play '
-          + 'and still stops a single source saturating the tunnel. This is the one that protects against one client hurting everyone else.',
-      }),
-      num('Source-engine queries per second per source', pr.queries_per_sec, (v) => (pr.queries_per_sec = v || 0), {
-        min: 0, placeholder: '0 = off',
-        help: 'Applies only to services ticked as Source engine, and only to their connectionless packets, the A2S queries and connection attempts. '
-          + 'Players already in the game are unaffected, which is what makes a tight number safe here: 2 or 3 per second is ample, and this is the usual flood vector for a Source server.',
-      }),
-      num('Block a tripping source for (s)', pr.block_seconds, (v) => (pr.block_seconds = v || 0), {
-        min: 0, placeholder: '0 = never block',
-        help: 'When a source trips any limit above, park it for this long: everything from that address is dropped on sight until it expires, cheaply, before conntrack. '
-          + '0 drops only the excess and never parks anybody, which is gentler and much less effective. 600 is a reasonable start. Parked addresses are listed on the dashboard.',
-      }),
-    ),
+    el('label', { class: 'field' }, caption('Per-source preset',
+      'Starting points sized from what real clients send: a browser holds at most 6 connections to one host, a Source player sends 30 to 66 packets a second, '
+      + 'and a carrier NAT can put dozens of subscribers behind one address. Choosing one fills in the five numbers below; editing any of them shows Custom.'), protectSel),
+    protectPresetNote,
+    el('div', { class: 'grid' }, fNewConns, fMaxConns, fPPS, fQPS, fBlock),
 
     el('h3', { class: 'sub-head', text: 'Edge filtering' }),
     el('p', { class: 'hint', text: 'No thresholds to get wrong, and no legitimate client sends any of what these drop. Reasonable to turn on together.' }),
@@ -1902,12 +1948,13 @@ function renderSettings() {
 
 async function loadSettings() {
   try {
-    [config, presets] = await Promise.all([
+    [config, presets, protectPresets] = await Promise.all([
       api('/api/config'),
       // A missing preset list is not fatal, but it must not be silent: the
       // dropdown would otherwise offer only Custom under a caption that
       // promises three choices, and show the shipped numbers as Custom.
       api('/api/presets').catch((e) => { toast(`Detection presets unavailable: ${e.message}`, true); return []; }),
+      api('/api/protect-presets').catch((e) => { toast(`Per-source presets unavailable: ${e.message}`, true); return []; }),
     ]);
     renderSettings();
     markSaved();
