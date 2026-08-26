@@ -473,3 +473,15 @@ func TestBindFailureIsReportedAndDoesNotSinkTheRest(t *testing.T) {
 		t.Errorf("the free port served % x", b)
 	}
 }
+
+// The shipped staleness bound must cover at least three shipped refresh
+// intervals, the same floor validate and the engine hold for configured
+// values: between polls every answer is served from the staleness window,
+// and one failed fetch has to be retryable inside it, or a healthy port
+// goes dark between refreshes out of the box.
+func TestShippedStalenessCoversThreeRefreshIntervals(t *testing.T) {
+	if DefaultStaleAfter < 3*DefaultRefreshEvery {
+		t.Fatalf("DefaultStaleAfter %v is under three DefaultRefreshEvery %v; a fresh install would go dark between refreshes",
+			DefaultStaleAfter, DefaultRefreshEvery)
+	}
+}

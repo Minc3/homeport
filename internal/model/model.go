@@ -107,9 +107,20 @@ type QueryCacheConfig struct {
 	// takes the shipped 3000: an older config unmarshals to exactly the
 	// behaviour it had. Bounded by validate on both sides: below 500 the
 	// refresher is a continuous poll of the operator's own server over the
-	// billed tunnel, and above 30000 the cache cannot stay inside its 90
-	// second staleness bound with room for a failed fetch to be retried.
+	// billed tunnel, and above 30000 every browser is looking at counts
+	// half a minute old.
 	RefreshMs int `json:"refresh_ms,omitempty"`
+
+	// StaleMs is how long the last good fetch keeps being served once the
+	// real server stops answering, and therefore how long a crashed server
+	// is still advertised by its own cache before its ports go quiet. Zero
+	// is automatic: the shipped 10000, or three refresh intervals where the
+	// refresh is slower, because between polls every answer is served from
+	// this window and one failed fetch has to be retryable inside it or a
+	// healthy port goes dark between refreshes. An explicit value below
+	// three refresh intervals is refused by validate for that reason; the
+	// engine holds the same floor again for a blob validate never saw.
+	StaleMs int `json:"stale_ms,omitempty"`
 }
 
 // MaxQueryCachePorts bounds how many ports the cache will serve. Each port is

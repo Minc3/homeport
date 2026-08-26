@@ -476,10 +476,12 @@ func TestEveryProtectPresetSurvivesValidate(t *testing.T) {
 // The query cache's refresh interval: zero is the shipped default and must
 // keep saving, the floor is what stops the refresher becoming a continuous
 // poll of the operator's own server over the billed tunnel, the ceiling is
-// what keeps the cache inside its 90s staleness bound (past it a healthy
-// site's server drops out of browsers), and a negative is refused like every
-// other duration here. The bounds live in validate and the portal only
-// mirrors them, so this is the test that holds them.
+// what keeps the counts a browser sees worth showing, and a negative is
+// refused like every other duration here. The bounds live in validate and
+// the portal only mirrors them, so this is the test that holds them. The
+// slowest refresh saves with the staleness box empty, and that is pinned
+// deliberately: empty means automatic, so a blob saved before the bound
+// existed can never be blocked from unrelated edits by it.
 func TestValidateBoundsTheQueryCacheRefresh(t *testing.T) {
 	for _, tc := range []struct {
 		ms int
@@ -493,6 +495,46 @@ func TestValidateBoundsTheQueryCacheRefresh(t *testing.T) {
 		}
 		if !tc.ok && err == nil {
 			t.Errorf("refresh %d ms saved; it must be refused", tc.ms)
+		}
+	}
+}
+
+// The staleness bound: zero is automatic and must keep saving whatever the
+// refresh says, an explicit bound under three effective refresh intervals is
+// refused because between polls every answer is served from that window (a
+// healthy port would go dark between refreshes), the relative floor uses the
+// default refresh when that box is empty, and the ceiling is what stops a
+// crashed server being advertised by its own cache for over five minutes.
+// Keyed on qcache's exported defaults, so validate and the cache cannot
+// drift.
+func TestValidateBoundsTheQueryCacheStaleness(t *testing.T) {
+	for _, tc := range []struct {
+		staleMs   int
+		refreshMs int
+		ok        bool
+	}{
+		{0, 0, true},          // both automatic, the shipped state
+		{0, 30000, true},      // slowest refresh, empty box: automatic covers it
+		{10000, 0, true},      // the default, typed out: 3 x 3000 fits
+		{9000, 0, true},       // exactly three default refresh intervals
+		{8999, 0, false},      // one ms under three default refresh intervals
+		{1500, 500, true},     // exactly three explicit refresh intervals
+		{1499, 500, false},    // under them
+		{10000, 30000, false}, // the default bound cannot cover a slow refresh when typed
+		{90000, 30000, true},  // but three slow intervals can
+		{-1, 0, false},
+		{300000, 0, true},
+		{300001, 0, false},
+	} {
+		cfg := model.Defaults()
+		cfg.QueryCache.StaleMs = tc.staleMs
+		cfg.QueryCache.RefreshMs = tc.refreshMs
+		err := validate(&cfg)
+		if tc.ok && err != nil {
+			t.Errorf("stale %d ms with refresh %d ms refused: %v", tc.staleMs, tc.refreshMs, err)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("stale %d ms with refresh %d ms saved; it must be refused", tc.staleMs, tc.refreshMs)
 		}
 	}
 }

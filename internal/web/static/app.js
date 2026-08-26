@@ -1848,8 +1848,15 @@ function renderSettings() {
         min: 500, max: 30000, placeholder: 'empty = 3000',
         help: 'How often a queried port is re-fetched from the real server, which is the staleness a browser normally sees. Faster costs more refresh '
           + 'traffic on the active tunnel and polls your own server harder; slower shows staler player counts. Between 500 and 30000: below that the '
-          + 'refresher is polling your own server continuously, and above it the cache cannot stay inside the 90 second staleness bound with room for a '
-          + 'failed fetch to be retried before the port goes dark. Clear the box for the default 3000. An idle port is never polled whatever this says.',
+          + 'refresher is polling your own server continuously, and above it every browser is looking at counts half a minute old. Clear the box for '
+          + 'the default 3000. An idle port is never polled whatever this says.',
+      }),
+      num('Serve a cached reply for at most (ms)', c.query_cache.stale_ms || '', (v) => (c.query_cache.stale_ms = v || 0), {
+        min: 1500, max: 300000, placeholder: 'empty = 10000',
+        help: 'How long the last good fetch keeps being served once the real server stops answering, and so how long a crashed server is still '
+          + 'advertised before its ports go quiet. Must cover at least three refresh intervals: between polls every answer comes out of this window, '
+          + 'so a smaller bound would have a healthy port going dark between refreshes. Clear the box for automatic: 10000, or three refresh '
+          + 'intervals where the refresh is slower.',
       }),
     ),
   ));

@@ -1583,10 +1583,20 @@ past its staleness bound answers nothing rather than advertising a server
 that may be gone. The refresh interval is `QueryCache.RefreshMs`, zero
 meaning the shipped 3000; validate bounds it on both sides (500 to 30000),
 because below the floor the refresher is a continuous poll of the operator's
-own server over the billed tunnel, and above the ceiling the 90 second
-staleness bound leaves no room for a failed fetch to be retried before a
-healthy site's port goes dark. The engine clamps the floor again for a blob
-stored by a build without it. The protect chains run before dstnat, so with
+own server over the billed tunnel, and above the ceiling every browser is
+looking at counts half a minute old. The staleness bound beside it is
+`QueryCache.StaleMs`, zero meaning automatic: the shipped 10 seconds, or
+three effective refresh intervals where the refresh is slower. The relative
+floor is the load-bearing one, and it is why empty means automatic rather
+than a number: between polls every answer is served from the staleness
+window, so a bound under three refresh intervals has a healthy port going
+dark between refreshes with one failed fetch unretryable - validate refuses
+an explicit value that does that, while an empty box can never be argued
+into it, which is also what keeps a blob saved with a slow refresh under an
+older build from being blocked on unrelated edits. Both defaults are
+`qcache`'s exported constants (`DefaultRefreshEvery`, `DefaultStaleAfter`),
+keyed on by validate and by `engine.queryCacheTimings`, which holds both
+floors again for the blob validate never saw. The protect chains run before dstnat, so with
 both features on the limits drop first and a parked source never reaches the
 cache; the portal warns, without refusing, when the cache is on with
 protection off entirely, because that is supported but leaves nothing else

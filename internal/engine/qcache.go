@@ -9,6 +9,36 @@ import (
 	"github.com/quinlan102/homeport/internal/qcache"
 )
 
+// queryCacheTimings resolves the refresh interval and staleness bound a
+// stored configuration gives the cache. The floors are validate's, held
+// again here for the values validate never saw - a blob stored by a build
+// without them, where there is nobody at this boundary to tell. Below the
+// refresh floor the refresher is a continuous poll of the operator's own
+// server over the billed tunnel. The staleness floor is three effective
+// refresh intervals: between polls every answer is served from that window
+// and one failed fetch has to be retryable inside it, or a healthy port
+// goes dark between refreshes - which is also what an unset bound must not
+// be talked into by a slow stored refresh, so the comparison is made on the
+// effective values, defaults filled in.
+func queryCacheTimings(qc model.QueryCacheConfig) (refresh, stale time.Duration) {
+	refresh = time.Duration(qc.RefreshMs) * time.Millisecond
+	if refresh > 0 && refresh < 500*time.Millisecond {
+		refresh = 500 * time.Millisecond
+	}
+	refreshEff := refresh
+	if refreshEff == 0 {
+		refreshEff = qcache.DefaultRefreshEvery
+	}
+	stale = time.Duration(qc.StaleMs) * time.Millisecond
+	if stale == 0 {
+		stale = qcache.DefaultStaleAfter
+	}
+	if stale < 3*refreshEff {
+		stale = 3 * refreshEff
+	}
+	return refresh, stale
+}
+
 // startQueryCache replaces the running cache generation with one built from
 // the current configuration, or with nothing where the cache is off, the
 // mode is observe, or no service opts in.
@@ -58,18 +88,12 @@ func (e *Engine) startQueryCache(parent context.Context) {
 		}
 	}
 
-	// The floor is validate's, held again here for the value validate never
-	// saw: a blob stored by a build without the floor. Below it the
-	// refresher is a continuous poll of the operator's own server over the
-	// billed tunnel, and there is nobody at this boundary to tell.
-	refresh := time.Duration(cfg.QueryCache.RefreshMs) * time.Millisecond
-	if refresh > 0 && refresh < 500*time.Millisecond {
-		refresh = 500 * time.Millisecond
-	}
+	refresh, stale := queryCacheTimings(cfg.QueryCache)
 	c := qcache.New(qcache.Config{
 		Ports:        ports,
 		Bind:         e.qcBind,
 		RefreshEvery: refresh,
+		StaleAfter:   stale,
 		Log:          e.log,
 	})
 	ctx, cancel := context.WithCancel(parent)

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
 )
@@ -80,6 +81,44 @@ func TestStopQueryCacheWaitsTheGenerationOut(t *testing.T) {
 	for _, st := range e.Status().QueryCache {
 		if st.Error != "" {
 			t.Errorf("port %d failed to rebind after a stop: %s", st.Port, st.Error)
+		}
+	}
+}
+
+// The timings the engine hands the cache hold validate's floors again, for
+// the blob validate never saw. The staleness floor is the one that matters:
+// three effective refresh intervals, because between polls every answer is
+// served from that window, so a stored bound (or the unset default) that a
+// slow stored refresh undercuts would have a healthy port going dark between
+// refreshes - and there is nobody at this boundary to tell.
+func TestQueryCacheTimingsHoldTheFloors(t *testing.T) {
+	ms := func(d time.Duration) int { return int(d / time.Millisecond) }
+	for _, tc := range []struct {
+		name        string
+		refreshMs   int
+		staleMs     int
+		wantRefresh time.Duration
+		wantStale   time.Duration
+	}{
+		// The shipped state: the cache's own defaults, refresh passed as
+		// zero so qcache fills it in, staleness resolved here.
+		{"defaults", 0, 0, 0, 10 * time.Second},
+		// A refresh below the floor is lifted, exactly as before.
+		{"refresh floor", 200, 0, 500 * time.Millisecond, 10 * time.Second},
+		// A slow stored refresh must lift an unset bound with it: the
+		// default 10s covers three intervals only up to 3333ms.
+		{"slow refresh lifts the default", 30000, 0, 30 * time.Second, 90 * time.Second},
+		// An explicit bound a slow refresh undercuts is lifted the same way.
+		{"slow refresh lifts an explicit bound", 10000, 12000, 10 * time.Second, 30 * time.Second},
+		// An explicit bound that covers its refresh is not moved by a ms.
+		{"explicit bound kept", 3000, 15000, 3 * time.Second, 15 * time.Second},
+	} {
+		refresh, stale := queryCacheTimings(model.QueryCacheConfig{
+			RefreshMs: tc.refreshMs, StaleMs: tc.staleMs,
+		})
+		if refresh != tc.wantRefresh || stale != tc.wantStale {
+			t.Errorf("%s: refresh %d ms stale %d ms -> refresh %d ms stale %d ms, want %d and %d",
+				tc.name, tc.refreshMs, tc.staleMs, ms(refresh), ms(stale), ms(tc.wantRefresh), ms(tc.wantStale))
 		}
 	}
 }

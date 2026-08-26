@@ -32,8 +32,8 @@ type Port struct {
 }
 
 // Config sizes a Cacher. The zero value of every knob takes the shipped
-// default; the knobs exist for the tests, which cannot wait ninety seconds
-// to watch a cache go stale.
+// default; the knobs exist for the tests, which cannot wait ten seconds to
+// watch a cache go stale.
 type Config struct {
 	Ports []Port
 
@@ -57,11 +57,14 @@ type Config struct {
 	// costs only what is actually being asked about.
 	IdleAfter time.Duration
 
-	// StaleAfter stops serving a cached reply older than this. Long enough to
-	// ride out a failover, during which the refresh stream breaks with the
-	// control channel; short enough that a server that has really gone away
-	// drops out of browsers in a minute or two rather than being advertised
-	// indefinitely by its own cache.
+	// StaleAfter stops serving a cached reply older than this. It is the
+	// whole of the trade the operator makes in the portal (QueryCache.
+	// StaleMs): longer rides out a longer refresh outage before the port
+	// goes quiet, shorter drops a server that has really crashed out of
+	// browsers sooner. It must cover at least three refresh intervals,
+	// because between polls every answer is served from this window and one
+	// failed fetch has to be retryable inside it, or a healthy port goes
+	// dark between refreshes; the engine holds that floor.
 	StaleAfter time.Duration
 
 	// UpstreamTimeout bounds one refresh round trip.
@@ -70,10 +73,14 @@ type Config struct {
 	Log *slog.Logger
 }
 
+// DefaultRefreshEvery and DefaultStaleAfter are exported because web.validate
+// and the engine's clamp key their bounds on them: a default written out
+// again in either place is a second definition the next tuning change can
+// move apart, silently loosening the floor the staleness bound holds.
 const (
-	defaultRefreshEvery    = 3 * time.Second
+	DefaultRefreshEvery    = 3 * time.Second
+	DefaultStaleAfter      = 10 * time.Second
 	defaultIdleAfter       = 60 * time.Second
-	defaultStaleAfter      = 90 * time.Second
 	defaultUpstreamTimeout = 2 * time.Second
 )
 
@@ -94,13 +101,13 @@ type Cacher struct {
 
 func New(cfg Config) *Cacher {
 	if cfg.RefreshEvery <= 0 {
-		cfg.RefreshEvery = defaultRefreshEvery
+		cfg.RefreshEvery = DefaultRefreshEvery
 	}
 	if cfg.IdleAfter <= 0 {
 		cfg.IdleAfter = defaultIdleAfter
 	}
 	if cfg.StaleAfter <= 0 {
-		cfg.StaleAfter = defaultStaleAfter
+		cfg.StaleAfter = DefaultStaleAfter
 	}
 	if cfg.UpstreamTimeout <= 0 {
 		cfg.UpstreamTimeout = defaultUpstreamTimeout

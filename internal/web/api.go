@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
+	"github.com/quinlan102/homeport/internal/qcache"
 	"github.com/quinlan102/homeport/internal/quota"
 	"github.com/quinlan102/homeport/internal/store"
 	"github.com/quinlan102/homeport/internal/sysx"
@@ -529,10 +530,9 @@ func validate(cfg *model.Config) error {
 	// The query cache's refresh interval. Zero is the shipped default. The
 	// floor exists because below it the refresher is a continuous poll of
 	// the operator's own game server, run over the billed tunnel; the
-	// ceiling because the cache stops serving a reply older than 90
-	// seconds, and a refresh slower than a third of that leaves no room for
-	// a failed fetch to be retried before the cache goes dark and the
-	// server drops out of browsers on a healthy site.
+	// ceiling because the refresh interval is the staleness every browser
+	// normally sees, and half a minute is already the edge of a count worth
+	// showing.
 	if cfg.QueryCache.RefreshMs < 0 {
 		return errors.New("query cache: the refresh interval cannot be negative")
 	}
@@ -541,8 +541,37 @@ func validate(cfg *model.Config) error {
 			"the least is 500, and 0 means the default 3000", cfg.QueryCache.RefreshMs)
 	}
 	if cfg.QueryCache.RefreshMs > 30000 {
-		return fmt.Errorf("query cache: a refresh of %d ms cannot keep the cache inside its 90s staleness bound; "+
+		return fmt.Errorf("query cache: a refresh of %d ms shows every browser a count that stale; "+
 			"the most is 30000, and 0 means the default 3000", cfg.QueryCache.RefreshMs)
+	}
+
+	// The staleness bound: how long the last good fetch keeps being served
+	// once the real server stops answering. Zero is automatic - the shipped
+	// default, or three refresh intervals where the refresh is slower - so
+	// only an explicit value is checked, and the relative floor is the
+	// load-bearing half: between polls every answer is served from this
+	// window, so a bound under three effective refresh intervals has a
+	// healthy port going dark between refreshes, with no room for one
+	// failed fetch to be retried. Both defaults are qcache's own exported
+	// constants, so this check and the cache cannot drift.
+	if cfg.QueryCache.StaleMs < 0 {
+		return errors.New("query cache: the staleness bound cannot be negative")
+	}
+	if cfg.QueryCache.StaleMs > 300000 {
+		return fmt.Errorf("query cache: a staleness bound of %d ms keeps advertising a crashed server for over five minutes; "+
+			"the most is 300000, and 0 means the default %d", cfg.QueryCache.StaleMs, int(qcache.DefaultStaleAfter/time.Millisecond))
+	}
+	if cfg.QueryCache.StaleMs != 0 {
+		refreshEff := cfg.QueryCache.RefreshMs
+		if refreshEff == 0 {
+			refreshEff = int(qcache.DefaultRefreshEvery / time.Millisecond)
+		}
+		if cfg.QueryCache.StaleMs < 3*refreshEff {
+			return fmt.Errorf("query cache: a staleness bound of %d ms is under three refresh intervals (refresh %d ms): between "+
+				"polls every answer is served from this window, so a healthy port would go dark between refreshes; "+
+				"use at least %d, refresh faster, or clear the box for automatic",
+				cfg.QueryCache.StaleMs, refreshEff, 3*refreshEff)
+		}
 	}
 
 	// Regions. The names become nftables set names and the networks their
