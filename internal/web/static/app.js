@@ -1803,6 +1803,15 @@ function renderSettings() {
       + 'being advertised by its own cache.')),
     el('p', { class: 'hint', text: 'Needs the Source engine tick on the service rows above; a row without it is not touched. If the cache is doing the '
       + 'flood absorbing, the Source queries per second limit above can be set to 0, or left on to cap what the cache ever sees.' }),
+    el('div', { class: 'grid' },
+      num('Refresh interval (ms)', c.query_cache.refresh_ms, (v) => (c.query_cache.refresh_ms = v || 0), {
+        min: 0, max: 30000, placeholder: '0 = 3000',
+        help: 'How often a queried port is re-fetched from the real server, which is the staleness a browser normally sees. Faster costs more refresh '
+          + 'traffic on the active tunnel and polls your own server harder; slower shows staler player counts. At most 30000, because the cache stops '
+          + 'serving a reply older than 90 seconds and a slower refresh leaves no room for a failed fetch to be retried before the port goes dark. '
+          + 'An idle port is never polled whatever this says.',
+      }),
+    ),
   ));
 
   const linkerBody = el('tbody', {});

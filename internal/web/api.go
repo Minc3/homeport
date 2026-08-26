@@ -526,6 +526,19 @@ func validate(cfg *model.Config) error {
 		}
 	}
 
+	// The query cache's refresh interval. Zero is the shipped default; the
+	// ceiling exists because the cache stops serving a reply older than 90
+	// seconds, and a refresh slower than a third of that leaves no room for
+	// a failed fetch to be retried before the cache goes dark and the
+	// server drops out of browsers on a healthy site.
+	if cfg.QueryCache.RefreshMs < 0 {
+		return errors.New("query cache: the refresh interval cannot be negative")
+	}
+	if cfg.QueryCache.RefreshMs > 30000 {
+		return fmt.Errorf("query cache: a refresh of %d ms cannot keep the cache inside its 90s staleness bound; "+
+			"the most is 30000, and 0 means the default 3000", cfg.QueryCache.RefreshMs)
+	}
+
 	// Regions. The names become nftables set names and the networks their
 	// elements, so both are held to what nft will load: a bad entry here is
 	// not cosmetic, it is the whole protection table refused at once, every

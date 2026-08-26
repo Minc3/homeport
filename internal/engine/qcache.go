@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
 	"github.com/quinlan102/homeport/internal/qcache"
@@ -44,7 +45,12 @@ func (e *Engine) startQueryCache(parent context.Context) {
 		}
 	}
 
-	c := qcache.New(qcache.Config{Ports: ports, Bind: e.qcBind, Log: e.log})
+	c := qcache.New(qcache.Config{
+		Ports:        ports,
+		Bind:         e.qcBind,
+		RefreshEvery: time.Duration(cfg.QueryCache.RefreshMs) * time.Millisecond,
+		Log:          e.log,
+	})
 	ctx, cancel := context.WithCancel(parent)
 	done := &sync.WaitGroup{}
 	done.Add(1)

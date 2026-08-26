@@ -99,6 +99,15 @@ type Config struct {
 // which observe mode must not send anything down.
 type QueryCacheConfig struct {
 	Enabled bool `json:"enabled,omitempty"`
+
+	// RefreshMs is how often a queried port is re-fetched from the real
+	// server, and therefore the staleness a browser normally sees. Zero
+	// takes the shipped 3000: an older config unmarshals to exactly the
+	// behaviour it had. Bounded above by validate at 30000, because the
+	// cache stops serving a reply older than 90 seconds and a refresh slower
+	// than a third of that leaves no room for a fetch to fail and be
+	// retried before the cache goes dark.
+	RefreshMs int `json:"refresh_ms,omitempty"`
 }
 
 // MaxQueryCachePorts bounds how many ports the cache will serve. Each port is

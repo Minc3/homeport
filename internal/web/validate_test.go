@@ -473,6 +473,29 @@ func TestEveryProtectPresetSurvivesValidate(t *testing.T) {
 	}
 }
 
+// The query cache's refresh interval: zero is the shipped default and must
+// keep saving, the ceiling is what keeps the cache inside its 90s staleness
+// bound (past it a healthy site's server drops out of browsers), and a
+// negative is refused like every other duration here. The bounds live in
+// validate and the portal only mirrors them, so this is the test that holds
+// them.
+func TestValidateBoundsTheQueryCacheRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		ms int
+		ok bool
+	}{{0, true}, {3000, true}, {30000, true}, {-1, false}, {30001, false}} {
+		cfg := model.Defaults()
+		cfg.QueryCache.RefreshMs = tc.ms
+		err := validate(&cfg)
+		if tc.ok && err != nil {
+			t.Errorf("refresh %d ms refused: %v", tc.ms, err)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("refresh %d ms saved; it must be refused", tc.ms)
+		}
+	}
+}
+
 // A DNAT rule with no interface to scope it to matches its port on every
 // interface the frontend has, the admin tunnel included - and that is the
 // tunnel the portal is reached over. A row naming the portal's own port would

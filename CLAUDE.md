@@ -1542,7 +1542,11 @@ table observe never loads, and the refresh stream rides the active tunnel,
 which observe must not bill. The refresh is demand-driven - an unqueried
 port polls nothing, so a backend full of Source servers costs only what is
 being asked about - and a cache past its staleness bound answers nothing
-rather than advertising a server that may be gone. The protect chains run
+rather than advertising a server that may be gone. The refresh interval is
+`QueryCache.RefreshMs`, zero meaning the shipped 3000; validate caps it at
+30000 because the staleness bound is 90 seconds and a slower refresh leaves
+no room for a failed fetch to be retried before a healthy site's port goes
+dark. The protect chains run
 before dstnat, so with both features on the limits drop first and a parked
 source never reaches the cache.
 
