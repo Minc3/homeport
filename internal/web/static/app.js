@@ -452,7 +452,14 @@ async function refreshStatus() {
 // a port whose socket failed to bind is redirecting every query to nothing.
 function renderQueryCache(states) {
   const section = document.getElementById('qcache-section');
-  const list = states || [];
+  const all = states || [];
+  // Only ports with something to say. A site publishing a wide Source range
+  // caches every port in it, and a hundred rows of zeros bury the handful
+  // that carry the story; a port nobody has queried has no story yet. A bind
+  // error always shows, because that port is redirecting queries to nothing.
+  const list = all.filter((q) => q.error || q.refresh_error
+    || q.answered || q.challenged || q.unanswered
+    || q.info_age_sec >= 0 || q.player_age_sec >= 0);
   section.classList.toggle('hidden', list.length === 0);
   if (!list.length) return;
 
@@ -463,19 +470,29 @@ function renderQueryCache(states) {
     el('thead', {}, el('tr', {},
       el('th', { text: 'Port' }), el('th', { text: 'Service' }),
       el('th', { text: 'Answered' }), el('th', { text: 'Challenged' }), el('th', { text: 'Unanswered' }),
-      el('th', { text: 'Info age' }), el('th', { text: 'Players age' }))),
+      el('th', { text: 'Info age' }), el('th', { text: 'Players age' }),
+      el('th', { text: 'Problem' }))),
     el('tbody', {}, list.map((q) => el('tr', {},
       el('td', { text: q.port }),
-      el('td', { text: q.error ? `${q.service} - CANNOT BIND: ${q.error}` : q.service }),
+      el('td', { text: q.service }),
       el('td', { text: q.answered.toLocaleString() }),
       el('td', { text: q.challenged.toLocaleString() }),
       el('td', { text: q.unanswered.toLocaleString() }),
       el('td', { text: age(q.info_age_sec) }),
-      el('td', { text: age(q.player_age_sec) })))))));
+      el('td', { text: age(q.player_age_sec) }),
+      el('td', { title: q.error || q.refresh_error || '',
+        text: q.error ? `cannot bind: ${q.error}`
+          : q.refresh_error ? `no answer from ${q.target}: ${q.refresh_error}`
+          : '' })))))));
+  const hidden = all.length - list.length;
+  if (hidden > 0) {
+    body.append(el('p', { class: 'hint', text: `${hidden} cached port${hidden === 1 ? '' : 's'} with no activity hidden.` }));
+  }
   body.append(el('p', { class: 'hint', text: 'Answered is payloads served from cache; Challenged counts the challenge every new source gets first, so under a '
-    + 'spoofed flood it is the number climbing while Answered stays flat, which is the cache doing its job. Unanswered climbing with a high age means the '
-    + 'cache cannot reach the game server: the port answers nothing rather than advertising a server that may be gone. "Never fetched" on an idle port is '
-    + 'normal - the cache only polls a port while somebody is asking about it.' }));
+    + 'spoofed flood it is the number climbing while Answered stays flat, which is the cache doing its job. Counters climbing on a port with "no answer '
+    + 'from" beside them usually means nothing is listening on that port at the far end - internet scanners query every published port and complete '
+    + 'challenges like anybody else. The same line on a port whose game server is really running is the cache unable to reach it, and the port answers '
+    + 'nothing rather than advertising a server that may be gone.' }));
 }
 
 // counterInfo turns a rule comment into a readable label and an explanation.

@@ -2858,8 +2858,15 @@ where a subtle regression would be invisible in production until an outage:
   multi-packet reply is replayed fragment for fragment; a stale cache answers
   nothing and says so in its counters, because serving stale forever would
   advertise a dead server indefinitely; cancellation returns promptly
-  (invariant 17, the read loops sit on sockets); and a port something else
-  holds is reported loudly while the ports beside it still serve.
+  (invariant 17, the read loops sit on sockets); a port something else
+  holds is reported loudly while the ports beside it still serve; and a port
+  whose upstream never answers names the failure in the snapshot the portal
+  renders - "never fetched" beside climbing counters cannot otherwise
+  distinguish a down game server from a port only scanners query, and
+  scanners complete challenges like anybody else. That case is also the
+  port's first failure ever, which pins fetchOK starting true: begun false,
+  the first failure is not an edge and the one journal line an operator
+  most needs never prints.
 - `model/qcache_test.go` - the enumeration both the redirects and the sockets
   are built from: only enabled, Source-ticked UDP services produce ports,
   duplicates across services collapse, the linker target is honoured, and the

@@ -308,6 +308,45 @@ func TestStaleCacheAnswersNothing(t *testing.T) {
 	}
 }
 
+// A port whose upstream never answers says so: the failure lands in the
+// snapshot the portal renders. Without it, "never fetched" beside climbing
+// counters cannot distinguish a down game server from a port only scanners
+// query, which is a dashboard that reports a question. This is also the
+// first failure the port ever has, which pins the logging edge case the
+// same state feeds: fetchOK must start true or the first failure is not an
+// edge and stays silent everywhere.
+func TestAnUnreachableUpstreamIsNamedInTheSnapshot(t *testing.T) {
+	u := newFakeUpstream(t)
+	u.conn.Close() // nothing will ever answer
+	cacher, addr, _ := startCacher(t, u, func(c *Config) {
+		c.UpstreamTimeout = 200 * time.Millisecond
+	})
+	c := newClient(t, addr)
+
+	// A real client's dance: the challenge works, the payload never comes.
+	c.send(infoRequest(nil))
+	ch := c.mustChallenge()
+	c.send(infoRequest(ch))
+	if b := c.read(100 * time.Millisecond); b != nil {
+		t.Fatalf("an empty cache served % x", b)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		st := cacher.Snapshot()
+		if len(st) == 1 && st[0].RefreshError != "" {
+			if st[0].InfoAgeSec != -1 {
+				t.Errorf("info age = %v, want -1 for never fetched", st[0].InfoAgeSec)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("refresh error never surfaced: %+v", st)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // Cancellation tears the whole thing down promptly. The read loops sit on
 // sockets with no deadline, so this is invariant 17: the context watcher
 // must close the socket, or every settings save would stall on a read that

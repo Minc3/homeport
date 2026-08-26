@@ -1066,6 +1066,15 @@ type QueryCacheState struct {
 	// frontend holds it, and every query to it is being redirected to nothing.
 	// Loud in the portal for that reason.
 	Error string `json:"error,omitempty"`
+
+	// RefreshError is the last upstream refresh failure, cleared by the next
+	// success. "Never fetched" without this is a question rather than a
+	// report: it cannot distinguish a game server that is down or missing
+	// from a port that only scanners ever query - scanners complete
+	// challenges like anybody else, so a port with nothing behind it still
+	// shows counters climbing while its cache stays empty, and this is the
+	// line that says why.
+	RefreshError string `json:"refresh_error,omitempty"`
 }
 
 // GeoLockedPort is one port with its automatic region lock engaged, and the

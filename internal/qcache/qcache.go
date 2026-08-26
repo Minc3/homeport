@@ -118,7 +118,10 @@ func New(cfg Config) *Cacher {
 	}
 	c := &Cacher{cfg: cfg, log: log, secret: secret, bound: make(chan struct{})}
 	for _, p := range cfg.Ports {
-		c.ports = append(c.ports, &portCache{cfg: p, c: c, nudge: make(chan struct{}, 1)})
+		pc := &portCache{cfg: p, c: c, nudge: make(chan struct{}, 1)}
+		pc.info.fetchOK = true
+		pc.player.fetchOK = true
+		c.ports = append(c.ports, pc)
 	}
 	return c
 }
@@ -168,6 +171,9 @@ func (c *Cacher) Snapshot() []model.QueryCacheState {
 			PlayerAgeSec: p.player.ageSec(now),
 			Error:        p.bindErrString(),
 		}
+		if st.RefreshError = p.info.lastErr(); st.RefreshError == "" {
+			st.RefreshError = p.player.lastErr()
+		}
 		out = append(out, st)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Port < out[j].Port })
@@ -183,7 +189,21 @@ type cacheEntry struct {
 	datagrams [][]byte
 	fetched   time.Time // zero = never
 	demand    time.Time // last valid client query of this type
-	fetchOK   bool      // last refresh outcome, for edge-triggered logging
+
+	// fetchOK drives the edge-triggered logging and must start true, or the
+	// first failure is not an edge and the one case an operator most needs
+	// told about - a cache that has never reached its server at all - is the
+	// one case the journal stays silent on. fetchErr is that failure kept
+	// for the portal, because "never fetched" on the dashboard without the
+	// reason is a question, not a report.
+	fetchOK  bool
+	fetchErr string
+}
+
+func (e *cacheEntry) lastErr() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.fetchErr
 }
 
 func (e *cacheEntry) stampDemand(now time.Time) {
@@ -366,8 +386,10 @@ func (p *portCache) refreshEntry(ctx context.Context, e *cacheEntry, what string
 		e.datagrams = datagrams
 		e.fetched = time.Now()
 		e.fetchOK = true
+		e.fetchErr = ""
 	} else {
 		e.fetchOK = false
+		e.fetchErr = err.Error()
 	}
 	e.mu.Unlock()
 	// Edge-triggered, because a refresh failure repeats every interval for as
