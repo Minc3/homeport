@@ -717,42 +717,45 @@ func ProtectPresets() []ProtectPreset {
 			Note: "For a server whose players are known and mostly on home connections. 10 new connections a second and 50 concurrent " +
 				"per address still clear a browser comfortably, which holds at most 6 connections to one host, but leave little room " +
 				"for big shared networks. 150 UDP packets a second covers two Source players on one address, each sending at the usual " +
-				"30 to 66 packets a second, and not a house full. 2 queries a second is ample for server browsers. A tripping source " +
-				"is parked for 10 minutes, the classic fail2ban ban. Pick this only when the dashboard counters show real traffic " +
+				"30 to 66 packets a second, and not a house full. 10 queries a second clears a server browser being refreshed by hand, " +
+				"which sends the three A2S queries per refresh and tripped the old figure of 2 on the second click. A tripping source " +
+				"is parked for a minute. Pick this only when the dashboard counters show real traffic " +
 				"sitting far below these figures, because a player behind a shared carrier address is the one it will bite first.",
 			NewConnsPerSec:    10,
 			MaxConnsPerSource: 50,
 			PacketsPerSec:     150,
-			QueriesPerSec:     2,
-			BlockSeconds:      600,
+			QueriesPerSec:     10,
+			BlockSeconds:      60,
 		},
 		{
 			Name:  ProtectPresetPublic,
 			Label: "Public server",
 			Note: "A defensible starting point for a public server. 20 new connections a second and 100 concurrent per address sit " +
 				"well clear of a browser's 6 per host and of a small office NAT. 400 UDP packets a second covers five or six Source " +
-				"players sharing one carrier address, each sending at the usual 30 to 66 packets a second. 3 queries a second is " +
-				"ample for server browsers, and the query flood is the usual attack on a Source server. A tripping source is parked " +
-				"for 10 minutes. Watch the counters after choosing this: a limit that trips in normal play reads from outside as " +
+				"players sharing one carrier address, each sending at the usual 30 to 66 packets a second. 15 queries a second clears " +
+				"a hand-refreshed server browser, which sends the three A2S queries per refresh, while the query flood, the usual " +
+				"attack on a Source server, still trips it thousands of times over. A tripping source is parked " +
+				"for a minute. Watch the counters after choosing this: a limit that trips in normal play reads from outside as " +
 				"the service being down.",
 			NewConnsPerSec:    20,
 			MaxConnsPerSource: 100,
 			PacketsPerSec:     400,
-			QueriesPerSec:     3,
-			BlockSeconds:      600,
+			QueriesPerSec:     15,
+			BlockSeconds:      60,
 		},
 		{
 			Name:  ProtectPresetShared,
 			Label: "Shared networks (CGNAT-heavy)",
 			Note: "For audiences heavy on mobile and university networks, where carrier NAT routinely puts 16 to 64 subscribers " +
 				"behind one address. 1000 UDP packets a second covers a dozen Source players on one address; 40 new connections and " +
-				"250 concurrent cover their browsers beside them. Parking is the dangerous half on shared addresses, since one park " +
-				"is every household behind that NAT, so a tripping source is parked for one minute rather than ten. The limits " +
+				"250 concurrent cover their browsers beside them, and 20 queries a second covers several of them refreshing at once. " +
+				"Parking is the dangerous half on shared addresses, since one park " +
+				"is every household behind that NAT, so a tripping source is parked for one minute. The limits " +
 				"still stop a single flood; they are just sized so a busy shared address is not mistaken for one.",
 			NewConnsPerSec:    40,
 			MaxConnsPerSource: 250,
 			PacketsPerSec:     1000,
-			QueriesPerSec:     10,
+			QueriesPerSec:     20,
 			BlockSeconds:      60,
 		},
 	}

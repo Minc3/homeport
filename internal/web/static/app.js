@@ -1769,12 +1769,16 @@ function renderSettings() {
       protectField('queries_per_sec', 'Source-engine queries per second per source', pr.queries_per_sec, (v) => (pr.queries_per_sec = v), {
         min: 0, placeholder: '0 = off',
         help: 'Applies only to services ticked as Source engine, and only to their connectionless packets, the A2S queries and connection attempts. '
-          + 'Players already in the game are unaffected, which is what makes a tight number safe here: 2 or 3 per second is ample, and this is the usual flood vector for a Source server.',
+          + 'Players already in the game are unaffected, which is what makes a tight number safe here, but a server browser refresh sends three A2S queries at once, '
+          + 'so single digits park anybody who refreshes twice in a second: 10 or more per second is the safe floor, and this is the usual flood vector for a Source server.',
       }),
       protectField('block_seconds', 'Block a tripping source for (s)', pr.block_seconds, (v) => (pr.block_seconds = v), {
         min: 0, placeholder: '0 = never block',
-        help: 'When a source trips any limit above, park it for this long: everything from that address is dropped on sight until it expires, cheaply, before conntrack. '
-          + '0 drops only the excess and never parks anybody, which is gentler and much less effective. 600 is a reasonable start. Parked addresses are listed on the dashboard.',
+        help: 'When a source trips any limit above, park its address for this long: everything it sends, on every port, not just the port or limit it tripped, is dropped '
+          + 'on sight before anything else runs, until the timer expires on its own. That turns a sustained flood into one cheap lookup per packet. 0 never parks anybody '
+          + 'and only drops the excess over each limit, which is gentler and much less effective. Parking is by address, and a carrier or office NAT puts many households '
+          + 'behind one, so a single tripping client parks everyone sharing its address: keep this short, 60 is a reasonable start, and a refresh-happy player who trips a limit is locked out for a minute rather than ten. '
+          + 'Parked addresses are listed on the dashboard, and saving any protection change unparks all of them, because the list lives in the kernel and a save reloads the table.',
       }),
     ),
 
