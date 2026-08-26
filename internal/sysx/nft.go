@@ -103,8 +103,8 @@ func BuildRuleset(cfg model.Config) string {
 			b    int
 			what string
 		}{{0x54, "info"}, {0x55, "players"}, {0x56, "rules"}} {
-			fmt.Fprintf(&b, "\t\t%sudp dport %s @th,64,32 0xffffffff @th,96,8 0x%02x redirect comment %q\n",
-				serviceScope(cfg), port, t.b, fmt.Sprintf("qcache %s: %s", t.what, sp.Service))
+			fmt.Fprintf(&b, "\t\t%sudp dport %s %s @th,96,8 0x%02x redirect comment %q\n",
+				serviceScope(cfg), port, connectionlessMatch, t.b, fmt.Sprintf("qcache %s: %s", t.what, sp.Service))
 		}
 	}
 

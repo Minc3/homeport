@@ -92,15 +92,16 @@ func TestProtectPresetsAreOrderedTightestFirstAfterOff(t *testing.T) {
 // side effect would drop packets nobody asked it to.
 func TestProtectPresetApplyTouchesOnlyTheFiveLimits(t *testing.T) {
 	pr := ProtectConfig{
-		Enabled:        true,
-		DropInvalid:    true,
-		DropBogusTCP:   true,
-		DropSpoofed:    true,
-		GeoLockSeconds: 120,
-		Regions:        []GeoRegion{{Name: "oceania", CIDRs: []string{"1.128.0.0/11"}}},
+		Enabled:           true,
+		DropInvalid:       true,
+		DropBogusTCP:      true,
+		DropSpoofed:       true,
+		DropLegacyQueries: true,
+		GeoLockSeconds:    120,
+		Regions:           []GeoRegion{{Name: "oceania", CIDRs: []string{"1.128.0.0/11"}}},
 	}
 	protectPresetByName(t, ProtectPresetPublic).Apply(&pr)
-	if !pr.Enabled || !pr.DropInvalid || !pr.DropBogusTCP || !pr.DropSpoofed {
+	if !pr.Enabled || !pr.DropInvalid || !pr.DropBogusTCP || !pr.DropSpoofed || !pr.DropLegacyQueries {
 		t.Errorf("a preset changed a switch it does not own: %+v", pr)
 	}
 	if pr.GeoLockSeconds != 120 || len(pr.Regions) != 1 {

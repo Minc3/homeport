@@ -76,6 +76,15 @@ func TestProtectionNeverMentionsTheSystemsOwnPorts(t *testing.T) {
 	cfg.Protect.DropInvalid = true
 	cfg.Protect.DropBogusTCP = true
 	cfg.Protect.DropSpoofed = true
+	// The legacy-query drop has to be in the ruleset this scans, or a future
+	// edit widening it could mention the system's own traffic with nothing
+	// here to notice.
+	cfg.Protect.DropLegacyQueries = true
+	for i := range cfg.Services {
+		if cfg.Services[i].Proto == "udp" {
+			cfg.Services[i].SourceEngine = true
+		}
+	}
 	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
 
 	for _, banned := range []string{"51999", "51998", "10.99.0.1", "10.99.0.2"} {
@@ -268,6 +277,14 @@ func TestEveryDropIsCounted(t *testing.T) {
 	cfg.Protect.DropInvalid = true
 	cfg.Protect.DropBogusTCP = true
 	cfg.Protect.DropSpoofed = true
+	// Every drop means every drop: the legacy-query rule must be rendered
+	// here too, so it needs its toggle and a Source-engine port to scope to.
+	cfg.Protect.DropLegacyQueries = true
+	for i := range cfg.Services {
+		if cfg.Services[i].Proto == "udp" {
+			cfg.Services[i].SourceEngine = true
+		}
+	}
 	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
 
 	for _, line := range strings.Split(ruleset, "\n") {

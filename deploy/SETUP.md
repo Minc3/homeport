@@ -592,6 +592,7 @@ then set only the thresholds you want. Each is off at 0.
 | UDP packets per second per source | per source |
 | Block a tripping source for (s) | 0 means drop the packet but do not park the source |
 | Drop invalid, bogus TCP flags, spoofed sources | cheap, safe to leave on |
+| Drop legacy Source queries | the two dead query types (GETCHALLENGE, A2A_PING); needs a **Source engine** tick below or it drops nothing |
 
 For a Source game port, tick **Source engine** on that service row. It limits
 only connectionless packets, so a limit of two or three per second cannot touch

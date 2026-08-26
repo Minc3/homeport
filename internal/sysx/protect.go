@@ -96,8 +96,11 @@ func (s ProtectSpec) geoLockSeconds() int {
 // list is the expensive part of a build (a fetched country is tens of
 // thousands of networks, parsed and sorted), it runs under the engine's apply
 // lock, and two independent computations of "a live geo service" would be two
-// definitions a future edit can move apart.
-func (s ProtectSpec) active(geoSvcs []ProtectService) bool {
+// definitions a future edit can move apart. The Source-engine ports come the
+// same way for the second reason alone: the emission gates below must agree
+// with the answers given here, and a gate written out twice is two
+// definitions.
+func (s ProtectSpec) active(sePorts []string, geoSvcs []ProtectService) bool {
 	if s.PublicIface == "" {
 		return false
 	}
@@ -107,13 +110,10 @@ func (s ProtectSpec) active(geoSvcs []ProtectService) bool {
 	if s.NewConnsPerSec > 0 || s.MaxConnsPerSource > 0 || s.PacketsPerSec > 0 {
 		return true
 	}
-	if s.QueriesPerSec > 0 && len(s.sourceEnginePorts()) > 0 {
-		return true
-	}
-	// Like the query-rate limiter, this drop scopes to the Source-engine
-	// ports, so with none configured there is nothing for it to match and it
-	// activates nothing.
-	if s.DropLegacyQueries && len(s.sourceEnginePorts()) > 0 {
+	// The query-rate limiter and the legacy-query drop both scope to the
+	// Source-engine ports, so with none configured neither has anything to
+	// match and neither activates anything.
+	if (s.QueriesPerSec > 0 || s.DropLegacyQueries) && len(sePorts) > 0 {
 		return true
 	}
 	for _, sv := range s.Services {
@@ -440,14 +440,24 @@ const (
 	CounterGeoTrip    = "geo-trip"
 )
 
+// connectionlessMatch is the Source engine's connectionless header: every
+// query and connection attempt starts 0xFFFFFFFF in the first four bytes
+// after the 8-byte UDP header, and an in-game client's sequence-numbered
+// packets never do. Three rules read it - the query rate limiter, the
+// legacy-query drop, and the query cache redirects in nft.go - and a packet
+// they disagreed about would be dropped by one and answered by another, so
+// there is exactly one spelling.
+const connectionlessMatch = "@th,64,32 0xffffffff"
+
 // BuildProtectRuleset renders the edge filtering table, or "" when there is
 // nothing switched on.
 func BuildProtectRuleset(spec ProtectSpec) string {
 	// Resolved once, shared by the emptiness check and the rule emission
-	// below; see active for why this is not computed twice.
+	// below; see active for why neither is computed twice.
 	geoElems := spec.geoRegionElems()
 	geoSvcs := spec.geoServices(geoElems)
-	if !spec.active(geoSvcs) {
+	sePorts := spec.sourceEnginePorts()
+	if !spec.active(sePorts, geoSvcs) {
 		return ""
 	}
 	iface := spec.PublicIface
@@ -497,7 +507,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	if spec.PacketsPerSec > 0 {
 		dynSet("packet_rate", 60)
 	}
-	if spec.QueriesPerSec > 0 && len(spec.sourceEnginePorts()) > 0 {
+	if spec.QueriesPerSec > 0 && len(sePorts) > 0 {
 		dynSet("query_rate", 60)
 	}
 
@@ -583,15 +593,15 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 		b.WriteString("\t\t# Source addresses that cannot legitimately arrive from the internet.\n")
 		fmt.Fprintf(&b, "\t\tip saddr %s counter drop comment %q\n", martianSet(), CounterSpoofed)
 	}
-	if se := spec.sourceEnginePorts(); spec.DropLegacyQueries && len(se) > 0 {
+	if spec.DropLegacyQueries && len(sePorts) > 0 {
 		b.WriteString("\t\t# The two deprecated Source connectionless queries, dropped before\n")
 		b.WriteString("\t\t# conntrack: GETCHALLENGE (0x57) and A2A_PING (0x69). No client has\n")
 		b.WriteString("\t\t# sent either in over a decade, and both are reflector shapes. The\n")
 		b.WriteString("\t\t# match is the connectionless header then the type byte, exactly as\n")
-		b.WriteString("\t\t# the query-rate limiter reads it, so the live queries (0x54-0x56)\n")
+		b.WriteString("\t\t# the query rate limiter reads it, so the live queries (0x54-0x56)\n")
 		b.WriteString("\t\t# and in-game traffic are untouched.\n")
-		fmt.Fprintf(&b, "\t\tudp dport %s @th,64,32 0xffffffff @th,96,8 { 0x57, 0x69 } counter drop comment %q\n",
-			portSet(se), CounterLegacyQ)
+		fmt.Fprintf(&b, "\t\tudp dport %s %s @th,96,8 { 0x57, 0x69 } counter drop comment %q\n",
+			portSet(sePorts), connectionlessMatch, CounterLegacyQ)
 	}
 	if len(geoSvcs) > 0 {
 		b.WriteString("\t\t# Region locks: an allow lock drops everything outside its regions,\n")
@@ -677,14 +687,14 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 			portSet(udp), spec.PacketsPerSec, spec.PacketsPerSec*2, blockStmt, CounterPacketRate)
 	}
 
-	if se := spec.sourceEnginePorts(); len(se) > 0 && spec.QueriesPerSec > 0 {
+	if len(sePorts) > 0 && spec.QueriesPerSec > 0 {
 		b.WriteString("\t\t# Source-engine connectionless packets: the queries and connection\n")
 		b.WriteString("\t\t# attempts, which start 0xFFFFFFFF. A player already in the game\n")
 		b.WriteString("\t\t# sends sequence-numbered packets and never matches this, which is\n")
 		b.WriteString("\t\t# what makes a tight limit safe here. @th,64,32 is the first four\n")
 		b.WriteString("\t\t# bytes after the 8-byte UDP header.\n")
-		fmt.Fprintf(&b, "\t\tudp dport %s @th,64,32 0xffffffff add @query_rate { ip saddr limit rate over %d/second burst %d packets } %scounter drop comment %q\n",
-			portSet(se), spec.QueriesPerSec, spec.QueriesPerSec*2, blockStmt, CounterQueryRate)
+		fmt.Fprintf(&b, "\t\tudp dport %s %s add @query_rate { ip saddr limit rate over %d/second burst %d packets } %scounter drop comment %q\n",
+			portSet(sePorts), connectionlessMatch, spec.QueriesPerSec, spec.QueriesPerSec*2, blockStmt, CounterQueryRate)
 	}
 
 	// Aggregate ceilings last: a packet that survived every per-source limit
