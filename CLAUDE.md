@@ -2928,7 +2928,15 @@ where a subtle regression would be invisible in production until an outage:
   not `dynamic` refuses every `add` from the packet path, and a set literal with
   a repeated or overlapping element is rejected outright - in each case nft
   rejects the **whole table**, so one duplicated service port would have taken
-  every limit down with it. Generated nftables is worth reading by eye before
+  every limit down with it. A third joined them from a live journal: the
+  `conn_count` set must carry no element timeout, because `ct count` is a
+  connlimit expression and the kernel refuses one in a timeout-flagged set
+  with "Operation not supported" - the conntrack table's own timers are what
+  age a live count. The whole table was refused with it on every save, and
+  because `nft -f` is atomic the *previous* table stayed live, so the portal
+  accepted the limits while the kernel enforced none of them; only the ERROR
+  line in the journal said why. `TestConnCountSetCarriesNoTimeout` pins the
+  shape. Generated nftables is worth reading by eye before
   trusting: the tests can only assert what somebody thought to assert.
 - `qcache/qcache_test.go` - the anti-spoofing property both ways: an
   unchallenged or wrongly challenged source gets a challenge never larger

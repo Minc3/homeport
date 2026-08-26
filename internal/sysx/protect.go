@@ -489,20 +489,30 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	}
 	// One dynamic set per limit rather than one shared: they age at different
 	// rates and a shared set would have the busiest limit evicting the others'
-	// state.
+	// state. A timeout of 0 emits a set with no element timeout at all, and
+	// that is not a variant nothing uses: the kernel refuses a connlimit
+	// expression (`ct count`) in a timeout-flagged set with "Operation not
+	// supported", and refuses the whole table with it - the conntrack table's
+	// own timers are what age a live connection count, so an element timeout
+	// there is meaningless as well as fatal. Found live: every per-source
+	// limit stayed out of the kernel while the journal named this line.
 	dynSet := func(name string, timeout int) {
 		fmt.Fprintf(&b, "\tset %s {\n", name)
 		b.WriteString("\t\ttype ipv4_addr\n")
 		b.WriteString("\t\tsize 65535\n")
-		b.WriteString("\t\tflags dynamic,timeout\n")
-		fmt.Fprintf(&b, "\t\ttimeout %ds\n", timeout)
+		if timeout > 0 {
+			b.WriteString("\t\tflags dynamic,timeout\n")
+			fmt.Fprintf(&b, "\t\ttimeout %ds\n", timeout)
+		} else {
+			b.WriteString("\t\tflags dynamic\n")
+		}
 		b.WriteString("\t}\n\n")
 	}
 	if spec.NewConnsPerSec > 0 {
 		dynSet("conn_rate", 60)
 	}
 	if spec.MaxConnsPerSource > 0 {
-		dynSet("conn_count", 60)
+		dynSet("conn_count", 0)
 	}
 	if spec.PacketsPerSec > 0 {
 		dynSet("packet_rate", 60)

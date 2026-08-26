@@ -846,3 +846,42 @@ func TestCounterDropsIsTheRuleVerdictNotTheName(t *testing.T) {
 		t.Error("a dropping rule under an unknown name reads as observing only")
 	}
 }
+
+// The conn_count set must carry no element timeout. `ct count` is a
+// connlimit expression, and the kernel refuses one in a timeout-flagged set
+// with "Operation not supported" - and nft rejects the whole table with it,
+// so on the live deployment that found this every per-source limit and every
+// geo lock stayed out of the kernel while the old table sat in place and the
+// journal named this one rule. A live connection count needs no aging of its
+// own: the conntrack table's timers are what make the count fall as
+// connections close. The rate-limiter sets beside it keep their timeouts,
+// which their `limit rate` expressions support and need.
+func TestConnCountSetCarriesNoTimeout(t *testing.T) {
+	cfg := protectCfg()
+	cfg.Protect.NewConnsPerSec = 20
+	cfg.Protect.MaxConnsPerSource = 50
+	cfg.Protect.PacketsPerSec = 400
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	setBlock := func(name string) string {
+		start := strings.Index(ruleset, "set "+name+" {")
+		if start < 0 {
+			t.Fatalf("no %s set in the ruleset:\n%s", name, ruleset)
+		}
+		end := strings.Index(ruleset[start:], "}")
+		return ruleset[start : start+end]
+	}
+
+	cc := setBlock("conn_count")
+	if strings.Contains(cc, "timeout") {
+		t.Errorf("the conn_count set carries a timeout, which the kernel refuses for ct count:\n%s", cc)
+	}
+	if !strings.Contains(cc, "flags dynamic") {
+		t.Errorf("the conn_count set is not dynamic, so every add from the packet path is refused:\n%s", cc)
+	}
+	for _, name := range []string{"conn_rate", "packet_rate"} {
+		if b := setBlock(name); !strings.Contains(b, "flags dynamic,timeout") {
+			t.Errorf("the %s set lost its timeout; its entries would never age:\n%s", name, b)
+		}
+	}
+}
