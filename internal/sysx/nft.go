@@ -69,6 +69,33 @@ func BuildRuleset(cfg model.Config) string {
 	b.WriteString("\tchain prerouting {\n")
 	b.WriteString("\t\ttype nat hook prerouting priority dstnat; policy accept;\n")
 
+	// The query-cache redirects come first, because rules in a chain run in
+	// order and a query that reaches the dnat rule below is already on its
+	// way down a tunnel. `redirect` with no port keeps the destination port
+	// and rewrites only the address to this host's own, so the responder
+	// binds the service port itself and no port mapping exists to drift.
+	// The ports come from model.QueryCachePorts, the same enumeration the
+	// engine binds sockets for - deriving them twice is how a query gets
+	// redirected to a port nothing answers. @th,64,32 0xffffffff is the
+	// connectionless marker (see protect.go, where the same match is
+	// explained); @th,96,8 is the type byte behind it, so only A2S_INFO
+	// (0x54) and A2S_PLAYER (0x55) are taken and everything else a client
+	// sends - connection handshakes, A2S_RULES, game traffic - still reaches
+	// the real server.
+	for _, sp := range model.QueryCachePorts(cfg) {
+		port := fmt.Sprintf("%d", sp.From)
+		if sp.To > sp.From {
+			port = fmt.Sprintf("%d-%d", sp.From, sp.To)
+		}
+		for _, t := range []struct {
+			b    int
+			what string
+		}{{0x54, "info"}, {0x55, "players"}} {
+			fmt.Fprintf(&b, "\t\t%sudp dport %s @th,64,32 0xffffffff @th,96,8 0x%02x redirect comment %q\n",
+				serviceScope(cfg), port, t.b, fmt.Sprintf("qcache %s: %s", t.what, sp.Service))
+		}
+	}
+
 	for _, s := range cfg.Services {
 		if !s.Enabled {
 			continue
@@ -81,27 +108,33 @@ func BuildRuleset(cfg model.Config) string {
 		if s.PortEnd > s.Port {
 			port = fmt.Sprintf("%d-%d", s.Port, s.PortEnd)
 		}
-		var rule strings.Builder
-		rule.WriteString("\t\t")
-		if cfg.Frontend.PublicIface != "" {
-			fmt.Fprintf(&rule, "iifname %q ", cfg.Frontend.PublicIface)
-		}
-		if cfg.Frontend.PublicIP != "" {
-			fmt.Fprintf(&rule, "ip daddr %s ", cfg.Frontend.PublicIP)
-		}
 		// Almost always the backend. A service names a different overlay
 		// address only where a linker agent publishes it from another host,
 		// and the routing to get there is the same route widened by one
 		// prefix - there is no second mechanism here.
-		fmt.Fprintf(&rule, "%s dport %s dnat to %s comment %q\n",
-			proto, port, s.TargetOr(cfg.Overlay.BackendIP), s.Name)
-		b.WriteString(rule.String())
+		fmt.Fprintf(&b, "\t\t%s%s dport %s dnat to %s comment %q\n",
+			serviceScope(cfg), proto, port, s.TargetOr(cfg.Overlay.BackendIP), s.Name)
 	}
 
 	b.WriteString("\t}\n")
 	writeMSSClamp(&b, pathIfaces(cfg))
 	b.WriteString("}\n")
 	return b.String()
+}
+
+// serviceScope is the interface and address qualifier every published rule
+// carries: one definition, because the query-cache redirects and the dnat
+// rules must match exactly the same arriving traffic, and two copies of this
+// pair of conditionals is how one of them stops doing so.
+func serviceScope(cfg model.Config) string {
+	var s strings.Builder
+	if cfg.Frontend.PublicIface != "" {
+		fmt.Fprintf(&s, "iifname %q ", cfg.Frontend.PublicIface)
+	}
+	if cfg.Frontend.PublicIP != "" {
+		fmt.Fprintf(&s, "ip daddr %s ", cfg.Frontend.PublicIP)
+	}
+	return s.String()
 }
 
 func pathIfaces(cfg model.Config) []string {

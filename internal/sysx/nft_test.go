@@ -593,3 +593,72 @@ func TestTheOverlayAddressIsReparsedToo(t *testing.T) {
 		t.Errorf("a good address was rewritten to %q", got)
 	}
 }
+
+// qcacheConfig is a published Source service with the cache switched on.
+func qcacheConfig() model.Config {
+	cfg := model.Defaults()
+	cfg.Frontend.PublicIface = "eth0"
+	cfg.QueryCache.Enabled = true
+	cfg.Services = []model.Service{
+		{Name: "gmod", Proto: "udp", Port: 27015, PortEnd: 27030, Enabled: true, SourceEngine: true},
+	}
+	return cfg
+}
+
+// With the cache off the ruleset is byte-identical to a build that never
+// heard of it - invariant 19's discipline, applied here because every site
+// that does not opt in must see exactly the rules it always had.
+func TestRulesetIsUntouchedWithTheQueryCacheOff(t *testing.T) {
+	cfg := qcacheConfig()
+	cfg.QueryCache.Enabled = false
+	rs := BuildRuleset(cfg)
+	if strings.Contains(rs, "redirect") || strings.Contains(rs, "qcache") {
+		t.Errorf("cache off still generated redirect rules:\n%s", rs)
+	}
+}
+
+// The redirects take only what the cache answers: the connectionless marker
+// and then the two type bytes, INFO and PLAYER. Everything else on the port -
+// game traffic, connection handshakes, A2S_RULES - must still reach the dnat
+// rule below them, which is why the redirects also have to come first: rules
+// run in order, and a query that reaches the dnat is already on its way down
+// a tunnel.
+func TestQueryCacheRedirectsAreNarrowAndPrecedeTheDNAT(t *testing.T) {
+	rs := BuildRuleset(qcacheConfig())
+	for _, want := range []string{
+		`iifname "eth0" udp dport 27015-27030 @th,64,32 0xffffffff @th,96,8 0x54 redirect comment "qcache info: gmod"`,
+		`iifname "eth0" udp dport 27015-27030 @th,64,32 0xffffffff @th,96,8 0x55 redirect comment "qcache players: gmod"`,
+	} {
+		if !strings.Contains(rs, want) {
+			t.Errorf("ruleset lacks %q:\n%s", want, rs)
+		}
+	}
+	dnat := strings.Index(rs, "dnat to")
+	redirect := strings.Index(rs, "redirect")
+	if dnat < 0 || redirect < 0 || redirect > dnat {
+		t.Errorf("redirects must precede the dnat rule:\n%s", rs)
+	}
+	// A bare redirect keeps the destination port, which is what lets the
+	// responder bind the service port itself. A `redirect to` would be a
+	// port mapping that has to agree with the engine's sockets by hand.
+	if strings.Contains(rs, "redirect to") {
+		t.Errorf("redirect maps ports; the responder binds the service port:\n%s", rs)
+	}
+}
+
+// Only the opted-in service is redirected: a UDP service without the Source
+// tick, and any TCP service, keep their queries going to the real server.
+func TestQueryCacheRedirectsOnlyOptedInServices(t *testing.T) {
+	cfg := qcacheConfig()
+	cfg.Services = append(cfg.Services,
+		model.Service{Name: "other-udp", Proto: "udp", Port: 30000, Enabled: true},
+		model.Service{Name: "web", Proto: "tcp", Port: 443, Enabled: true, SourceEngine: true},
+	)
+	rs := BuildRuleset(cfg)
+	if strings.Contains(rs, "qcache info: other-udp") || strings.Contains(rs, "qcache info: web") {
+		t.Errorf("a service that did not opt in was redirected:\n%s", rs)
+	}
+	if !strings.Contains(rs, "qcache info: gmod") {
+		t.Errorf("the opted-in service lost its redirect:\n%s", rs)
+	}
+}

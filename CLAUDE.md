@@ -183,6 +183,7 @@ tunnel** regardless of which one is active.
 | `internal/engine` | Frontend brain: probers, per-path health trackers, the selector, the applier, the control server. |
 | `internal/agent` | Backend: probe responder, return-route management, LTE metering, control client. |
 | `internal/linker` | Optional extra host: overlay address, one policy route to the backend, connection marking so containers can be published, a control client, a reconciler. No probes, no decisions, no metering. |
+| `internal/qcache` | The Source query cache: answers A2S_INFO and A2S_PLAYER at the frontend from a cache refreshed off the real server, challenging every source first. Frontend-only; the backend and linker never link it. |
 | `internal/quota` | Billing periods, metered-byte reconstruction, enforcement decisions. |
 | `internal/store` | SQLite. Config, usage ledger, history, events, grants, users/sessions. |
 | `internal/web` | Portal HTTP server, JSON API, config validation, embedded static assets. |
@@ -1513,6 +1514,38 @@ sequence numbered. That is what makes a limit of two or three per second safe:
 it cannot touch the traffic of a player already connected. Without the payload
 match the same rule would throttle gameplay at a rate chosen for queries.
 
+**The query cache terminates A2S queries at the edge, and that is a carve-out
+from "no userspace handling of published traffic", not a breach of it.** What
+invariant 2 protects is the conntrack property of §3: a player's flow must
+keep its 5-tuple across a failover, which no proxy can give it. An A2S query
+is a stateless one-shot request with no flow to preserve, so answering it at
+the frontend destroys nothing - and it is the one protection the per-source
+limits cannot give. Those key on a source address being real: a hundred real
+bots trip them and are parked, but a flood that randomises its sources never
+trips a per-source limit, lands on the service ceiling, and the ceiling drops
+legitimate browser queries with the flood, on a cheap VPS whose datacentre
+only filters volumetric attacks. The cache does what a modern Source server
+itself does: every source is challenged before it is served, the challenge
+(HMAC over source and a time bucket, no per-client state to exhaust) is
+smaller than the query that provokes it so nothing amplifies, and a spoofed
+sender never sees it, so a spoofed flood gets nothing while challenged
+clients keep being answered from memory. `model.QueryCachePorts` is the one
+enumeration both halves share - the nft redirects (`@th,96,8` on the type
+byte, so game traffic, connection attempts and A2S_RULES pass untouched to
+the DNAT below) and the engine's responder sockets - because deriving them
+twice is how a query gets redirected to a port nothing answers. The redirect
+keeps the destination port (`redirect`, never `redirect to`), so the
+responder binds the service port itself and no port mapping exists to drift.
+Off by default, one switch (`Config.QueryCache`), independent of
+`Protect` in both directions, armed mode only: the redirects ride the DNAT
+table observe never loads, and the refresh stream rides the active tunnel,
+which observe must not bill. The refresh is demand-driven - an unqueried
+port polls nothing, so a backend full of Source servers costs only what is
+being asked about - and a cache past its staleness bound answers nothing
+rather than advertising a server that may be gone. The protect chains run
+before dstnat, so with both features on the limits drop first and a parked
+source never reaches the cache.
+
 **Region locks are operator-declared network lists, not a GeoIP database.**
 `Protect.Regions` is named lists of CIDRs; `Service.GeoRegions` locks a port to
 their union, dropping everything else in the raw chain. A GeoIP database would
@@ -1627,7 +1660,10 @@ Breaking any of these is a correctness bug even if the tests pass.
 2. No SNAT, no masquerade, no userspace forwarding of **published** traffic.
    The `failover_egress` table is the one source NAT, it applies only to
    connections the backend originates outbound, and it must stay in its own
-   table and stay scoped to the public interface.
+   table and stay scoped to the public interface. The query cache is the one
+   carve-out and it forwards nothing: it *terminates* stateless A2S queries
+   at the frontend, which have no flow whose 5-tuple could be broken - see
+   §6 for why that is not the proxy this invariant forbids.
 3. Each path has a **unique** routing table and a **unique** fwmark. Two paths
    sharing either means both probe through the same tunnel and a dead link
    tests as healthy. `web.validate` rejects duplicates. The per-path fwmark
@@ -2505,6 +2541,7 @@ because zero is already the right answer.
 | `Service.SourceEngine`, `Service.CeilingPPS` | an ordinary published port | portal |
 | `Protect.Regions`, `Service.GeoRegions` | no region locks; reachable from anywhere | portal |
 | `Service.GeoAutoPPS` | a lock with regions set is unconditional | portal |
+| `Config.QueryCache` | no query cache; A2S queries reach the real server | portal |
 
 `Config.Linkers` is the topology the backend cannot work out for itself. An
 overlay address says nothing about which machine holds it, so each row pairs one
@@ -2812,6 +2849,29 @@ where a subtle regression would be invisible in production until an outage:
   rejects the **whole table**, so one duplicated service port would have taken
   every limit down with it. Generated nftables is worth reading by eye before
   trusting: the tests can only assert what somebody thought to assert.
+- `qcache/qcache_test.go` - the anti-spoofing property both ways: an
+  unchallenged or wrongly challenged source gets a challenge smaller than its
+  query and never a payload, and a challenged client is served the upstream's
+  bytes verbatim. The caching property itself: fifty client queries cost the
+  upstream a handful of fetches, and a port nobody queries polls nothing at
+  all, which is what makes many Source servers affordable to cache. A
+  multi-packet reply is replayed fragment for fragment; a stale cache answers
+  nothing and says so in its counters, because serving stale forever would
+  advertise a dead server indefinitely; cancellation returns promptly
+  (invariant 17, the read loops sit on sockets); and a port something else
+  holds is reported loudly while the ports beside it still serve.
+- `model/qcache_test.go` - the enumeration both the redirects and the sockets
+  are built from: only enabled, Source-ticked UDP services produce ports,
+  duplicates across services collapse, the linker target is honoured, and the
+  cap holds so a range typo cannot become forty thousand sockets.
+- `engine/qcache_test.go` - the cache runs only when armed and enabled,
+  observe mode starts nothing (the refresher would bill query traffic to the
+  active path), and stop waits the generation out so a restart can rebind the
+  same fixed ports.
+- `sysx/nft_test.go` also pins the redirects: byte-absent with the cache off,
+  ahead of the dnat rule and narrowed to the two type bytes when on, only for
+  opted-in services, and never `redirect to` - the responder binds the
+  service port itself, so there is no port mapping to drift.
 - `sysx/shape_test.go` - an unshaped path installs nothing, the configured rate
   reaches the kernel with the overhead, an intact shaper is left alone, one lost
   with its interface is restored, clearing the rate removes it, a queue

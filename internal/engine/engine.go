@@ -15,6 +15,7 @@ import (
 	"github.com/quinlan102/homeport/internal/model"
 	"github.com/quinlan102/homeport/internal/notify"
 	"github.com/quinlan102/homeport/internal/proto"
+	"github.com/quinlan102/homeport/internal/qcache"
 	"github.com/quinlan102/homeport/internal/quota"
 	"github.com/quinlan102/homeport/internal/store"
 	"github.com/quinlan102/homeport/internal/sysx"
@@ -61,6 +62,21 @@ type Engine struct {
 	proberCancel context.CancelFunc
 	proberDone   *sync.WaitGroup
 	results      chan Result
+
+	// The Source query cache, running only when armed and enabled. Its
+	// lifecycle is the probers' - stop waits before start binds - and has to
+	// be: unlike a prober's ephemeral marked socket, the cache binds fixed
+	// service ports, so a generation started before the old one has let go
+	// fails its binds against its own predecessor.
+	qc       *qcache.Cacher
+	qcCancel context.CancelFunc
+	qcDone   *sync.WaitGroup
+	// qcBind narrows the cache's listen address. Empty - every deployment -
+	// binds wide, which the redirect requires (it rewrites a query's
+	// destination to the arriving interface's own address). Tests set
+	// loopback so they never open a wildcard socket on a development
+	// machine, where that is a firewall prompt rather than a listener.
+	qcBind string
 
 	// liveProbers counts prober goroutines across every generation, which is
 	// precisely the number the orphaned-generation fault got wrong. It exists
@@ -310,9 +326,11 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.applySystemConfig(ctx)
 		e.seedActiveFromKernel(ctx)
 		e.startProbers(ctx)
+		e.startQueryCache(ctx)
 	}
 	e.reconfMu.Unlock()
 	defer e.stopProbers()
+	defer e.stopQueryCache()
 
 	decide := time.NewTicker(500 * time.Millisecond)
 	defer decide.Stop()
@@ -2093,6 +2111,10 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 		return err
 	}
 	e.stopProbers()
+	// The query cache goes down with them and comes back after them: its
+	// sockets are fixed ports, so the old generation must have let go before
+	// applySystemConfig loads redirect rules pointing at the new one's.
+	e.stopQueryCache()
 
 	// The swap is made under applyMu, briefly, for the same reason the backend's
 	// is: evaluate reads the runner under e.mu at its start and then shells out
@@ -2126,6 +2148,7 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 	e.notifier.SetConfig(cfg.Notify)
 	e.applySystemConfig(ctx)
 	e.startProbers(ctx)
+	e.startQueryCache(ctx)
 	e.refreshQuota(time.Now())
 	// A save changes selectPath's inputs as surely as the operator's other
 	// actions do - a path disabled, priorities reordered, a quota changed -
@@ -2251,6 +2274,7 @@ func (e *Engine) Status() model.Status {
 
 		Protect:         e.protectStatus(),
 		SharedEndpoints: e.sharedEndpoints,
+		QueryCache:      e.queryCacheStates(),
 		LinkerStates:    e.linkerStates(),
 		PreferredPath:   preferredPathID(e.cfg),
 		PublicAddress:   wan,
@@ -2333,8 +2357,11 @@ func (e *Engine) Revert(ctx context.Context) {
 	// The probers go too. Their routes and rules are removed below, so left
 	// running they would report every path down and fire the no-usable-path
 	// alarm about a state the operator just asked for. Reconfigure restarts
-	// them.
+	// them. The query cache follows for the same reason: its redirect rules
+	// go down with the ruleset below, and its refresher would go on sending
+	// query traffic down tunnels the revert is about to unroute.
 	e.stopProbers()
+	e.stopQueryCache()
 
 	runner := e.realRunner() // revert always acts, even in observe mode
 	sysx.RemoveRuleset(ctx, runner)

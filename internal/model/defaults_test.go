@@ -23,6 +23,9 @@ func TestNothingInTheShippedConfigurationIsLive(t *testing.T) {
 	if cfg.Frontend.BackendEgress {
 		t.Error("backend egress ships on, which would send the row below out the tunnel")
 	}
+	if cfg.QueryCache.Enabled {
+		t.Error("the query cache ships on, which would bind service ports and answer for servers nobody opted in")
+	}
 	for _, s := range cfg.Egress.Sources {
 		if s.Enabled {
 			t.Errorf("egress source %s (%s) ships enabled", s.Name, s.CIDR)

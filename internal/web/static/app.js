@@ -444,6 +444,38 @@ async function refreshStatus() {
   for (const l of states) linkers.append(linkerCard(l));
 
   renderProtect(st.protect);
+  renderQueryCache(st.query_cache);
+}
+
+// The cache's freshness is the whole reason it is reported: a cache serving
+// stale data looks exactly like a healthy server with the wrong map name, and
+// a port whose socket failed to bind is redirecting every query to nothing.
+function renderQueryCache(states) {
+  const section = document.getElementById('qcache-section');
+  const list = states || [];
+  section.classList.toggle('hidden', list.length === 0);
+  if (!list.length) return;
+
+  const body = document.getElementById('qcache-body');
+  body.textContent = '';
+  const age = (s) => (s < 0 ? 'never fetched' : s > 90 ? `${Math.round(s)}s (stale, not served)` : `${Math.round(s)}s`);
+  body.append(el('div', { class: 'table-wrap' }, el('table', {},
+    el('thead', {}, el('tr', {},
+      el('th', { text: 'Port' }), el('th', { text: 'Service' }),
+      el('th', { text: 'Answered' }), el('th', { text: 'Challenged' }), el('th', { text: 'Unanswered' }),
+      el('th', { text: 'Info age' }), el('th', { text: 'Players age' }))),
+    el('tbody', {}, list.map((q) => el('tr', {},
+      el('td', { text: q.port }),
+      el('td', { text: q.error ? `${q.service} - CANNOT BIND: ${q.error}` : q.service }),
+      el('td', { text: q.answered.toLocaleString() }),
+      el('td', { text: q.challenged.toLocaleString() }),
+      el('td', { text: q.unanswered.toLocaleString() }),
+      el('td', { text: age(q.info_age_sec) }),
+      el('td', { text: age(q.player_age_sec) })))))));
+  body.append(el('p', { class: 'hint', text: 'Answered is payloads served from cache; Challenged counts the challenge every new source gets first, so under a '
+    + 'spoofed flood it is the number climbing while Answered stays flat, which is the cache doing its job. Unanswered climbing with a high age means the '
+    + 'cache cannot reach the game server: the port answers nothing rather than advertising a server that may be gone. "Never fetched" on an idle port is '
+    + 'normal - the cache only polls a port while somebody is asking about it.' }));
 }
 
 // counterInfo turns a rule comment into a readable label and an explanation.
@@ -1736,6 +1768,23 @@ function renderSettings() {
     el('p', { class: 'hint', text: 'The counters reset whenever you save, because saving reloads the rules.' }),
   ));
   protect.refresh();
+
+  if (!c.query_cache) c.query_cache = {};
+  form.append(section('Source query cache',
+    el('p', { class: 'hint', text: 'Answers A2S_INFO and A2S_PLAYER queries at this frontend, from a cache refreshed off the real server every few seconds, '
+      + 'for every published UDP service ticked as Source engine. Queries stop crossing the tunnel, and every source is challenged before it is served, '
+      + 'exactly as a modern Source server does it, so a flood of spoofed addresses gets nothing but challenges no spoofed sender can answer.' }),
+    el('p', { class: 'hint', text: 'This is the protection the per-source limits cannot give: those key on source addresses being real. It works with every '
+      + 'limit above at zero, and with the limits on they simply apply first. In-game traffic, connection attempts and A2S_RULES are untouched and still '
+      + 'reach the real server.' }),
+    el('div', {}, checkbox('Enabled', c.query_cache.enabled, (v) => (c.query_cache.enabled = v),
+      'Armed mode only, like the DNAT rules the redirects ride beside. The refresh costs a small stream down the active tunnel, only while a port is '
+      + 'actually being queried; an idle port costs nothing. The dashboard shows each cached port with its counters and cache age: a cache that cannot '
+      + 'reach its server serves its last answer for about 90 seconds and then answers nothing, so a dead server drops out of browsers rather than '
+      + 'being advertised by its own cache.')),
+    el('p', { class: 'hint', text: 'Needs the Source engine tick on the service rows above; a row without it is not touched. If the cache is doing the '
+      + 'flood absorbing, the Source queries per second limit above can be set to 0, or left on to cap what the cache ever sees.' }),
+  ));
 
   const linkerBody = el('tbody', {});
   const linkerConfigs = el('div', {});

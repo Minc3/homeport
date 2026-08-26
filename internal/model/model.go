@@ -2,7 +2,10 @@
 // frontend and backend agents.
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Mode controls whether the frontend is allowed to touch the system.
 const (
@@ -63,6 +66,99 @@ type Config struct {
 	// Protect is edge filtering and rate limiting on the frontend. Off, with
 	// every threshold zero, on every site until somebody turns it on.
 	Protect ProtectConfig `json:"protect,omitempty"`
+
+	// QueryCache answers Source-engine A2S_INFO and A2S_PLAYER queries from
+	// the frontend itself. Off on every site until somebody turns it on, and
+	// an older config unmarshals to exactly this.
+	QueryCache QueryCacheConfig `json:"query_cache,omitempty"`
+}
+
+// QueryCacheConfig is the frontend's Source query cache: one switch, off by
+// default.
+//
+// With it on, every published UDP service ticked as Source engine has its
+// A2S_INFO and A2S_PLAYER queries answered at the frontend from a cache that
+// is refreshed from the real server every few seconds, instead of being
+// forwarded down a tunnel. The cache challenges every source before serving a
+// payload, exactly as a modern Source server does, and a challenge reply is
+// smaller than the query that provoked it, so the cache cannot be used as a
+// reflection amplifier and a spoofed-source query flood gets nothing but
+// challenges no spoofed sender can answer. That is the hole it exists to
+// close: the per-source limits key on source addresses being real, so a flood
+// that randomises them never trips a limit and lands on the service ceiling,
+// which drops legitimate browser queries along with the flood. The cache
+// keeps answering the legitimate clients through it, on a frontend whose
+// datacentre may only filter volumetric attacks.
+//
+// It is independent of ProtectConfig on purpose. A site can run the cache
+// with every per-source limit at zero and let it absorb floods, or run both,
+// in which case the limits drop first: the protect chains run before
+// destination NAT, where the cache's redirect lives. Armed mode only, like
+// the DNAT beside it - the redirect rules ride the same table, which observe
+// mode never loads, and the cache's refresh traffic rides the active tunnel,
+// which observe mode must not send anything down.
+type QueryCacheConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+// MaxQueryCachePorts bounds how many ports the cache will serve. Each port is
+// a bound socket and a refresh stream on the frontend, so the bound has to
+// exist, but it is far above any real deployment: the shipped Source row is
+// sixteen ports. Ports past the cap are neither cached nor redirected, so
+// their queries still reach the real server - the enumeration is the single
+// source of truth for both halves, which is what keeps a redirect from ever
+// pointing at a port no socket answers.
+const MaxQueryCachePorts = 128
+
+// QueryCacheSpan is a contiguous run of ports the cache serves for one
+// service, with the overlay address the cache refreshes from.
+type QueryCacheSpan struct {
+	From, To int
+	Target   string // overlay address of the host really answering
+	Service  string // the service row's name, for rule comments and the portal
+}
+
+// QueryCachePorts enumerates what the cache serves: every port of every
+// enabled UDP service ticked as Source engine, deduplicated, capped at
+// MaxQueryCachePorts. It is the one definition shared by the nftables
+// generator (which redirects exactly these ports) and the engine (which binds
+// a responder for exactly these ports); deriving either side separately is
+// how a query gets redirected to a port nothing answers. Mode is deliberately
+// not consulted here: the engine gates on it, and the generated ruleset is
+// only ever loaded when armed.
+func QueryCachePorts(cfg Config) []QueryCacheSpan {
+	if !cfg.QueryCache.Enabled {
+		return nil
+	}
+	budget := MaxQueryCachePorts
+	claimed := map[int]bool{}
+	var out []QueryCacheSpan
+	for _, s := range cfg.Services {
+		if !s.Enabled || !s.SourceEngine || !strings.EqualFold(s.Proto, "udp") {
+			continue
+		}
+		end := s.Port
+		if s.PortEnd > s.Port {
+			end = s.PortEnd
+		}
+		target := s.TargetOr(cfg.Overlay.BackendIP)
+		var span *QueryCacheSpan
+		for p := s.Port; p <= end && budget > 0; p++ {
+			if claimed[p] {
+				span = nil
+				continue
+			}
+			claimed[p] = true
+			budget--
+			if span != nil && span.To == p-1 {
+				span.To = p
+				continue
+			}
+			out = append(out, QueryCacheSpan{From: p, To: p, Target: target, Service: s.Name})
+			span = &out[len(out)-1]
+		}
+	}
+	return out
 }
 
 // ProtectConfig is the frontend's filtering of published traffic.
@@ -879,6 +975,12 @@ type Status struct {
 	// feature is switched on and its rules are really loaded.
 	Protect *ProtectStatus `json:"protect,omitempty"`
 
+	// QueryCache is one row per cached port. Absent unless the cache is
+	// running. Reported for the reason the protect counters are, doubled: a
+	// cache serving stale data looks exactly like a healthy server with the
+	// wrong map name, and only this says which is happening.
+	QueryCache []QueryCacheState `json:"query_cache,omitempty"`
+
 	// SharedEndpoints lists tunnels seen arriving from one public address,
 	// which means they are riding the same internet service. Empty is healthy
 	// and the normal case.
@@ -936,6 +1038,34 @@ type ProtectCounter struct {
 type BlockedSource struct {
 	Address    string `json:"address"`
 	ExpiresSec int    `json:"expires_sec"`
+}
+
+// QueryCacheState is the running state of one cached port.
+type QueryCacheState struct {
+	Port    int    `json:"port"`
+	Service string `json:"service"`
+	Target  string `json:"target"`
+
+	// Answered counts payloads served from cache; Challenged counts the
+	// challenge replies that every new source gets first, so under a spoofed
+	// flood this is the number climbing. Unanswered counts correctly
+	// challenged queries the cache had nothing fresh to serve - a steady
+	// climb here with the age high is the fingerprint of the upstream being
+	// unreachable.
+	Answered   uint64 `json:"answered"`
+	Challenged uint64 `json:"challenged"`
+	Unanswered uint64 `json:"unanswered"`
+
+	// InfoAgeSec and PlayerAgeSec are how old each cached reply is, -1 for
+	// never fetched. The cache stops serving a reply past its staleness
+	// bound, so a port can be listed here and still answer nothing.
+	InfoAgeSec   float64 `json:"info_age_sec"`
+	PlayerAgeSec float64 `json:"player_age_sec"`
+
+	// Error is a port whose socket could not be bound: something else on the
+	// frontend holds it, and every query to it is being redirected to nothing.
+	// Loud in the portal for that reason.
+	Error string `json:"error,omitempty"`
 }
 
 // GeoLockedPort is one port with its automatic region lock engaged, and the

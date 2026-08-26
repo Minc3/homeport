@@ -91,6 +91,14 @@
       <h2 class="section-head">Protection</h2>
       <div class="card" id="protect-body"></div>
     </div>
+
+    <!-- Absent unless the query cache is running. A cache serving stale data
+         looks exactly like a healthy server with the wrong map name, so its
+         freshness has to be somewhere a person can see it. -->
+    <div id="qcache-section" class="hidden">
+      <h2 class="section-head">Source query cache</h2>
+      <div class="card" id="qcache-body"></div>
+    </div>
   </section>
 
   <section id="tab-settings" class="hidden">
