@@ -2327,6 +2327,28 @@ ip route get 10.99.0.3 from 10.99.0.1 iif wg-main
 
 Answering with the tunnel rather than the LAN is the bug.
 
+**And the same trap bit a second time, through Docker, because the exception
+is by destination and DNAT rewrites destinations.** `EnsureOverlayLocalRule`
+is `to <subnet> lookup main`, which covers the case it was written for -
+overlay host talking to overlay host. A frontend-sourced packet to a
+*containerised* service is DNAT'd by Docker in prerouting, so by the time
+the rules run its destination is a bridge address, the to-subnet exception
+no longer matches, and `from <subnet> lookup 100` bounces it back down the
+tunnel it arrived from. Players never notice, because a client's public
+source never matches the return rule: the one flow affected is
+frontend-sourced traffic to a DNAT'd port, which in practice is the query
+cache's refresh. The fingerprint, seen live on this deployment: the cache's
+Problem column showing `i/o timeout` against ports players are happily
+connected to, and `connection refused` for the host-delivered ports beside
+them - refused proves the non-DNAT'd path works end to end, which is what
+narrows it to the container path. `sysx.EnsureFrontendLocalRule` is the fix,
+`from <frontend overlay IP> lookup main` at `FrontendLocalRulePref`
+immediately ahead of the overlay-local rule: the source is the one thing
+DNAT cannot have rewritten yet, and any packet the backend sees with the
+frontend's own source arrived *from* the frontend, so routing it by a table
+whose default leads back there is a bounce by definition. Gated on the
+subnet exactly as the overlay-local rule is.
+
 **An overlay address must exist on exactly one host, and a revert deliberately
 leaves it behind.** Swapping two hosts' roles - the box that was the linker
 becoming the backend, the old backend becoming the linker - leaves each one

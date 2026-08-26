@@ -1220,3 +1220,70 @@ func RemoveOverlayLocalRule(ctx context.Context, r Runner, subnet string) {
 	_, _ = r.Run(ctx, "ip", "rule", "del", "to", subnet, "lookup", "main",
 		"pref", strconv.Itoa(OverlayLocalRulePref))
 }
+
+// FrontendLocalRulePref is the priority of the rule that keeps
+// frontend-sourced traffic in the main table. Immediately ahead of the
+// overlay-local rule, whose gap it closes.
+const FrontendLocalRulePref = OverlayLocalRulePref - 1
+
+// EnsureFrontendLocalRule keeps traffic *from* the frontend out of the return
+// table, wherever it is addressed.
+//
+// This is the overlay-local rule's trap arriving a second way. That rule is
+// an exception by *destination* - `to <subnet> lookup main` - which covers
+// the case it was written for, the frontend talking to overlay hosts. What
+// it cannot cover is a frontend-sourced packet whose destination has stopped
+// being an overlay address before routing happens: a packet to a
+// containerised service is DNAT'd by Docker in prerouting, so by the time
+// the rules are consulted its destination is a bridge address, the to-subnet
+// exception no longer matches, and `from <subnet> lookup 100` routes it by a
+// table whose default points straight back down the tunnel it arrived from.
+//
+// Nothing reports it, and published traffic is unaffected: a client's source
+// is public and never matches the return rule, so every player reaches the
+// same container normally. Only frontend-sourced traffic to a DNAT'd service
+// is bounced - which in practice is the query cache's refresh, arriving from
+// 10.99.0.1 and answered with silence while the portal shows every path
+// healthy. The fingerprint from the frontend is an i/o timeout against a
+// port players are happily connected to.
+//
+// The fix is by source, because the source is the one thing DNAT cannot have
+// rewritten yet: any packet this host sees with the frontend's own address
+// arrived *from* the frontend, and routing it by a table whose default leads
+// back to the frontend is a bounce by definition. Main already knows every
+// answer: containers are bridge routes, linkers are host routes, this host's
+// own addresses are local.
+//
+// Gated exactly as the overlay-local rule is: without a subnet the return
+// rule names only this host's address, cannot match the frontend, and a site
+// with no linkers generates exactly what it always did.
+func EnsureFrontendLocalRule(ctx context.Context, r Runner, frontendIP, subnet string) error {
+	if subnet == "" || frontendIP == "" {
+		return nil
+	}
+	existing, err := listRules(ctx, r)
+	if err != nil {
+		return err
+	}
+	want := strconv.Itoa(FrontendLocalRulePref)
+	for _, line := range strings.Split(existing, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		for i, tok := range f {
+			if tok == "from" && i+1 < len(f) && f[i+1] == frontendIP &&
+				strings.HasPrefix(line, want+":") {
+				return nil
+			}
+		}
+	}
+	_, err = r.Run(ctx, "ip", "rule", "add", "from", frontendIP, "lookup", "main", "pref", want)
+	return err
+}
+
+// RemoveFrontendLocalRule withdraws it.
+func RemoveFrontendLocalRule(ctx context.Context, r Runner, frontendIP, subnet string) {
+	if subnet == "" || frontendIP == "" {
+		return
+	}
+	_, _ = r.Run(ctx, "ip", "rule", "del", "from", frontendIP, "lookup", "main",
+		"pref", strconv.Itoa(FrontendLocalRulePref))
+}

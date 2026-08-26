@@ -153,6 +153,36 @@ func TestTheOverlayLocalRuleOutranksTheReturnRules(t *testing.T) {
 	}
 }
 
+// The overlay-local exception is by destination, and a destination stops
+// being an overlay address the moment Docker DNATs it to a container. A
+// frontend-sourced packet to a containerised service is then routed by
+// `from <subnet> lookup 100` straight back down the tunnel it arrived from,
+// while every player reaches the same container normally, because a client's
+// public source never matches the return rule. In practice the bounced
+// traffic is the query cache's refresh: an i/o timeout from the frontend
+// against a port players are happily connected to, with every path healthy.
+// The exception by source is what closes it, because the source is the one
+// thing DNAT cannot have rewritten yet.
+func TestFrontendSourcedTrafficIsKeptOutOfTheReturnTable(t *testing.T) {
+	a, q := agentForReconcile(t, backendKernel())
+	cfg := a.cfg
+	cfg.Overlay.Subnet = "10.99.0.0/24"
+
+	a.applyPlumbing(context.Background(), cfg)
+
+	if q.wrote("ip rule add from 10.99.0.1 lookup main") != 1 {
+		t.Errorf("the frontend-source exception was not installed; writes were %v", q.writes())
+	}
+}
+
+// Same ranking requirement as the overlay-local rule, for the same reason.
+func TestTheFrontendLocalRuleOutranksTheReturnRules(t *testing.T) {
+	if sysx.FrontendLocalRulePref >= sysx.ReturnRulePrefBase {
+		t.Fatalf("frontend-local rule at %d does not outrank the return rules at %d",
+			sysx.FrontendLocalRulePref, sysx.ReturnRulePrefBase)
+	}
+}
+
 // Without a subnet the return rule names a single address and cannot match the
 // frontend, so there is nothing to except - and a site with no linkers must
 // generate exactly what it always did.

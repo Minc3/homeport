@@ -287,6 +287,16 @@ func (a *Agent) applyPlumbing(ctx context.Context, cfg proto.BackendConfig) {
 		a.log.Warn("overlay-local rule not installed; a linker's control channel cannot complete", "err", err)
 	}
 
+	// ...and the same exception by source, because the one above is by
+	// destination and a destination stops being an overlay address the moment
+	// Docker DNATs it to a container. A frontend-sourced packet to a
+	// containerised service then matches the return rule and is routed
+	// straight back down the tunnel - the query cache's refresh times out
+	// against a port players are happily connected to.
+	if err := sysx.EnsureFrontendLocalRule(ctx, real, cfg.Overlay.FrontendIP, cfg.Overlay.Subnet); err != nil {
+		a.log.Warn("frontend-local rule not installed; frontend-sourced queries to containers will be bounced", "err", err)
+	}
+
 	// Extra hosts behind this one. The frontend routes the whole overlay range
 	// down the active tunnel, so a packet for a linker arrives here addressed
 	// to a machine that is not this one and has to be forwarded - and an
@@ -1118,6 +1128,7 @@ func (a *Agent) Revert(ctx context.Context) {
 	// always, and the overlay range wherever a subnet is configured.
 	sysx.RemoveReturnRoutes(ctx, r, cfg.Overlay.BackendIP, cfg.Overlay.Subnet)
 	sysx.RemoveOverlayLocalRule(ctx, r, cfg.Overlay.Subnet)
+	sysx.RemoveFrontendLocalRule(ctx, r, cfg.Overlay.FrontendIP, cfg.Overlay.Subnet)
 	sysx.RemoveProbeRoutes(ctx, r, paths, cfg.Overlay.FrontendIP+"/32", cfg.Overlay.FrontendIP+"/32")
 
 	a.log.Warn("reverted all system changes on the backend",

@@ -49,6 +49,7 @@ func TestBackendRevertRemovesWhatTheAgentInstalled(t *testing.T) {
 		"ip rule del from 10.99.0.0/24 lookup 100 pref 32501",
 		"ip rule del fwmark 0x200 lookup 100 pref 29998",
 		"ip rule del to 10.99.0.0/24 lookup main",
+		"ip rule del from 10.99.0.1 lookup main",
 		"ip route del default table 100",
 		// The per-path plumbing, and the main-table route to the frontend.
 		"ip rule del fwmark 0x101 lookup 101 pref 30001",
