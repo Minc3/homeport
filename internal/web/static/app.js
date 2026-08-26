@@ -875,6 +875,59 @@ function num(label, value, onInput, opts = {}) {
   return field(label, value, onInput, { ...opts, type: 'number' });
 }
 
+// presetPicker is the dropdown mechanism the two preset families share: a
+// select listing the presets plus a Custom sentinel, the note under it, the
+// strict match of the config's numbers against each preset, and the change
+// handler that fills them in. One copy, because the first two were written
+// twice and diverged inside a single commit: the per-source copy needed the
+// absent-field coercion below and the detection copy never did, so a fix
+// landing in one had nothing to make it land in the other. What genuinely
+// differs between families rides the hooks: onRefresh runs after every
+// refresh (detection recomputes its detection-time line), onApply runs after
+// a chosen preset's numbers land (detection lifts a standby interval the new
+// active one would overtake).
+//
+// The match coerces an absent field to the 0 it means, rather than writing 0
+// into the config up front. The five per-source limits are omitempty in Go,
+// so a config that never set one omits it entirely; pre-normalising made Off
+// match but also made every untouched box render a literal 0, which buried
+// the placeholder saying what zero means ("0 = off", "0 = never block") - the
+// only in-form statement of that semantics. Coercing in the comparison keeps
+// the box empty, the placeholder visible, and Off still reads as Off.
+function presetPicker(list, keys, target, customNote, hooks = {}) {
+  const inputs = {};
+  const sel = el('select', {});
+  for (const d of list) sel.append(el('option', { value: d.name, text: d.label }));
+  sel.append(el('option', { value: 'custom', text: 'Custom' }));
+  const note = el('p', { class: 'hint' });
+  const refresh = () => {
+    const m = list.find((d) => keys.every((k) => d[k] === (target[k] ?? 0)));
+    sel.value = m ? m.name : 'custom';
+    note.textContent = m ? m.note : customNote;
+    if (hooks.onRefresh) hooks.onRefresh();
+  };
+  sel.addEventListener('change', () => {
+    const d = list.find((x) => x.name === sel.value);
+    if (!d) { refresh(); return; }
+    for (const k of keys) {
+      target[k] = d[k];
+      inputs[k].value = d[k];
+    }
+    if (hooks.onApply) hooks.onApply(d);
+    refresh();
+  });
+  // field builds one number input owned by the family: the setter stays at the
+  // call site so the assignment is visible to the scan in
+  // portal_numeric_test.go, and the input is registered under its key here so
+  // the key cannot drift from the box the change handler fills.
+  const field = (key, label, value, set, opts) => {
+    const f = num(label, value, (v) => { set(v); refresh(); }, opts);
+    inputs[key] = f.querySelector('input');
+    return f;
+  };
+  return { sel, note, inputs, refresh, field };
+}
+
 function section(title, ...children) {
   return el('fieldset', {}, el('legend', { text: title }), ...children);
 }
@@ -1317,64 +1370,48 @@ function renderSettings() {
   // match, the fill of the config and the fill of the inputs, so a field
   // added to a preset is added here once.
   const PRESET_KEYS = ['active_interval_ms', 'timeout_ms', 'fail_threshold', 'window_size'];
-  const probeInputs = {};
-  const presetSel = el('select', {});
-  for (const d of presets) presetSel.append(el('option', { value: d.name, text: d.label }));
-  presetSel.append(el('option', { value: 'custom', text: 'Custom' }));
-  const presetNote = el('p', { class: 'hint' });
   const detectLine = el('p', { class: 'hint' });
-  const matchingPreset = () => presets.find((d) => PRESET_KEYS.every((k) => d[k] === c.probe[k]));
-  const refreshDetection = () => {
-    const m = matchingPreset();
-    presetSel.value = m ? m.name : 'custom';
-    presetNote.textContent = m ? m.note
-      : 'Custom numbers. Faster detection is bought with false failovers on any link that drops bursts of packets, and each one of those '
-        + 'parks players on a metered path until the failback hold-down clears. Keep the timeout above the worst round trip on the slowest link.';
-    // Mirrors ProbeConfig.DetectMs in Go, and blanks rather than quoting a
-    // figure for numbers that cannot be saved.
-    //
-    // It reads the boxes rather than the model to decide that. It used to rely
-    // on a blank box reaching the model as NaN, which is what parseFloat gave
-    // it; a cleared box now coerces to 0, deliberately and for reasons that
-    // have nothing to do with this line, so that test became unreachable and
-    // the hint started quoting "condemned in about 0.8s" for a form validate
-    // refuses. The isFinite guard stays for a value that is not blank and not a
-    // number.
-    const p = c.probe;
-    const blank = Object.values(probeInputs).some((i) => i && i.value.trim() === '');
-    const ms = (Math.max(p.fail_threshold, 1) - 1) * p.active_interval_ms + p.timeout_ms;
-    detectLine.textContent = !blank && Number.isFinite(ms)
-      ? `With these numbers a dead active path is condemned in about ${Math.round(ms / 100) / 10}s. Players feel a freeze of roughly that long, `
-        + 'plus a moment for the switch, and a link that goes quiet for that long without being dead moves traffic too.'
-      : '';
-  };
-  presetSel.addEventListener('change', () => {
-    const d = presets.find((x) => x.name === presetSel.value);
-    if (!d) { refreshDetection(); return; }
-    for (const k of PRESET_KEYS) {
-      c.probe[k] = d[k];
-      probeInputs[k].value = d[k];
-    }
-    // Validation refuses a standby cadence faster than the active one, and a
-    // preset the portal offers must never produce a form it then refuses.
-    if (!(c.probe.standby_interval_ms >= d.active_interval_ms)) {
-      c.probe.standby_interval_ms = d.active_interval_ms;
-      probeInputs.standby_interval_ms.value = d.active_interval_ms;
-    }
-    refreshDetection();
-  });
-  const probeField = (key, label, value, set, opts) => {
-    const f = num(label, value, (v) => { set(v); refreshDetection(); }, opts);
-    probeInputs[key] = f.querySelector('input');
-    return f;
-  };
+  const detection = presetPicker(presets, PRESET_KEYS, c.probe,
+    'Custom numbers. Faster detection is bought with false failovers on any link that drops bursts of packets, and each one of those '
+      + 'parks players on a metered path until the failback hold-down clears. Keep the timeout above the worst round trip on the slowest link.',
+    {
+      onRefresh: () => {
+        // Mirrors ProbeConfig.DetectMs in Go, and blanks rather than quoting a
+        // figure for numbers that cannot be saved.
+        //
+        // It reads the boxes rather than the model to decide that. It used to
+        // rely on a blank box reaching the model as NaN, which is what
+        // parseFloat gave it; a cleared box now coerces to 0, deliberately and
+        // for reasons that have nothing to do with this line, so that test
+        // became unreachable and the hint started quoting "condemned in about
+        // 0.8s" for a form validate refuses. The isFinite guard stays for a
+        // value that is not blank and not a number.
+        const p = c.probe;
+        const blank = Object.values(probeInputs).some((i) => i && i.value.trim() === '');
+        const ms = (Math.max(p.fail_threshold, 1) - 1) * p.active_interval_ms + p.timeout_ms;
+        detectLine.textContent = !blank && Number.isFinite(ms)
+          ? `With these numbers a dead active path is condemned in about ${Math.round(ms / 100) / 10}s. Players feel a freeze of roughly that long, `
+            + 'plus a moment for the switch, and a link that goes quiet for that long without being dead moves traffic too.'
+          : '';
+      },
+      // Validation refuses a standby cadence faster than the active one, and a
+      // preset the portal offers must never produce a form it then refuses.
+      onApply: (d) => {
+        if (!(c.probe.standby_interval_ms >= d.active_interval_ms)) {
+          c.probe.standby_interval_ms = d.active_interval_ms;
+          probeInputs.standby_interval_ms.value = d.active_interval_ms;
+        }
+      },
+    });
+  const probeInputs = detection.inputs;
+  const probeField = detection.field;
 
   form.append(section('Probing',
     el('label', { class: 'field' }, caption('Detection speed',
       'How quickly a failing active path is given up on. Standard is the shipped tuning. Fast makes a failover a brief stutter at the cost of '
       + 'the occasional failover nothing was wrong for. Relaxed is for links that drop bursts of packets or spike in latency, and would otherwise '
-      + 'be condemned and recover on their own. Choosing one fills in the four numbers below; editing any of them shows Custom.'), presetSel),
-    presetNote,
+      + 'be condemned and recover on their own. Choosing one fills in the four numbers below; editing any of them shows Custom.'), detection.sel),
+    detection.note,
     detectLine,
     el('div', { class: 'grid' },
       probeField('active_interval_ms', 'Active interval (ms)', c.probe.active_interval_ms, (v) => (c.probe.active_interval_ms = v), {
@@ -1427,7 +1464,7 @@ function renderSettings() {
     ),
     el('p', { class: 'hint', text: 'Standby paths are probed slower because they only need to be known-good, and on metered LTE that difference is most of the monthly probe cost.' }),
   ));
-  refreshDetection();
+  detection.refresh();
 
   form.append(section('Failover',
     el('div', { class: 'grid' },
@@ -1591,66 +1628,15 @@ function renderSettings() {
   // choosing one fills the five numbers below, the stored configuration
   // carries only the numbers, and editing any of them shows Custom. The Off
   // preset is all zeros, which is also the shipped state, so a fresh install
-  // reads Off rather than Custom.
+  // reads Off rather than Custom: the five limits are omitempty in Go, so an
+  // untouched config omits them, and presetPicker's match reads an absent one
+  // as the 0 it means while the box stays empty with its placeholder showing.
   const PROTECT_KEYS = ['new_conns_per_sec', 'max_conns_per_source', 'packets_per_sec', 'queries_per_sec', 'block_seconds'];
-  // The match compares these against preset numbers, and a config that has
-  // never set one omits the field entirely, so normalise undefined to the 0
-  // it means before anything reads it.
-  for (const k of PROTECT_KEYS) pr[k] = pr[k] || 0;
-  const protectInputs = {};
-  const protectSel = el('select', {});
-  for (const d of protectPresets) protectSel.append(el('option', { value: d.name, text: d.label }));
-  protectSel.append(el('option', { value: 'custom', text: 'Custom' }));
-  const protectPresetNote = el('p', { class: 'hint' });
-  const matchingProtectPreset = () => protectPresets.find((d) => PROTECT_KEYS.every((k) => d[k] === pr[k]));
-  const refreshProtectPreset = () => {
-    const m = matchingProtectPreset();
-    protectSel.value = m ? m.name : 'custom';
-    protectPresetNote.textContent = m ? m.note
-      : 'Custom numbers. Keep each one well clear of what the dashboard counters show in normal use: several players or '
-        + 'browsers routinely share one address behind a carrier or office NAT, and a limit that is right for one client '
-        + 'is far too tight for all of them together.';
-  };
-  protectSel.addEventListener('change', () => {
-    const d = protectPresets.find((x) => x.name === protectSel.value);
-    if (!d) { refreshProtectPreset(); return; }
-    for (const k of PROTECT_KEYS) {
-      pr[k] = d[k];
-      protectInputs[k].value = d[k];
-    }
-    refreshProtectPreset();
-  });
-  const fNewConns = num('New connections per second', pr.new_conns_per_sec, (v) => { pr.new_conns_per_sec = v || 0; refreshProtectPreset(); }, {
-    min: 0, placeholder: '0 = off',
-    help: 'TCP connection attempts from one address, per second. Established connections are never touched, so this only affects how fast a client may open new ones. '
-      + 'A browser opens a handful per page; 20 is generous. Stops connection floods and a stuck client reconnecting in a loop.',
-  });
-  protectInputs.new_conns_per_sec = fNewConns.querySelector('input');
-  const fMaxConns = num('Concurrent connections per source', pr.max_conns_per_source, (v) => { pr.max_conns_per_source = v || 0; refreshProtectPreset(); }, {
-    min: 0, placeholder: '0 = off',
-    help: 'How many tracked TCP connections one address may hold open at once. Shared connections behind one office or carrier NAT can be surprisingly many, '
-      + 'so keep it well clear of what you see in normal use: 50 to 100 for a web service.',
-  });
-  protectInputs.max_conns_per_source = fMaxConns.querySelector('input');
-  const fPPS = num('UDP packets per second per source', pr.packets_per_sec, (v) => { pr.packets_per_sec = v || 0; refreshProtectPreset(); }, {
-    min: 0, placeholder: '0 = off',
-    help: 'Packets per second from one address to a published UDP port. A player in a game sends tens per second, so this wants to be generous: 400 is far above normal play '
-      + 'and still stops a single source saturating the tunnel. This is the one that protects against one client hurting everyone else.',
-  });
-  protectInputs.packets_per_sec = fPPS.querySelector('input');
-  const fQPS = num('Source-engine queries per second per source', pr.queries_per_sec, (v) => { pr.queries_per_sec = v || 0; refreshProtectPreset(); }, {
-    min: 0, placeholder: '0 = off',
-    help: 'Applies only to services ticked as Source engine, and only to their connectionless packets, the A2S queries and connection attempts. '
-      + 'Players already in the game are unaffected, which is what makes a tight number safe here: 2 or 3 per second is ample, and this is the usual flood vector for a Source server.',
-  });
-  protectInputs.queries_per_sec = fQPS.querySelector('input');
-  const fBlock = num('Block a tripping source for (s)', pr.block_seconds, (v) => { pr.block_seconds = v || 0; refreshProtectPreset(); }, {
-    min: 0, placeholder: '0 = never block',
-    help: 'When a source trips any limit above, park it for this long: everything from that address is dropped on sight until it expires, cheaply, before conntrack. '
-      + '0 drops only the excess and never parks anybody, which is gentler and much less effective. 600 is a reasonable start. Parked addresses are listed on the dashboard.',
-  });
-  protectInputs.block_seconds = fBlock.querySelector('input');
-  refreshProtectPreset();
+  const protect = presetPicker(protectPresets, PROTECT_KEYS, pr,
+    'Custom numbers. Keep each one well clear of what the dashboard counters show in normal use: several players or '
+      + 'browsers routinely share one address behind a carrier or office NAT, and a limit that is right for one client '
+      + 'is far too tight for all of them together.');
+  const protectField = protect.field;
 
   form.append(section('Protection (rate limiting and edge filtering)',
     // Stated before the switches, not after them. Everything in this section
@@ -1680,9 +1666,35 @@ function renderSettings() {
     el('p', { class: 'hint', text: 'Each of these applies to one client address at a time, and each does nothing at zero. They are counted against the ports of your enabled published services, nothing else.' }),
     el('label', { class: 'field' }, caption('Per-source preset',
       'Starting points sized from what real clients send: a browser holds at most 6 connections to one host, a Source player sends 30 to 66 packets a second, '
-      + 'and a carrier NAT can put dozens of subscribers behind one address. Choosing one fills in the five numbers below; editing any of them shows Custom.'), protectSel),
-    protectPresetNote,
-    el('div', { class: 'grid' }, fNewConns, fMaxConns, fPPS, fQPS, fBlock),
+      + 'and a carrier NAT can put dozens of subscribers behind one address. Choosing one fills in the five numbers below; editing any of them shows Custom.'), protect.sel),
+    protect.note,
+    el('div', { class: 'grid' },
+      protectField('new_conns_per_sec', 'New connections per second', pr.new_conns_per_sec, (v) => (pr.new_conns_per_sec = v), {
+        min: 0, placeholder: '0 = off',
+        help: 'TCP connection attempts from one address, per second. Established connections are never touched, so this only affects how fast a client may open new ones. '
+          + 'A browser opens a handful per page; 20 is generous. Stops connection floods and a stuck client reconnecting in a loop.',
+      }),
+      protectField('max_conns_per_source', 'Concurrent connections per source', pr.max_conns_per_source, (v) => (pr.max_conns_per_source = v), {
+        min: 0, placeholder: '0 = off',
+        help: 'How many tracked TCP connections one address may hold open at once. Shared connections behind one office or carrier NAT can be surprisingly many, '
+          + 'so keep it well clear of what you see in normal use: 50 to 100 for a web service.',
+      }),
+      protectField('packets_per_sec', 'UDP packets per second per source', pr.packets_per_sec, (v) => (pr.packets_per_sec = v), {
+        min: 0, placeholder: '0 = off',
+        help: 'Packets per second from one address to a published UDP port. A player in a game sends tens per second, so this wants to be generous: 400 is far above normal play '
+          + 'and still stops a single source saturating the tunnel. This is the one that protects against one client hurting everyone else.',
+      }),
+      protectField('queries_per_sec', 'Source-engine queries per second per source', pr.queries_per_sec, (v) => (pr.queries_per_sec = v), {
+        min: 0, placeholder: '0 = off',
+        help: 'Applies only to services ticked as Source engine, and only to their connectionless packets, the A2S queries and connection attempts. '
+          + 'Players already in the game are unaffected, which is what makes a tight number safe here: 2 or 3 per second is ample, and this is the usual flood vector for a Source server.',
+      }),
+      protectField('block_seconds', 'Block a tripping source for (s)', pr.block_seconds, (v) => (pr.block_seconds = v), {
+        min: 0, placeholder: '0 = never block',
+        help: 'When a source trips any limit above, park it for this long: everything from that address is dropped on sight until it expires, cheaply, before conntrack. '
+          + '0 drops only the excess and never parks anybody, which is gentler and much less effective. 600 is a reasonable start. Parked addresses are listed on the dashboard.',
+      }),
+    ),
 
     el('h3', { class: 'sub-head', text: 'Edge filtering' }),
     el('p', { class: 'hint', text: 'No thresholds to get wrong, and no legitimate client sends any of what these drop. Reasonable to turn on together.' }),
@@ -1723,6 +1735,7 @@ function renderSettings() {
     ),
     el('p', { class: 'hint', text: 'The counters reset whenever you save, because saving reloads the rules.' }),
   ));
+  protect.refresh();
 
   const linkerBody = el('tbody', {});
   const linkerConfigs = el('div', {});
@@ -1948,14 +1961,21 @@ function renderSettings() {
 
 async function loadSettings() {
   try {
+    // A missing preset list is not fatal, but it must not be silent: the
+    // dropdown would otherwise offer only Custom under a caption that
+    // promises choices, and show the shipped numbers as Custom. The failures
+    // are collected into one toast rather than raised from each catch,
+    // because toast() replaces whatever is showing: both lists fail together
+    // in the realistic case (the same network blip takes both requests), and
+    // two toasts racing would leave whichever ran second on screen with the
+    // other failure unreported.
+    const missing = [];
     [config, presets, protectPresets] = await Promise.all([
       api('/api/config'),
-      // A missing preset list is not fatal, but it must not be silent: the
-      // dropdown would otherwise offer only Custom under a caption that
-      // promises three choices, and show the shipped numbers as Custom.
-      api('/api/presets').catch((e) => { toast(`Detection presets unavailable: ${e.message}`, true); return []; }),
-      api('/api/protect-presets').catch((e) => { toast(`Per-source presets unavailable: ${e.message}`, true); return []; }),
+      api('/api/presets').catch((e) => { missing.push(`detection: ${e.message}`); return []; }),
+      api('/api/protect-presets').catch((e) => { missing.push(`per-source: ${e.message}`); return []; }),
     ]);
+    if (missing.length) toast(`Preset lists unavailable (${missing.join('; ')}); their dropdowns offer only Custom`, true);
     renderSettings();
     markSaved();
     // The form events keep it live from here; this covers a config loaded

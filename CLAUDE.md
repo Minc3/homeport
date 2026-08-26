@@ -2738,8 +2738,10 @@ where a subtle regression would be invisible in production until an outage:
   are built through a wrapper whose own `num(` call carries neither the binding
   nor the options; renaming the helper made it scan zero calls and still report
   ok; and balancing parens without regard for string literals meant one
-  unbalanced paren in a label would swallow the calls after it. It scans both
-  names now, counts what it found, and requires every fractional field to have
+  unbalanced paren in a label would swallow the calls after it. It scans every
+  name now (`num(`, and the `probeField(` and `protectField(` aliases of
+  `presetPicker`'s field wrapper - a new alias must be added to its list),
+  counts what it found, and requires every fractional field to have
   been matched by something, and `engine/usage_bounds_test.go` drives `clampStamp`
   from both directions including the two overflowing extremes, which is the case
   the `time.Time` shape gets backwards. The definition guard is `function num(` exactly, for
@@ -2858,12 +2860,17 @@ where a subtle regression would be invisible in production until an outage:
   interval the new active one would overtake and leaves a slower one alone,
   and `DetectMs` counts the streak plus the last timeout.
 - `model/protect_presets_test.go`: the Off preset is the shipped all-zero
-  state, so a fresh install reads Off rather than Custom and choosing Off
-  really disables every limit; the presets after Off are ordered tightest to
-  most generous in every limit while block seconds runs the other way, since
-  the generous preset is for shared addresses where one park is every
-  household behind the NAT; and `Apply` touches only the five limits, never
-  the master switch, the edge filtering or the regions.
+  state, so a fresh install reads Off rather than Custom, and choosing Off
+  really disables every limit - pinned by applying Off to a config with every
+  limit set, because applied to one already at zero an Apply that skipped a
+  field passed unnoticed, and nothing in production calls Apply at all; the
+  presets after Off are ordered tightest to most generous in every limit,
+  none of them holds a zero, since zero is a limit turned off and that is the
+  Off preset's job, and block seconds never grows down the list while the
+  most generous preset parks for the shortest time, since it is for shared
+  addresses where one park is every household behind the NAT; and `Apply`
+  touches only the five limits, never the master switch, the edge filtering
+  or the regions.
 - `web/validate_test.go` also runs every preset through `validate`, on the
   shipped configuration and on one with a short standby interval, because a
   copy of the bounds would keep passing after the real rule moved. The

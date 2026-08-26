@@ -9,18 +9,22 @@ import (
 // fresh install's protection section then reads "Off" rather than "Custom",
 // which matters because all-zero is the state nobody chose and the dropdown
 // must say so, and choosing Off must actually turn every limit off rather
-// than leaving one behind.
+// than leaving one behind. That last half is why Off is applied to a config
+// with every limit set, not to the shipped one: applied to a config already
+// at zero, an Apply that skipped a field passed unnoticed, and Apply is
+// called from nothing but these tests, so they are the only thing pinning it.
 func TestOffPresetIsTheShippedProtectState(t *testing.T) {
 	off := protectPresetByName(t, ProtectPresetOff)
-	want := Defaults().Protect
-	got := want
+	got := Defaults().Protect
+	got.NewConnsPerSec, got.MaxConnsPerSource = 20, 60
+	got.PacketsPerSec, got.QueriesPerSec, got.BlockSeconds = 400, 3, 600
 	off.Apply(&got)
 	if got.NewConnsPerSec != 0 || got.MaxConnsPerSource != 0 || got.PacketsPerSec != 0 ||
 		got.QueriesPerSec != 0 || got.BlockSeconds != 0 {
 		t.Errorf("Off preset leaves a limit set: %+v", got)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("Off preset applied to the shipped config changes it: %+v, want %+v", got, want)
+	if want := Defaults().Protect; !reflect.DeepEqual(got, want) {
+		t.Errorf("Off preset does not restore the shipped config: %+v, want %+v", got, want)
 	}
 }
 
@@ -54,6 +58,30 @@ func TestProtectPresetsAreOrderedTightestFirstAfterOff(t *testing.T) {
 			t.Errorf("preset %s parks for %ds, longer than %s's %ds; the generous preset must park "+
 				"for less, not more, because a parked shared address is every household behind it",
 				cur.Name, cur.BlockSeconds, prev.Name, prev.BlockSeconds)
+		}
+	}
+
+	// And no preset after Off may hold a zero. Zero is how a limit is turned
+	// off, the most permissive value there is, so a zero inside a named
+	// preset ships it with one protection silently disabled: turning a limit
+	// off is the Off preset's job. The consecutive comparison above cannot
+	// catch this, because the first preset after Off is compared against
+	// nothing on its left.
+	for _, p := range presets[1:] {
+		for _, v := range []struct {
+			what string
+			n    int
+		}{
+			{"new connections per second", p.NewConnsPerSec},
+			{"concurrent connections", p.MaxConnsPerSource},
+			{"packets per second", p.PacketsPerSec},
+			{"queries per second", p.QueriesPerSec},
+			{"block seconds", p.BlockSeconds},
+		} {
+			if v.n <= 0 {
+				t.Errorf("preset %s has %s = %d; zero means that limit is off, and turning a limit "+
+					"off is the Off preset's job", p.Name, v.what, v.n)
+			}
 		}
 	}
 }

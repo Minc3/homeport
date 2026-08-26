@@ -136,13 +136,16 @@ func floatTags(rt reflect.Type, seen map[reflect.Type]bool) []string {
 // balanced, so an options object on a later line belongs to the call it was
 // written under.
 //
-// Two names, not one. `num(` is the helper, and `probeField(` is a wrapper
-// around it: the wrapper's own num( call carries a variable for its options and
-// a setter closure rather than an assignment, so scanning only num( sees the
-// wrapper once and the five probe inputs never - which is exactly what happened,
-// and adding float: true to the window_size input left this test green.
+// Three names, not one. `num(` is the helper, and `probeField(` and
+// `protectField(` are the two aliases of presetPicker's field wrapper around
+// it: the wrapper's own num( call carries a variable for its options and a
+// setter closure rather than an assignment, so scanning only num( sees the
+// wrapper once and the wrapped inputs never - which is exactly what happened
+// with the five probe inputs, and adding float: true to the window_size input
+// left this test green. A new alias of that wrapper must be added here, or
+// every input built through it is silently outside the scan.
 //
-// The definitions of both are skipped by name. The previous version claimed to
+// The definition of num is skipped by name. The previous version claimed to
 // skip `function num(` and did not, because the character before it is a space:
 // the guard only rejected identifiers *ending* in num, such as enum(. It was
 // harmless because the definition line contains neither a binding nor the
@@ -150,7 +153,7 @@ func floatTags(rt reflect.Type, seen map[reflect.Type]bool) []string {
 // one.
 func numCalls(src string) []string {
 	var out []string
-	for _, name := range []string{"num(", "probeField("} {
+	for _, name := range []string{"num(", "probeField(", "protectField("} {
 		for i := 0; ; {
 			j := strings.Index(src[i:], name)
 			if j < 0 {
@@ -184,8 +187,10 @@ func numCalls(src string) []string {
 // forty characters ahead of it. A scanner that quietly drops call sites is the
 // failure this whole test exists to prevent, arrived at from the inside.
 //
-// probeField needs no case: its declaration is `const probeField = (`, which
-// contains no `probeField(` token at all.
+// probeField and protectField need no case: their declarations are
+// `const probeField = detection.field;` and `const protectField =
+// protect.field;`, which contain no `probeField(` or `protectField(` token at
+// all.
 func isDefinition(src string, i int) bool {
 	const kw = "function "
 	return i >= len(kw) && src[i-len(kw):i] == kw
