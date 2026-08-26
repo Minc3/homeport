@@ -474,16 +474,17 @@ func TestEveryProtectPresetSurvivesValidate(t *testing.T) {
 }
 
 // The query cache's refresh interval: zero is the shipped default and must
-// keep saving, the ceiling is what keeps the cache inside its 90s staleness
-// bound (past it a healthy site's server drops out of browsers), and a
-// negative is refused like every other duration here. The bounds live in
-// validate and the portal only mirrors them, so this is the test that holds
-// them.
+// keep saving, the floor is what stops the refresher becoming a continuous
+// poll of the operator's own server over the billed tunnel, the ceiling is
+// what keeps the cache inside its 90s staleness bound (past it a healthy
+// site's server drops out of browsers), and a negative is refused like every
+// other duration here. The bounds live in validate and the portal only
+// mirrors them, so this is the test that holds them.
 func TestValidateBoundsTheQueryCacheRefresh(t *testing.T) {
 	for _, tc := range []struct {
 		ms int
 		ok bool
-	}{{0, true}, {3000, true}, {30000, true}, {-1, false}, {30001, false}} {
+	}{{0, true}, {500, true}, {3000, true}, {30000, true}, {-1, false}, {1, false}, {499, false}, {30001, false}} {
 		cfg := model.Defaults()
 		cfg.QueryCache.RefreshMs = tc.ms
 		err := validate(&cfg)

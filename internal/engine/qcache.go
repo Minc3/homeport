@@ -20,18 +20,31 @@ import (
 // answering nothing. Every caller holds reconfMu, which is what makes the
 // stop-then-start sequence atomic against the other callers.
 //
-// Armed mode only, and that is a promise rather than an optimisation. The
-// redirect rules ride the DNAT table, which observe mode never loads, so in
-// observe the sockets would sit unreachable - but the refresher would still
-// send query traffic down the active tunnel, and observe mode's promise is
-// that nothing the agent does can be felt or billed.
+// The cache runs where its redirect rules are: armed, or disarmed with the
+// data plane still loaded. Observe with nothing loaded starts nothing, and
+// that is a promise rather than an optimisation - the sockets would sit
+// unreachable while the refresher sent query traffic down the active tunnel,
+// and observe mode's promise is that nothing the agent does can be felt or
+// billed.
 func (e *Engine) startQueryCache(parent context.Context) {
 	e.stopQueryCache()
 
 	e.mu.RLock()
 	cfg := e.cfg
+	dataPlane := e.dataPlane
 	e.mu.RUnlock()
-	if cfg.Mode != model.ModeArmed {
+	// Armed, or disarmed with the rules still loaded. Invariant 13: going
+	// armed to observe deliberately leaves the installed ruleset in the
+	// kernel, and the qcache redirects ride that ruleset - so a cache
+	// stopped on the mode alone left every redirected query pointing at a
+	// closed socket, and the server dropped out of browsers the moment the
+	// operator disarmed, with the portal showing rules active throughout.
+	// The sockets follow the rules, not the mode. Observe with nothing
+	// loaded still starts nothing, which keeps observe's promise that no
+	// refresh traffic is sent or billed. dataPlane is in-memory, so a
+	// restart while disarmed-with-rules starts no cache; that is the same
+	// approximation RulesActive itself reports after such a restart.
+	if cfg.Mode != model.ModeArmed && !dataPlane {
 		return
 	}
 	spans := model.QueryCachePorts(cfg)
@@ -45,10 +58,18 @@ func (e *Engine) startQueryCache(parent context.Context) {
 		}
 	}
 
+	// The floor is validate's, held again here for the value validate never
+	// saw: a blob stored by a build without the floor. Below it the
+	// refresher is a continuous poll of the operator's own server over the
+	// billed tunnel, and there is nobody at this boundary to tell.
+	refresh := time.Duration(cfg.QueryCache.RefreshMs) * time.Millisecond
+	if refresh > 0 && refresh < 500*time.Millisecond {
+		refresh = 500 * time.Millisecond
+	}
 	c := qcache.New(qcache.Config{
 		Ports:        ports,
 		Bind:         e.qcBind,
-		RefreshEvery: time.Duration(cfg.QueryCache.RefreshMs) * time.Millisecond,
+		RefreshEvery: refresh,
 		Log:          e.log,
 	})
 	ctx, cancel := context.WithCancel(parent)

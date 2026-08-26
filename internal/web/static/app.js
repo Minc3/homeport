@@ -459,7 +459,7 @@ function renderQueryCache(states) {
   // error always shows, because that port is redirecting queries to nothing.
   const list = all.filter((q) => q.error || q.refresh_error
     || q.answered || q.challenged || q.unanswered
-    || q.info_age_sec >= 0 || q.player_age_sec >= 0);
+    || q.info_age_sec >= 0 || q.player_age_sec >= 0 || q.rules_age_sec >= 0);
   section.classList.toggle('hidden', list.length === 0);
   if (!list.length) return;
 
@@ -470,7 +470,7 @@ function renderQueryCache(states) {
     el('thead', {}, el('tr', {},
       el('th', { text: 'Port' }), el('th', { text: 'Service' }),
       el('th', { text: 'Answered' }), el('th', { text: 'Challenged' }), el('th', { text: 'Unanswered' }),
-      el('th', { text: 'Info age' }), el('th', { text: 'Players age' }),
+      el('th', { text: 'Info age' }), el('th', { text: 'Players age' }), el('th', { text: 'Rules age' }),
       el('th', { text: 'Problem' }))),
     el('tbody', {}, list.map((q) => el('tr', {},
       el('td', { text: q.port }),
@@ -480,6 +480,7 @@ function renderQueryCache(states) {
       el('td', { text: q.unanswered.toLocaleString() }),
       el('td', { text: age(q.info_age_sec) }),
       el('td', { text: age(q.player_age_sec) }),
+      el('td', { text: age(q.rules_age_sec) }),
       // An icon with the message on hover, not the message itself: the error
       // strings carry whole socket addresses and were wider than the rest of
       // the table put together.
@@ -491,9 +492,9 @@ function renderQueryCache(states) {
     body.append(el('p', { class: 'hint', text: `${hidden} cached port${hidden === 1 ? '' : 's'} with no activity hidden.` }));
   }
   body.append(el('p', { class: 'hint', text: 'Answered is payloads served from cache; Challenged counts the challenge every new source gets first, so under a '
-    + 'spoofed flood it is the number climbing while Answered stays flat, which is the cache doing its job. Hover a ⚠ for the error: counters climbing '
-    + 'on a ⚠ port usually mean nothing is listening there at the far end - internet scanners query every published port and complete challenges like '
-    + 'anybody else - while a ⚠ on a port whose game server is really running is the cache unable to reach it, and the port answers nothing rather than '
+    + 'spoofed flood it is the number climbing while Answered stays flat, which is the cache doing its job. Hover a ⚠ for the error. Counters climbing '
+    + 'on a ⚠ port usually mean nothing is listening there at the far end: internet scanners query every published port and complete challenges like '
+    + 'anybody else. The same ⚠ on a port whose game server is really running is the cache unable to reach it, and the port answers nothing rather than '
     + 'advertising a server that may be gone. A ✖ is a port something else on the frontend holds, redirecting its queries to nothing.' }));
 }
 
@@ -749,6 +750,30 @@ function updateGeoWarn() {
   }
 }
 
+// updateQcacheWarn notes, without refusing anything, that the query cache is
+// on while Protection is off. That combination is supported by design - the
+// cache absorbs floods the limits cannot see - but with protection off there
+// is no edge hygiene, no parked sources and no ceiling in front of any
+// published port, and an operator who arrived here by unticking Protection
+// for an unrelated reason should hear what else that changed.
+function updateQcacheWarn() {
+  const w = document.getElementById('qcache-warn');
+  if (!w || !config) return;
+  const show = !!(config.query_cache && config.query_cache.enabled)
+    && !(config.protect && config.protect.enabled);
+  w.classList.toggle('hidden', !show);
+  if (show) {
+    w.textContent = '';
+    w.append(
+      el('h3', { text: 'Query cache on, Protection off' }),
+      el('p', { text: 'That works: the cache challenges and absorbs query floods on its own. But nothing else now stands in front of your '
+        + 'published ports - no edge hygiene, no per-source limits, no parked sources and no service ceilings - so everything that is not '
+        + 'an A2S query reaches the tunnel unfiltered. Deliberate is fine; if Protection was turned off for some other reason, its master '
+        + 'switch is in the section above.' }),
+    );
+  }
+}
+
 // 'input' catches typing, 'change' the dropdowns and checkboxes, 'click' the
 // Add and Remove buttons. Typing is debounced: a fetched country list puts
 // tens of thousands of networks in the config, and sameConfig walks all of
@@ -773,6 +798,7 @@ function updateGeoWarn() {
   for (const evt of ['change', 'click']) {
     form.addEventListener(evt, updateDirty);
     form.addEventListener(evt, updateGeoWarn);
+    form.addEventListener(evt, updateQcacheWarn);
   }
 }
 
@@ -1790,12 +1816,17 @@ function renderSettings() {
 
   if (!c.query_cache) c.query_cache = {};
   form.append(section('Source query cache',
-    el('p', { class: 'hint', text: 'Answers A2S_INFO and A2S_PLAYER queries at this frontend, from a cache refreshed off the real server every few seconds, '
-      + 'for every published UDP service ticked as Source engine. Queries stop crossing the tunnel, and every source is challenged before it is served, '
-      + 'exactly as a modern Source server does it, so a flood of spoofed addresses gets nothing but challenges no spoofed sender can answer.' }),
+    // Filled by updateQcacheWarn, which every form change runs: the cache
+    // works with protection off by design, but nothing else then stands in
+    // front of the published ports, and the operator should choose that with
+    // their eyes open rather than arrive at it.
+    el('div', { class: 'alert warn hidden', id: 'qcache-warn' }),
+    el('p', { class: 'hint', text: 'Answers A2S_INFO, A2S_PLAYER and A2S_RULES queries at this frontend, from a cache refreshed off the real server every '
+      + 'few seconds, for every published UDP service ticked as Source engine. Queries stop crossing the tunnel, and every source is challenged before it '
+      + 'is served, exactly as a modern Source server does it, so a flood of spoofed addresses gets nothing but challenges no spoofed sender can answer.' }),
     el('p', { class: 'hint', text: 'This is the protection the per-source limits cannot give: those key on source addresses being real. It works with every '
-      + 'limit above at zero, and with the limits on they simply apply first. In-game traffic, connection attempts and A2S_RULES are untouched and still '
-      + 'reach the real server.' }),
+      + 'limit above at zero, and with the limits on they simply apply first. In-game traffic and connection attempts are untouched and still reach the '
+      + 'real server.' }),
     el('div', {}, checkbox('Enabled', c.query_cache.enabled, (v) => (c.query_cache.enabled = v),
       'Armed mode only, like the DNAT rules the redirects ride beside. The refresh costs a small stream down the active tunnel, only while a port is '
       + 'actually being queried; an idle port costs nothing. The dashboard shows each cached port with its counters and cache age: a cache that cannot '
@@ -1804,12 +1835,16 @@ function renderSettings() {
     el('p', { class: 'hint', text: 'Needs the Source engine tick on the service rows above; a row without it is not touched. If the cache is doing the '
       + 'flood absorbing, the Source queries per second limit above can be set to 0, or left on to cap what the cache ever sees.' }),
     el('div', { class: 'grid' },
-      num('Refresh interval (ms)', c.query_cache.refresh_ms, (v) => (c.query_cache.refresh_ms = v || 0), {
-        min: 0, max: 30000, placeholder: '0 = 3000',
+      // The unset value renders as an empty box rather than a 0, because the
+      // box declares a floor of 500 and a displayed 0 would snap to it on
+      // first touch; empty is what the placeholder explains, and empty is
+      // what a cleared box stores as 0.
+      num('Refresh interval (ms)', c.query_cache.refresh_ms || '', (v) => (c.query_cache.refresh_ms = v || 0), {
+        min: 500, max: 30000, placeholder: 'empty = 3000',
         help: 'How often a queried port is re-fetched from the real server, which is the staleness a browser normally sees. Faster costs more refresh '
-          + 'traffic on the active tunnel and polls your own server harder; slower shows staler player counts. At most 30000, because the cache stops '
-          + 'serving a reply older than 90 seconds and a slower refresh leaves no room for a failed fetch to be retried before the port goes dark. '
-          + 'An idle port is never polled whatever this says.',
+          + 'traffic on the active tunnel and polls your own server harder; slower shows staler player counts. Between 500 and 30000: below that the '
+          + 'refresher is polling your own server continuously, and above it the cache cannot stay inside the 90 second staleness bound with room for a '
+          + 'failed fetch to be retried before the port goes dark. Clear the box for the default 3000. An idle port is never polled whatever this says.',
       }),
     ),
   ));
@@ -2055,9 +2090,10 @@ async function loadSettings() {
     if (missing.length) toast(`Preset lists unavailable (${missing.join('; ')}); their dropdowns offer only Custom`, true);
     renderSettings();
     markSaved();
-    // The form events keep it live from here; this covers a config loaded
-    // already carrying the mismatch.
+    // The form events keep them live from here; this covers a config loaded
+    // already carrying either mismatch.
     updateGeoWarn();
+    updateQcacheWarn();
   } catch (e) {
     toast(e.message, true);
   }

@@ -24,24 +24,32 @@ func engineForQueryCache(t *testing.T, mode string, enabled bool) *Engine {
 	return e
 }
 
-// The cache runs only when armed and enabled, and its Snapshot is what the
-// portal shows. Observe mode must start nothing: the redirect rules ride the
-// DNAT table observe never loads, so sockets would sit unreachable while the
-// refresher billed query traffic to whatever path is active - and observe
-// mode's promise is that nothing the agent does can be felt or billed.
-func TestQueryCacheRunsOnlyWhenArmedAndEnabled(t *testing.T) {
+// The cache runs where its redirect rules are, and its Snapshot is what the
+// portal shows. Observe with nothing loaded must start nothing: the sockets
+// would sit unreachable while the refresher billed query traffic to whatever
+// path is active, and observe mode's promise is that nothing the agent does
+// can be felt or billed. But observe with the data plane still loaded is
+// invariant 13's disarm, which deliberately keeps the installed ruleset -
+// the qcache redirects included - so a cache stopped on the mode alone left
+// every redirected query pointing at a closed socket, and the server dropped
+// out of browsers the moment the operator disarmed, with the portal showing
+// rules active throughout. The sockets follow the rules, not the mode.
+func TestQueryCacheFollowsTheLoadedRulesNotTheMode(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		mode    string
-		enabled bool
-		want    int // ports reported by Status
+		name      string
+		mode      string
+		enabled   bool
+		dataPlane bool
+		want      int // ports reported by Status
 	}{
-		{"armed and enabled", model.ModeArmed, true, 3},
-		{"armed but disabled", model.ModeArmed, false, 0},
-		{"enabled but observing", model.ModeObserve, true, 0},
+		{"armed and enabled", model.ModeArmed, true, false, 3},
+		{"armed but disabled", model.ModeArmed, false, false, 0},
+		{"observing with nothing loaded", model.ModeObserve, true, false, 0},
+		{"disarmed with the rules still loaded", model.ModeObserve, true, true, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := engineForQueryCache(t, tc.mode, tc.enabled)
+			e.dataPlane = tc.dataPlane
 			e.startQueryCache(context.Background())
 			defer e.stopQueryCache()
 			if got := len(e.Status().QueryCache); got != tc.want {

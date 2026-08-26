@@ -78,10 +78,22 @@ func BuildRuleset(cfg model.Config) string {
 	// engine binds sockets for - deriving them twice is how a query gets
 	// redirected to a port nothing answers. @th,64,32 0xffffffff is the
 	// connectionless marker (see protect.go, where the same match is
-	// explained); @th,96,8 is the type byte behind it, so only A2S_INFO
-	// (0x54) and A2S_PLAYER (0x55) are taken and everything else a client
-	// sends - connection handshakes, A2S_RULES, game traffic - still reaches
-	// the real server.
+	// explained); @th,96,8 is the type byte behind it: A2S_INFO (0x54),
+	// A2S_PLAYER (0x55) and A2S_RULES (0x56), the whole query repertoire.
+	//
+	// What the type-byte match chooses is less than it looks, and the
+	// difference is why all three types must be here. This is a NAT chain,
+	// and a NAT verdict binds to the conntrack flow: the chain is consulted
+	// for a tuple's first packet and never again, so the match decides which
+	// *flows* are captured, not which packets - a tuple whose first packet
+	// was a query has every later packet delivered to the cache for the life
+	// of the conntrack entry. That is safe exactly because the cache answers
+	// the whole repertoire: a server browser sends these three types from
+	// one socket, while a game client's join and play ride a socket of its
+	// own, whose first packet is not a query, so it binds to the dnat below
+	// and is never captured. Dropping one type from this list would not send
+	// it to the real server; it would silently drop it on every socket that
+	// ever sent another query first.
 	for _, sp := range model.QueryCachePorts(cfg) {
 		port := fmt.Sprintf("%d", sp.From)
 		if sp.To > sp.From {
@@ -90,7 +102,7 @@ func BuildRuleset(cfg model.Config) string {
 		for _, t := range []struct {
 			b    int
 			what string
-		}{{0x54, "info"}, {0x55, "players"}} {
+		}{{0x54, "info"}, {0x55, "players"}, {0x56, "rules"}} {
 			fmt.Fprintf(&b, "\t\t%sudp dport %s @th,64,32 0xffffffff @th,96,8 0x%02x redirect comment %q\n",
 				serviceScope(cfg), port, t.b, fmt.Sprintf("qcache %s: %s", t.what, sp.Service))
 		}

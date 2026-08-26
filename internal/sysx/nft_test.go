@@ -618,16 +618,22 @@ func TestRulesetIsUntouchedWithTheQueryCacheOff(t *testing.T) {
 }
 
 // The redirects take only what the cache answers: the connectionless marker
-// and then the two type bytes, INFO and PLAYER. Everything else on the port -
-// game traffic, connection handshakes, A2S_RULES - must still reach the dnat
-// rule below them, which is why the redirects also have to come first: rules
-// run in order, and a query that reaches the dnat is already on its way down
-// a tunnel.
+// and then the three query type bytes. A flow whose first packet is not a
+// query - game traffic, a join handshake - still reaches the dnat rule below
+// them, which is why the redirects also have to come first: rules run in
+// order, and a query that reaches the dnat is already on its way down a
+// tunnel.
 func TestQueryCacheRedirectsAreNarrowAndPrecedeTheDNAT(t *testing.T) {
 	rs := BuildRuleset(qcacheConfig())
+	// All three query types, and RULES is not optional: the redirect verdict
+	// binds to the conntrack flow, so a tuple that queried INFO first has its
+	// RULES packets delivered to the cache whatever this match says - a type
+	// missing here is not passed through, it is silently dropped on every
+	// socket that ever sent another query first.
 	for _, want := range []string{
 		`iifname "eth0" udp dport 27015-27030 @th,64,32 0xffffffff @th,96,8 0x54 redirect comment "qcache info: gmod"`,
 		`iifname "eth0" udp dport 27015-27030 @th,64,32 0xffffffff @th,96,8 0x55 redirect comment "qcache players: gmod"`,
+		`iifname "eth0" udp dport 27015-27030 @th,64,32 0xffffffff @th,96,8 0x56 redirect comment "qcache rules: gmod"`,
 	} {
 		if !strings.Contains(rs, want) {
 			t.Errorf("ruleset lacks %q:\n%s", want, rs)

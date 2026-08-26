@@ -77,13 +77,15 @@ type Config struct {
 // default.
 //
 // With it on, every published UDP service ticked as Source engine has its
-// A2S_INFO and A2S_PLAYER queries answered at the frontend from a cache that
-// is refreshed from the real server every few seconds, instead of being
-// forwarded down a tunnel. The cache challenges every source before serving a
-// payload, exactly as a modern Source server does, and a challenge reply is
-// smaller than the query that provoked it, so the cache cannot be used as a
-// reflection amplifier and a spoofed-source query flood gets nothing but
-// challenges no spoofed sender can answer. That is the hole it exists to
+// A2S_INFO, A2S_PLAYER and A2S_RULES queries answered at the frontend from a
+// cache that is refreshed from the real server every few seconds, instead of
+// being forwarded down a tunnel. The cache challenges every source before
+// serving a payload, exactly as a modern Source server does, and a challenge
+// reply is never larger than the query that provoked it - strictly smaller
+// for INFO, byte-for-byte equal for the 9-byte PLAYER and RULES queries - so
+// the cache amplifies nothing, and a spoofed-source query flood gets nothing
+// but challenges no spoofed sender can answer. Reflection at ratio 1.0 for
+// the equal-sized queries is the floor any UDP responder has. That is the hole it exists to
 // close: the per-source limits key on source addresses being real, so a flood
 // that randomises them never trips a limit and lands on the service ceiling,
 // which drops legitimate browser queries along with the flood. The cache
@@ -103,10 +105,10 @@ type QueryCacheConfig struct {
 	// RefreshMs is how often a queried port is re-fetched from the real
 	// server, and therefore the staleness a browser normally sees. Zero
 	// takes the shipped 3000: an older config unmarshals to exactly the
-	// behaviour it had. Bounded above by validate at 30000, because the
-	// cache stops serving a reply older than 90 seconds and a refresh slower
-	// than a third of that leaves no room for a fetch to fail and be
-	// retried before the cache goes dark.
+	// behaviour it had. Bounded by validate on both sides: below 500 the
+	// refresher is a continuous poll of the operator's own server over the
+	// billed tunnel, and above 30000 the cache cannot stay inside its 90
+	// second staleness bound with room for a failed fetch to be retried.
 	RefreshMs int `json:"refresh_ms,omitempty"`
 }
 
@@ -1065,11 +1067,12 @@ type QueryCacheState struct {
 	Challenged uint64 `json:"challenged"`
 	Unanswered uint64 `json:"unanswered"`
 
-	// InfoAgeSec and PlayerAgeSec are how old each cached reply is, -1 for
-	// never fetched. The cache stops serving a reply past its staleness
-	// bound, so a port can be listed here and still answer nothing.
+	// The ages are how old each cached reply is, -1 for never fetched. The
+	// cache stops serving a reply past its staleness bound, so a port can be
+	// listed here and still answer nothing.
 	InfoAgeSec   float64 `json:"info_age_sec"`
 	PlayerAgeSec float64 `json:"player_age_sec"`
+	RulesAgeSec  float64 `json:"rules_age_sec"`
 
 	// Error is a port whose socket could not be bound: something else on the
 	// frontend holds it, and every query to it is being redirected to nothing.

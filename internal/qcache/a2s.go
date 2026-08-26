@@ -13,9 +13,16 @@
 // nothing. Legitimate clients complete the challenge and are answered from
 // cache, at the datacentre, with nothing crossing a tunnel.
 //
-// Only INFO and PLAYER are cached, matching the reference implementations:
-// A2S_RULES is rarer, larger, and passes through to the real server like any
-// other packet, where the per-source query limit still covers it.
+// INFO, PLAYER and RULES are all cached, and the third is not optional. The
+// redirect that steers queries here is a NAT verdict, and NAT verdicts bind
+// to the conntrack flow: whichever packet a tuple sends first decides where
+// every later packet on that tuple is delivered. A server browser sends all
+// three query types from one socket, so a tuple that has queried INFO will
+// have its RULES packet delivered here too, whatever the ruleset's type-byte
+// match says - the match chooses which flows are captured, not which packets.
+// Caching all three is what makes the capture safe: the browser's whole
+// repertoire is answered, and a game client's join flow rides a socket of
+// its own and is never captured at all.
 package qcache
 
 import (
@@ -30,6 +37,7 @@ import (
 const (
 	typeInfoRequest   = 0x54 // 'T', A2S_INFO
 	typePlayerRequest = 0x55 // 'U', A2S_PLAYER
+	typeRulesRequest  = 0x56 // 'V', A2S_RULES
 	typeChallenge     = 0x41 // 'A', S2C_CHALLENGE, both directions
 )
 
@@ -62,6 +70,8 @@ const (
 	queryInfoChallenged
 	queryPlayerBare
 	queryPlayerChallenged
+	queryRulesBare
+	queryRulesChallenged
 )
 
 // classify reads a client datagram. The returned challenge is meaningful only
@@ -87,11 +97,18 @@ func classify(b []byte) (queryKind, []byte) {
 			return queryInfoChallenged, rest
 		}
 		return queryNone, nil
-	case typePlayerRequest:
+	case typePlayerRequest, typeRulesRequest:
 		if len(body) != 4 {
 			return queryNone, nil
 		}
-		if bytes.Equal(body, noChallenge) {
+		bare := bytes.Equal(body, noChallenge)
+		if b[4] == typeRulesRequest {
+			if bare {
+				return queryRulesBare, nil
+			}
+			return queryRulesChallenged, body
+		}
+		if bare {
 			return queryPlayerBare, nil
 		}
 		return queryPlayerChallenged, body
@@ -99,11 +116,15 @@ func classify(b []byte) (queryKind, []byte) {
 	return queryNone, nil
 }
 
-// challengeReply builds the 9-byte S2C_CHALLENGE datagram. Deliberately
-// smaller than either query that can provoke it (25 bytes for the shortest
-// INFO), which is what makes challenging every unknown source safe: a spoofed
-// flood gets back less traffic than it sent, aimed at an address that never
-// asked for it.
+// challengeReply builds the 9-byte S2C_CHALLENGE datagram. Never larger than
+// the query that provokes it: strictly smaller than any INFO (25 bytes at its
+// shortest), exactly equal to a bare PLAYER or RULES query (9 bytes). So the
+// cache amplifies nothing, but the equality half is worth saying plainly: a
+// spoofed flood of the 9-byte queries is reflected at its victim byte for
+// byte, ratio 1.0, which is the floor any UDP responder has and no better.
+// The gain over answering would-be payloads (hundreds of bytes for a 9-byte
+// PLAYER query) is what the challenge buys; making the reflection ratio zero
+// would mean answering nothing at all.
 func challengeReply(ch []byte) []byte {
 	out := make([]byte, 0, 9)
 	out = append(out, headerSingle...)
@@ -124,12 +145,21 @@ func infoRequest(challenge []byte) []byte {
 // playerRequest builds an upstream A2S_PLAYER query. With no challenge yet it
 // carries -1, which is the protocol's "give me one".
 func playerRequest(challenge []byte) []byte {
+	return challengedRequest(typePlayerRequest, challenge)
+}
+
+// rulesRequest builds an upstream A2S_RULES query, same shape as PLAYER.
+func rulesRequest(challenge []byte) []byte {
+	return challengedRequest(typeRulesRequest, challenge)
+}
+
+func challengedRequest(typ byte, challenge []byte) []byte {
 	if challenge == nil {
 		challenge = noChallenge
 	}
 	out := make([]byte, 0, len(headerSingle)+1+4)
 	out = append(out, headerSingle...)
-	out = append(out, typePlayerRequest)
+	out = append(out, typ)
 	return append(out, challenge...)
 }
 

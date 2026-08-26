@@ -43,6 +43,11 @@ func newFakeUpstream(t *testing.T, tune ...func(*fakeUpstream)) *fakeUpstream {
 
 func (u *fakeUpstream) port() int { return u.conn.LocalAddr().(*net.UDPAddr).Port }
 
+// rulesBody is the A2S_RULES answer: 'E' and a token payload.
+func (u *fakeUpstream) rulesBody() []byte {
+	return append(append([]byte{}, headerSingle...), 0x45, 0x01, 0x00, 's', 'v', 0x00)
+}
+
 func (u *fakeUpstream) serve() {
 	buf := make([]byte, 4096)
 	for {
@@ -74,6 +79,15 @@ func (u *fakeUpstream) serve() {
 			}
 			u.fetches.Add(1)
 			u.conn.WriteToUDP(append(append([]byte{}, headerSingle...), 0x44, 0x01), addr)
+		case queryRulesBare:
+			u.conn.WriteToUDP(challengeReply(u.challenge), addr)
+		case queryRulesChallenged:
+			if !bytes.Equal(ch, u.challenge) {
+				u.conn.WriteToUDP(challengeReply(u.challenge), addr)
+				continue
+			}
+			u.fetches.Add(1)
+			u.conn.WriteToUDP(u.rulesBody(), addr)
 		}
 	}
 }
@@ -195,6 +209,23 @@ func TestUnchallengedQueryGetsASmallerChallengeNeverAPayload(t *testing.T) {
 	if _, ok := isChallenge(c.read(2 * time.Second)); !ok {
 		t.Fatalf("a wrong challenge was not answered with a fresh challenge")
 	}
+
+	// The bare PLAYER and RULES queries are the sharp edge of the
+	// no-amplification claim: at 9 bytes they exactly equal the challenge
+	// reply, so the property there is "never larger", not "smaller" - a
+	// spoofed flood of them is reflected 1:1, which is the floor any UDP
+	// responder has. Pinned as <=, deliberately: a reply one byte larger
+	// than the query would make the cache an amplifier.
+	for _, q := range [][]byte{playerRequest(nil), rulesRequest(nil)} {
+		c.send(q)
+		reply := c.read(2 * time.Second)
+		if _, ok := isChallenge(reply); !ok {
+			t.Fatalf("bare query % x got % x, want a challenge", q, reply)
+		}
+		if len(reply) > len(q) {
+			t.Errorf("challenge reply is %d bytes to the query's %d; amplification", len(reply), len(q))
+		}
+	}
 	if got := u.fetches.Load(); got != 0 {
 		// The upstream may legitimately have been polled by now (demand was
 		// stamped), so assert the client side only: nothing above was a
@@ -227,6 +258,32 @@ func TestManyQueriesCostFewUpstreamFetches(t *testing.T) {
 	if got := u.fetches.Load(); got > 30 {
 		t.Errorf("upstream was fetched %d times for 51 client queries; the cache is not caching", got)
 	}
+}
+
+// A2S_RULES is cached like the other two, and it has to be rather than
+// nice-to-have: the redirect is a NAT verdict, NAT verdicts bind to the
+// conntrack flow, and a server browser sends INFO, PLAYER and RULES from one
+// socket - so a RULES packet on a tuple that queried INFO first arrives here
+// whatever the ruleset's type-byte match says. A cache that could not answer
+// it would be silently dropping it.
+func TestRulesQueriesAreCachedToo(t *testing.T) {
+	u := newFakeUpstream(t)
+	_, addr, _ := startCacher(t, u, nil)
+	c := newClient(t, addr)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c.send(rulesRequest(nil))
+		ch := c.mustChallenge()
+		c.send(rulesRequest(ch))
+		if b := c.read(200 * time.Millisecond); b != nil {
+			if !bytes.Equal(b, u.rulesBody()) {
+				t.Fatalf("served % x, want the upstream's RULES % x", b, u.rulesBody())
+			}
+			return
+		}
+	}
+	t.Fatalf("no RULES payload before the deadline")
 }
 
 // A port nobody queries costs nothing upstream: the refresh is demand-driven,

@@ -121,6 +121,7 @@ func New(cfg Config) *Cacher {
 		pc := &portCache{cfg: p, c: c, nudge: make(chan struct{}, 1)}
 		pc.info.fetchOK = true
 		pc.player.fetchOK = true
+		pc.rules.fetchOK = true
 		c.ports = append(c.ports, pc)
 	}
 	return c
@@ -169,10 +170,13 @@ func (c *Cacher) Snapshot() []model.QueryCacheState {
 			Unanswered:   p.unanswered.Load(),
 			InfoAgeSec:   p.info.ageSec(now),
 			PlayerAgeSec: p.player.ageSec(now),
+			RulesAgeSec:  p.rules.ageSec(now),
 			Error:        p.bindErrString(),
 		}
 		if st.RefreshError = p.info.lastErr(); st.RefreshError == "" {
-			st.RefreshError = p.player.lastErr()
+			if st.RefreshError = p.player.lastErr(); st.RefreshError == "" {
+				st.RefreshError = p.rules.lastErr()
+			}
 		}
 		out = append(out, st)
 	}
@@ -250,6 +254,7 @@ type portCache struct {
 
 	info   cacheEntry
 	player cacheEntry
+	rules  cacheEntry
 }
 
 func (p *portCache) setBindErr(err error) {
@@ -309,6 +314,13 @@ func (p *portCache) serve(ctx context.Context) {
 		case queryPlayerChallenged:
 			p.player.stampDemand(now)
 			p.answerOrChallenge(&p.player, src, ch, now)
+		case queryRulesBare:
+			p.rules.stampDemand(now)
+			p.maybeNudge()
+			p.sendChallenge(src, now)
+		case queryRulesChallenged:
+			p.rules.stampDemand(now)
+			p.answerOrChallenge(&p.rules, src, ch, now)
 		}
 	}
 }
@@ -368,6 +380,7 @@ func (p *portCache) refresh(ctx context.Context) {
 		now := time.Now()
 		p.refreshEntry(ctx, &p.info, "info", infoRequest, now)
 		p.refreshEntry(ctx, &p.player, "players", playerRequest, now)
+		p.refreshEntry(ctx, &p.rules, "rules", rulesRequest, now)
 	}
 }
 

@@ -183,7 +183,7 @@ tunnel** regardless of which one is active.
 | `internal/engine` | Frontend brain: probers, per-path health trackers, the selector, the applier, the control server. |
 | `internal/agent` | Backend: probe responder, return-route management, LTE metering, control client. |
 | `internal/linker` | Optional extra host: overlay address, one policy route to the backend, connection marking so containers can be published, a control client, a reconciler. No probes, no decisions, no metering. |
-| `internal/qcache` | The Source query cache: answers A2S_INFO and A2S_PLAYER at the frontend from a cache refreshed off the real server, challenging every source first. Frontend-only; the backend and linker never link it. |
+| `internal/qcache` | The Source query cache: answers A2S_INFO, A2S_PLAYER and A2S_RULES at the frontend from a cache refreshed off the real server, challenging every source first. Frontend-only; the backend and linker never link it. |
 | `internal/quota` | Billing periods, metered-byte reconstruction, enforcement decisions. |
 | `internal/store` | SQLite. Config, usage ledger, history, events, grants, users/sessions. |
 | `internal/web` | Portal HTTP server, JSON API, config validation, embedded static assets. |
@@ -1527,28 +1527,52 @@ legitimate browser queries with the flood, on a cheap VPS whose datacentre
 only filters volumetric attacks. The cache does what a modern Source server
 itself does: every source is challenged before it is served, the challenge
 (HMAC over source and a time bucket, no per-client state to exhaust) is
-smaller than the query that provokes it so nothing amplifies, and a spoofed
-sender never sees it, so a spoofed flood gets nothing while challenged
-clients keep being answered from memory. `model.QueryCachePorts` is the one
-enumeration both halves share - the nft redirects (`@th,96,8` on the type
-byte, so game traffic, connection attempts and A2S_RULES pass untouched to
-the DNAT below) and the engine's responder sockets - because deriving them
+never larger than the query that provokes it - strictly smaller for INFO,
+byte-for-byte equal for the 9-byte PLAYER and RULES queries - so nothing
+amplifies, and a spoofed sender never sees it, so a spoofed flood gets
+nothing while challenged clients keep being answered from memory. Reflection
+at 1.0 for the equal-sized queries is the floor any UDP responder has, and
+`qcache_test.go` pins the ratio in both directions.
+
+**All three query types are cached, and that is forced rather than chosen.**
+The redirect is a NAT verdict, and NAT verdicts bind to the conntrack flow:
+the chain is consulted for a tuple's first packet and never again, so the
+`@th,96,8` type-byte match decides which *flows* are captured, not which
+packets. A server browser sends INFO, PLAYER and RULES from one socket, so a
+tuple that queried INFO first has its RULES packets delivered to the cache
+whatever the match says - a type left out of the redirect list is not passed
+through to the real server, it is silently dropped on every socket that ever
+sent another query first. A game client's join and play ride a socket of its
+own, whose first packet is not a query, so it binds to the dnat and is never
+captured. `model.QueryCachePorts` is the one enumeration both halves share -
+the nft redirects and the engine's responder sockets - because deriving them
 twice is how a query gets redirected to a port nothing answers. The redirect
 keeps the destination port (`redirect`, never `redirect to`), so the
 responder binds the service port itself and no port mapping exists to drift.
-Off by default, one switch (`Config.QueryCache`), independent of
-`Protect` in both directions, armed mode only: the redirects ride the DNAT
-table observe never loads, and the refresh stream rides the active tunnel,
-which observe must not bill. The refresh is demand-driven - an unqueried
-port polls nothing, so a backend full of Source servers costs only what is
-being asked about - and a cache past its staleness bound answers nothing
-rather than advertising a server that may be gone. The refresh interval is
-`QueryCache.RefreshMs`, zero meaning the shipped 3000; validate caps it at
-30000 because the staleness bound is 90 seconds and a slower refresh leaves
-no room for a failed fetch to be retried before a healthy site's port goes
-dark. The protect chains run
-before dstnat, so with both features on the limits drop first and a parked
-source never reaches the cache.
+
+Off by default, one switch (`Config.QueryCache`), independent of `Protect`
+in both directions. The sockets follow the loaded rules, not the mode: the
+cache runs when armed, and also when disarmed with the data plane still up,
+because invariant 13's disarm deliberately leaves the installed ruleset -
+the redirects included - in the kernel, and a cache stopped on the mode
+alone left every redirected query pointing at a closed socket, dropping the
+server out of browsers the moment the operator disarmed. Observe with
+nothing loaded still starts nothing, which is what keeps observe's promise:
+the refresh stream rides the active tunnel and must not be sent or billed.
+The refresh is demand-driven - an unqueried port polls nothing, so a backend
+full of Source servers costs only what is being asked about - and a cache
+past its staleness bound answers nothing rather than advertising a server
+that may be gone. The refresh interval is `QueryCache.RefreshMs`, zero
+meaning the shipped 3000; validate bounds it on both sides (500 to 30000),
+because below the floor the refresher is a continuous poll of the operator's
+own server over the billed tunnel, and above the ceiling the 90 second
+staleness bound leaves no room for a failed fetch to be retried before a
+healthy site's port goes dark. The engine clamps the floor again for a blob
+stored by a build without it. The protect chains run before dstnat, so with
+both features on the limits drop first and a parked source never reaches the
+cache; the portal warns, without refusing, when the cache is on with
+protection off entirely, because that is supported but leaves nothing else
+in front of the published ports.
 
 **Region locks are operator-declared network lists, not a GeoIP database.**
 `Protect.Regions` is named lists of CIDRs; `Service.GeoRegions` locks a port to
@@ -2876,35 +2900,45 @@ where a subtle regression would be invisible in production until an outage:
   every limit down with it. Generated nftables is worth reading by eye before
   trusting: the tests can only assert what somebody thought to assert.
 - `qcache/qcache_test.go` - the anti-spoofing property both ways: an
-  unchallenged or wrongly challenged source gets a challenge smaller than its
-  query and never a payload, and a challenged client is served the upstream's
-  bytes verbatim. The caching property itself: fifty client queries cost the
-  upstream a handful of fetches, and a port nobody queries polls nothing at
-  all, which is what makes many Source servers affordable to cache. A
-  multi-packet reply is replayed fragment for fragment; a stale cache answers
-  nothing and says so in its counters, because serving stale forever would
-  advertise a dead server indefinitely; cancellation returns promptly
-  (invariant 17, the read loops sit on sockets); a port something else
-  holds is reported loudly while the ports beside it still serve; and a port
-  whose upstream never answers names the failure in the snapshot the portal
-  renders - "never fetched" beside climbing counters cannot otherwise
-  distinguish a down game server from a port only scanners query, and
-  scanners complete challenges like anybody else. That case is also the
-  port's first failure ever, which pins fetchOK starting true: begun false,
-  the first failure is not an edge and the one journal line an operator
-  most needs never prints.
+  unchallenged or wrongly challenged source gets a challenge never larger
+  than its query (strictly smaller for INFO, equal for the 9-byte PLAYER and
+  RULES queries, pinned as <= because one byte more would make the cache an
+  amplifier) and never a payload, and a challenged client is served the
+  upstream's bytes verbatim. RULES is cached beside the other two and pinned
+  as such, because the redirect verdict binds to the conntrack flow and a
+  browser's socket sends all three types: a type the cache could not answer
+  would be silently dropped, not passed through. The caching property
+  itself: fifty client queries cost the upstream a handful of fetches, and a
+  port nobody queries polls nothing at all, which is what makes many Source
+  servers affordable to cache. A multi-packet reply is replayed fragment for
+  fragment; a stale cache answers nothing and says so in its counters,
+  because serving stale forever would advertise a dead server indefinitely;
+  cancellation returns promptly (invariant 17, the read loops sit on
+  sockets); a port something else holds is reported loudly while the ports
+  beside it still serve; and a port whose upstream never answers names the
+  failure in the snapshot the portal renders - "never fetched" beside
+  climbing counters cannot otherwise distinguish a down game server from a
+  port only scanners query, and scanners complete challenges like anybody
+  else. That case is also the port's first failure ever, which pins fetchOK
+  starting true: begun false, the first failure is not an edge and the one
+  journal line an operator most needs never prints.
 - `model/qcache_test.go` - the enumeration both the redirects and the sockets
   are built from: only enabled, Source-ticked UDP services produce ports,
   duplicates across services collapse, the linker target is honoured, and the
   cap holds so a range typo cannot become forty thousand sockets.
-- `engine/qcache_test.go` - the cache runs only when armed and enabled,
-  observe mode starts nothing (the refresher would bill query traffic to the
-  active path), and stop waits the generation out so a restart can rebind the
-  same fixed ports.
+- `engine/qcache_test.go` - the cache follows the loaded rules rather than
+  the mode: armed runs it, observe with nothing loaded starts nothing (the
+  refresher would bill query traffic to the active path), and disarmed with
+  the data plane still up keeps it running, because invariant 13's disarm
+  keeps the redirect rules loaded and a cache stopped on the mode alone
+  blackholed every query the moment the operator disarmed. Stop waits the
+  generation out so a restart can rebind the same fixed ports.
 - `sysx/nft_test.go` also pins the redirects: byte-absent with the cache off,
-  ahead of the dnat rule and narrowed to the two type bytes when on, only for
-  opted-in services, and never `redirect to` - the responder binds the
-  service port itself, so there is no port mapping to drift.
+  ahead of the dnat rule and narrowed to the three query type bytes when on -
+  all three, because the verdict binds per flow and a missing type is a
+  silent drop, not a pass-through - only for opted-in services, and never
+  `redirect to`, since the responder binds the service port itself and there
+  is no port mapping to drift.
 - `sysx/shape_test.go` - an unshaped path installs nothing, the configured rate
   reaches the kernel with the overhead, an intact shaper is left alone, one lost
   with its interface is restored, clearing the rate removes it, a queue

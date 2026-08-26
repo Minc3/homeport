@@ -526,13 +526,19 @@ func validate(cfg *model.Config) error {
 		}
 	}
 
-	// The query cache's refresh interval. Zero is the shipped default; the
-	// ceiling exists because the cache stops serving a reply older than 90
+	// The query cache's refresh interval. Zero is the shipped default. The
+	// floor exists because below it the refresher is a continuous poll of
+	// the operator's own game server, run over the billed tunnel; the
+	// ceiling because the cache stops serving a reply older than 90
 	// seconds, and a refresh slower than a third of that leaves no room for
 	// a failed fetch to be retried before the cache goes dark and the
 	// server drops out of browsers on a healthy site.
 	if cfg.QueryCache.RefreshMs < 0 {
 		return errors.New("query cache: the refresh interval cannot be negative")
+	}
+	if cfg.QueryCache.RefreshMs != 0 && cfg.QueryCache.RefreshMs < 500 {
+		return fmt.Errorf("query cache: a refresh of %d ms polls your own server continuously, over the billed tunnel; "+
+			"the least is 500, and 0 means the default 3000", cfg.QueryCache.RefreshMs)
 	}
 	if cfg.QueryCache.RefreshMs > 30000 {
 		return fmt.Errorf("query cache: a refresh of %d ms cannot keep the cache inside its 90s staleness bound; "+
