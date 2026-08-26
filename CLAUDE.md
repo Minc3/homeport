@@ -1510,9 +1510,13 @@ same ground here.
 **Source-engine limiting matches only connectionless packets.** `@th,64,32
 0xffffffff` is the first four bytes after the UDP header, which the A2S queries
 and connection attempts carry and an in-game client never does - its packets are
-sequence numbered. That is what makes a limit of two or three per second safe:
-it cannot touch the traffic of a player already connected. Without the payload
-match the same rule would throttle gameplay at a rate chosen for queries.
+sequence numbered. That is what makes a tight limit safe for players already
+connected: it cannot touch their traffic. Without the payload match the same
+rule would throttle gameplay at a rate chosen for queries. Safe for connected
+players is not the same as safe, though: one server-browser refresh sends the
+three A2S queries at once, so a limit in the low single digits parks anybody
+who refreshes twice inside a second - which is why the presets' floor is 10 a
+second, and why the old shipped figures of 2 and 3 were raised.
 
 **The legacy-query drop is edge hygiene, not a limiter, so it is a plain
 toggle.** `Protect.DropLegacyQueries` drops the two deprecated Source
@@ -1569,18 +1573,35 @@ keeps the destination port (`redirect`, never `redirect to`), so the
 responder binds the service port itself and no port mapping exists to drift.
 
 Off by default, one switch (`Config.QueryCache`), independent of `Protect`
-in both directions. The sockets follow the loaded rules, not the mode: the
-cache runs when armed, and also when disarmed with the data plane still up,
-because invariant 13's disarm deliberately leaves the installed ruleset -
-the redirects included - in the kernel, and a cache stopped on the mode
-alone left every redirected query pointing at a closed socket, dropping the
-server out of browsers the moment the operator disarmed. Observe with
-nothing loaded still starts nothing, which is what keeps observe's promise:
-the refresh stream rides the active tunnel and must not be sent or billed.
-The refresh is demand-driven - an unqueried port polls nothing, so a backend
-full of Source servers costs only what is being asked about - and a cache
-past its staleness bound answers nothing rather than advertising a server
-that may be gone. The refresh interval is `QueryCache.RefreshMs`, zero
+in both directions. The sockets follow the loaded rules, not the mode, and
+"the loaded rules" is a persisted record, not the saved configuration:
+`applySystemConfig` writes the enumeration it just loaded to `meta`
+(`qcache_applied`) and `Revert` clears it, and whenever the mode is not
+armed `startQueryCache` builds its sockets from that record. Both halves
+took a failure to learn. A cache gated on the mode alone left every
+redirected query pointing at a closed socket the moment the operator
+disarmed, because invariant 13's disarm deliberately leaves the installed
+ruleset - the redirects included - in the kernel. And a cache built from the
+saved configuration reopened the same blackhole through two other doors: a
+save that shrank the enumeration while disarmed stopped sockets the
+still-loaded redirects kept delivering to, and a crash-restart while
+disarmed (the gate first read an in-memory flag, and the unit runs under
+`Restart=always`) started no sockets at all. Observe with nothing recorded
+still starts nothing, which is what keeps observe's promise: the refresh
+stream rides the active tunnel and must not be sent or billed.
+The refresh is demand-driven, and demand is a *verified* query - one whose
+source has echoed its challenge back. An unqueried port polls nothing, so a
+backend full of Source servers costs only what is being asked about, and a
+bare or wrongly challenged query stamps nothing, because demand drives the
+refresh stream down the billed tunnel and must not be drivable by a spoofed
+source: a trickle of bare queries costing the sender nothing would otherwise
+keep every port's refresh running through an LTE failover indefinitely. What
+that costs is one extra retry on the first query of an idle port, which a
+real browser does anyway. A failed fetch is retried at the refresh cadence,
+not the ticker's quarter-interval - pacing on last-success alone had a
+crashed game server polled at four times the configured rate for as long as
+it stayed down - and a cache past its staleness bound answers nothing rather
+than advertising a server that may be gone. The refresh interval is `QueryCache.RefreshMs`, zero
 meaning the shipped 3000; validate bounds it on both sides (500 to 30000),
 because below the floor the refresher is a continuous poll of the operator's
 own server over the billed tunnel, and above the ceiling every browser is
@@ -2966,12 +2987,16 @@ where a subtle regression would be invisible in production until an outage:
   duplicates across services collapse, the linker target is honoured, and the
   cap holds so a range typo cannot become forty thousand sockets.
 - `engine/qcache_test.go` - the cache follows the loaded rules rather than
-  the mode: armed runs it, observe with nothing loaded starts nothing (the
-  refresher would bill query traffic to the active path), and disarmed with
-  the data plane still up keeps it running, because invariant 13's disarm
-  keeps the redirect rules loaded and a cache stopped on the mode alone
-  blackholed every query the moment the operator disarmed. Stop waits the
-  generation out so a restart can rebind the same fixed ports.
+  the mode or the saved configuration: armed runs it, observe with nothing
+  recorded starts nothing (the refresher would bill query traffic to the
+  active path), disarmed it serves the recorded enumeration even after a
+  save shrank the config - invariant 13's disarm keeps the redirect rules
+  loaded, so stopping sockets on the saved config blackholed every query
+  those rules still delivered - a fresh process on the same store starts it
+  from the persisted record, which is the crash-restart the in-memory gate
+  missed, and a revert clears the record so nothing restarts a cache for
+  rules that are gone. Stop waits the generation out so a restart can rebind
+  the same fixed ports.
 - `sysx/nft_test.go` also pins the redirects: byte-absent with the cache off,
   ahead of the dnat rule and narrowed to the three query type bytes when on -
   all three, because the verdict binds per flow and a missing type is a

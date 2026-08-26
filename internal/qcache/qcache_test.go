@@ -226,12 +226,17 @@ func TestUnchallengedQueryGetsASmallerChallengeNeverAPayload(t *testing.T) {
 			t.Errorf("challenge reply is %d bytes to the query's %d; amplification", len(reply), len(q))
 		}
 	}
+	// And the spoofer drove no upstream traffic either. Nothing above
+	// completed a challenge, so no demand was stamped and the refresher must
+	// not have polled: demand is what keeps the refresh stream running down
+	// the billed tunnel, and a source that cannot echo a challenge back must
+	// not be able to keep it running - a trickle of bare queries costing the
+	// sender nothing would otherwise bill upstream polling through an LTE
+	// failover indefinitely. The sleep covers several 40ms refresh intervals,
+	// so a stamped demand could not hide in the window.
+	time.Sleep(200 * time.Millisecond)
 	if got := u.fetches.Load(); got != 0 {
-		// The upstream may legitimately have been polled by now (demand was
-		// stamped), so assert the client side only: nothing above was a
-		// payload. This check is that the *spoofer* caused no serving, kept
-		// deliberately loose because the refresher polling is correct.
-		_ = got
+		t.Errorf("the upstream was fetched %d times on unverified queries alone; a spoofer can drive the refresh stream", got)
 	}
 }
 
@@ -471,6 +476,69 @@ func TestBindFailureIsReportedAndDoesNotSinkTheRest(t *testing.T) {
 	cl := newClient(t, free.conn.LocalAddr())
 	if b := cl.queryInfo(); !bytes.Equal(b, u.infoBody) {
 		t.Errorf("the free port served % x", b)
+	}
+}
+
+// A failed fetch is retried at the refresh cadence, not the ticker's
+// quarter-interval. The refresher ticks at RefreshEvery/4 so a nudge or a due
+// fetch lands promptly, but due is measured from the last attempt: measured
+// from the last *success*, a failure never advanced the clock, so a crashed
+// game server whose port refused or stayed silent was polled at four times
+// the configured rate, down the active tunnel, for as long as it stayed down
+// - billed during exactly the outages the metering exists for.
+func TestFailingUpstreamIsRetriedAtTheRefreshCadence(t *testing.T) {
+	// An upstream that hears every query and never answers, so every fetch
+	// fails on its own timeout and the datagrams heard count the attempts.
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("silent upstream: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	var heard atomic.Int64
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, _, err := conn.ReadFromUDP(buf); err != nil {
+				return
+			}
+			heard.Add(1)
+		}
+	}()
+
+	c := New(Config{
+		Ports:           []Port{{Port: 0, Target: "127.0.0.1", TargetPort: conn.LocalAddr().(*net.UDPAddr).Port, Service: "test"}},
+		Bind:            "127.0.0.1",
+		RefreshEvery:    200 * time.Millisecond,
+		IdleAfter:       5 * time.Second,
+		StaleAfter:      5 * time.Second,
+		UpstreamTimeout: 20 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); c.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	<-c.bound
+	if c.ports[0].conn == nil {
+		t.Fatalf("cacher did not bind: %v", c.ports[0].bindErrString())
+	}
+
+	// Stamp demand for INFO the only way a client can: complete the
+	// challenge dance. The payload never comes, which is the point.
+	cl := newClient(t, c.ports[0].conn.LocalAddr())
+	cl.send(infoRequest(nil))
+	ch := cl.mustChallenge()
+	cl.send(infoRequest(ch))
+
+	// A second of failures at a 200ms cadence is about six attempts counting
+	// the nudged first one. The unpaced retry made it about twenty, so the
+	// bound separates the two with slack for scheduling on either side.
+	time.Sleep(time.Second)
+	got := heard.Load()
+	if got > 8 {
+		t.Errorf("a failing upstream heard %d fetch attempts in a second at a 200ms cadence; retries are not paced", got)
+	}
+	if got < 2 {
+		t.Errorf("a failing upstream heard only %d fetch attempts; it is not being retried at all", got)
 	}
 }
 

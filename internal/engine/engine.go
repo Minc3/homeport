@@ -1094,6 +1094,11 @@ func (e *Engine) applySystemConfig(ctx context.Context) {
 		e.mu.Lock()
 		e.dataPlane = true
 		e.mu.Unlock()
+		// The kernel now redirects exactly this configuration's query cache
+		// ports, so record them: startQueryCache builds its sockets from this
+		// record whenever the mode is not armed, because a disarmed save
+		// changes the configuration without touching the loaded redirects.
+		e.persistAppliedQueryCache(cfg)
 	}
 
 	e.applyEgress(ctx, cfg, gated, real)
@@ -2365,6 +2370,14 @@ func (e *Engine) Revert(ctx context.Context) {
 
 	runner := e.realRunner() // revert always acts, even in observe mode
 	sysx.RemoveRuleset(ctx, runner)
+	// The redirects went with the ruleset, so the record of them goes too, or
+	// the next restart would bind sockets for ports nothing redirects. The
+	// harmless direction: a crash between the removal and this write starts a
+	// latched process (the revert latch is persisted first), which runs no
+	// cache anyway.
+	if err := e.st.SetMeta(qcacheAppliedMetaKey, ""); err != nil {
+		e.log.Warn("cannot clear the applied query cache record", "err", err)
+	}
 	sysx.RemoveEgressRuleset(ctx, runner)
 	sysx.RemoveProtectRuleset(ctx, runner)
 	// Only tunnels this system shapes. An interface it never touched keeps

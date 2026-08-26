@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
+	"github.com/quinlan102/homeport/internal/notify"
 )
 
 // engineForQueryCache is engineForProbers with a Source service opted in and
@@ -26,37 +27,88 @@ func engineForQueryCache(t *testing.T, mode string, enabled bool) *Engine {
 }
 
 // The cache runs where its redirect rules are, and its Snapshot is what the
-// portal shows. Observe with nothing loaded must start nothing: the sockets
+// portal shows. Observe with nothing recorded must start nothing: the sockets
 // would sit unreachable while the refresher billed query traffic to whatever
 // path is active, and observe mode's promise is that nothing the agent does
-// can be felt or billed. But observe with the data plane still loaded is
-// invariant 13's disarm, which deliberately keeps the installed ruleset -
-// the qcache redirects included - so a cache stopped on the mode alone left
-// every redirected query pointing at a closed socket, and the server dropped
-// out of browsers the moment the operator disarmed, with the portal showing
-// rules active throughout. The sockets follow the rules, not the mode.
+// can be felt or billed. But when the mode is not armed the sockets are built
+// from the recorded enumeration - what an armed apply actually loaded - and
+// never from the saved configuration, because invariant 13's disarm keeps
+// the installed ruleset, redirects included, in the kernel while a disarmed
+// save reloads nothing. The first gate here read the mode plus an in-memory
+// flag and the configuration, which blackholed every redirected query two
+// ways: a save that unticked the cache while disarmed stopped sockets the
+// loaded redirects kept delivering to, and a crash-restart while disarmed
+// started none at all.
 func TestQueryCacheFollowsTheLoadedRulesNotTheMode(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		mode      string
-		enabled   bool
-		dataPlane bool
-		want      int // ports reported by Status
+		name     string
+		mode     string
+		enabled  bool
+		recorded bool // an armed apply loaded the redirects for the 3 ports
+		want     int  // ports reported by Status
 	}{
 		{"armed and enabled", model.ModeArmed, true, false, 3},
 		{"armed but disabled", model.ModeArmed, false, false, 0},
-		{"observing with nothing loaded", model.ModeObserve, true, false, 0},
-		{"disarmed with the rules still loaded", model.ModeObserve, true, true, 3},
+		{"observing with nothing recorded", model.ModeObserve, true, false, 0},
+		// The disarm case deliberately also unticks the cache in the saved
+		// configuration: the record, not the config, is what the kernel still
+		// redirects, so the sockets must stay.
+		{"disarmed with the rules still loaded", model.ModeObserve, false, true, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := engineForQueryCache(t, tc.mode, tc.enabled)
-			e.dataPlane = tc.dataPlane
+			if tc.recorded {
+				armed := e.cfg
+				armed.QueryCache.Enabled = true
+				e.persistAppliedQueryCache(armed) // what the armed apply recorded
+			}
 			e.startQueryCache(context.Background())
 			defer e.stopQueryCache()
 			if got := len(e.Status().QueryCache); got != tc.want {
 				t.Errorf("Status reports %d cached ports, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// The record is persisted, not in-memory, because the unit runs under
+// Restart=always: a crash while disarmed-with-rules brings back a process
+// whose memory says nothing is loaded while the redirects sit in the kernel.
+// A fresh engine on the same store must start the cache from the record.
+func TestQueryCacheSurvivesARestartWhileDisarmed(t *testing.T) {
+	e := engineForQueryCache(t, model.ModeArmed, true)
+	e.persistAppliedQueryCache(e.cfg)
+
+	// The restarted process: same store, observe mode, and a configuration
+	// that no longer opts in - the save that shrank it must not matter.
+	cfg := e.cfg
+	cfg.Mode = model.ModeObserve
+	cfg.QueryCache.Enabled = false
+	e2 := New(quietLogger(), e.st, notify.New(quietLogger()), cfg, []byte("secret"), t.TempDir())
+	e2.qcBind = "127.0.0.1"
+	e2.runner = &stubRunner{}
+	e2.real = &stubRunner{}
+	e2.startQueryCache(context.Background())
+	defer e2.stopQueryCache()
+	if got := len(e2.Status().QueryCache); got != 3 {
+		t.Errorf("restarted engine reports %d cached ports, want 3 from the persisted record", got)
+	}
+}
+
+// Revert removes the ruleset, so it clears the record with it: a restart
+// after a revert must not bind sockets for redirects that are gone, and the
+// reverted engine itself must not either.
+func TestRevertClearsTheQueryCacheRecord(t *testing.T) {
+	e := engineForQueryCache(t, model.ModeArmed, true)
+	e.persistAppliedQueryCache(e.cfg)
+	e.Revert(context.Background())
+	if got := e.st.Meta("qcache_applied"); got != "" {
+		t.Errorf("revert left the applied record %q", got)
+	}
+	e.startQueryCache(context.Background())
+	defer e.stopQueryCache()
+	if got := len(e.Status().QueryCache); got != 0 {
+		t.Errorf("a reverted engine still reports %d cached ports", got)
 	}
 }
 

@@ -465,7 +465,12 @@ function renderQueryCache(states) {
 
   const body = document.getElementById('qcache-body');
   body.textContent = '';
-  const age = (s) => (s < 0 ? 'never fetched' : s > 90 ? `${Math.round(s)}s (stale, not served)` : `${Math.round(s)}s`);
+  // The threshold is the bound the cache is actually serving under, carried
+  // in the snapshot, never a copy kept here: the first version hardcoded 90,
+  // which had already drifted from the shipped 10 and was wrong in both
+  // directions - a dead port shown as serving for 80 seconds, and a long
+  // configured bound labelled stale while it was still being served.
+  const age = (s, stale) => (s < 0 ? 'never fetched' : s > stale ? `${Math.round(s)}s (stale, not served)` : `${Math.round(s)}s`);
   body.append(el('div', { class: 'table-wrap' }, el('table', {},
     el('thead', {}, el('tr', {},
       el('th', { text: 'Port' }), el('th', { text: 'Service' }),
@@ -478,9 +483,9 @@ function renderQueryCache(states) {
       el('td', { text: q.answered.toLocaleString() }),
       el('td', { text: q.challenged.toLocaleString() }),
       el('td', { text: q.unanswered.toLocaleString() }),
-      el('td', { text: age(q.info_age_sec) }),
-      el('td', { text: age(q.player_age_sec) }),
-      el('td', { text: age(q.rules_age_sec) }),
+      el('td', { text: age(q.info_age_sec, q.stale_sec) }),
+      el('td', { text: age(q.player_age_sec, q.stale_sec) }),
+      el('td', { text: age(q.rules_age_sec, q.stale_sec) }),
       // An icon with the message on hover, not the message itself: the error
       // strings carry whole socket addresses and were wider than the rest of
       // the table put together. data-tip, not title: the browser sits on a
@@ -1841,32 +1846,53 @@ function renderSettings() {
       + 'limit above at zero, and with the limits on they simply apply first. In-game traffic and connection attempts are untouched and still reach the '
       + 'real server.' }),
     el('div', {}, checkbox('Enabled', c.query_cache.enabled, (v) => (c.query_cache.enabled = v),
-      'Armed mode only, like the DNAT rules the redirects ride beside. The refresh costs a small stream down the active tunnel, only while a port is '
+      'Takes effect when armed, and keeps running after a disarm, because disarming deliberately leaves the installed rules - the redirects included - '
+      + 'in place. The refresh costs a small stream down the active tunnel, only while a port is '
       + 'actually being queried; an idle port costs nothing. The dashboard shows each cached port with its counters and cache age: a cache that cannot '
-      + 'reach its server serves its last answer for about 90 seconds and then answers nothing, so a dead server drops out of browsers rather than '
-      + 'being advertised by its own cache.')),
+      + 'reach its server serves its last answer for the staleness bound below and then answers nothing, so a dead server drops out of browsers rather '
+      + 'than being advertised by its own cache.')),
     el('p', { class: 'hint', text: 'Needs the Source engine tick on the service rows above; a row without it is not touched. If the cache is doing the '
       + 'flood absorbing, the Source queries per second limit above can be set to 0, or left on to cap what the cache ever sees.' }),
-    el('div', { class: 'grid' },
+    (() => {
       // The unset value renders as an empty box rather than a 0, because the
       // box declares a floor of 500 and a displayed 0 would snap to it on
       // first touch; empty is what the placeholder explains, and empty is
       // what a cleared box stores as 0.
-      num('Refresh interval (ms)', c.query_cache.refresh_ms || '', (v) => (c.query_cache.refresh_ms = v || 0), {
+      const refreshBox = num('Refresh interval (ms)', c.query_cache.refresh_ms || '', (v) => (c.query_cache.refresh_ms = v || 0), {
         min: 500, max: 30000, placeholder: 'empty = 3000',
         help: 'How often a queried port is re-fetched from the real server, which is the staleness a browser normally sees. Faster costs more refresh '
           + 'traffic on the active tunnel and polls your own server harder; slower shows staler player counts. Between 500 and 30000: below that the '
           + 'refresher is polling your own server continuously, and above it every browser is looking at counts half a minute old. Clear the box for '
           + 'the default 3000. An idle port is never polled whatever this says.',
-      }),
-      num('Serve a cached reply for at most (ms)', c.query_cache.stale_ms || '', (v) => (c.query_cache.stale_ms = v || 0), {
+      });
+      const staleBox = num('Serve a cached reply for at most (ms)', c.query_cache.stale_ms || '', (v) => (c.query_cache.stale_ms = v || 0), {
         min: 1500, max: 300000, placeholder: 'empty = 10000',
         help: 'How long the last good fetch keeps being served once the real server stops answering, and so how long a crashed server is still '
           + 'advertised before its ports go quiet. Must cover at least three refresh intervals: between polls every answer comes out of this window, '
-          + 'so a smaller bound would have a healthy port going dark between refreshes. Clear the box for automatic: 10000, or three refresh '
-          + 'intervals where the refresh is slower.',
-      }),
-    ),
+          + 'so a smaller bound would have a healthy port going dark between refreshes - an explicit value under that is lifted here, because the '
+          + 'save endpoint refuses it. Clear the box for automatic: 10000, or three refresh intervals where the refresh is slower.',
+      });
+      // The endpoint refuses an explicit staleness bound under three
+      // effective refresh intervals, and the static min above covers that
+      // floor only at the fastest refresh: with the refresh box empty the
+      // real floor is 9000, so min: 1500 alone let 5000 through and every
+      // later save of the whole form was refused on it - the exact "clamp is
+      // decoration" failure declaring the bounds exists to close. The floor
+      // moves with the refresh box, so it is held here, after each field's
+      // own clamp has run (listeners fire in the order they were added), and
+      // in both boxes: raising the refresh must lift a bound it now
+      // undercuts. An empty staleness box is automatic and never lifted.
+      const holdStaleFloor = () => {
+        const floor = 3 * (c.query_cache.refresh_ms || 3000);
+        if (c.query_cache.stale_ms && c.query_cache.stale_ms < floor) {
+          c.query_cache.stale_ms = floor;
+          staleBox.querySelector('input').value = String(floor);
+        }
+      };
+      refreshBox.querySelector('input').addEventListener('change', holdStaleFloor);
+      staleBox.querySelector('input').addEventListener('change', holdStaleFloor);
+      return el('div', { class: 'grid' }, refreshBox, staleBox);
+    })(),
   ));
 
   const linkerBody = el('tbody', {});

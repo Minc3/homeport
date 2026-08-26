@@ -178,6 +178,7 @@ func (c *Cacher) Snapshot() []model.QueryCacheState {
 			InfoAgeSec:   p.info.ageSec(now),
 			PlayerAgeSec: p.player.ageSec(now),
 			RulesAgeSec:  p.rules.ageSec(now),
+			StaleSec:     c.cfg.StaleAfter.Seconds(),
 			Error:        p.bindErrString(),
 		}
 		if st.RefreshError = p.info.lastErr(); st.RefreshError == "" {
@@ -199,7 +200,16 @@ type cacheEntry struct {
 	mu        sync.Mutex
 	datagrams [][]byte
 	fetched   time.Time // zero = never
-	demand    time.Time // last valid client query of this type
+	demand    time.Time // last verified client query of this type
+
+	// attempted is when the last fetch finished, successful or not, and is
+	// what paces the refresher. Pacing on fetched alone let a failing
+	// upstream be retried on every ticker tick - RefreshEvery/4 - because a
+	// failure never advanced it: a crashed game server whose port answered
+	// with an immediate refusal was polled at four times the configured
+	// cadence, down the active tunnel, billed during exactly the outages the
+	// metering exists for.
+	attempted time.Time
 
 	// fetchOK drives the edge-triggered logging and must start true, or the
 	// first failure is not an edge and the one case an operator most needs
@@ -305,28 +315,26 @@ func (p *portCache) serve(ctx context.Context) {
 			continue
 		}
 		now := time.Now()
+		// A bare query earns a challenge and nothing else - not even a demand
+		// stamp. Demand is what keeps the refresher polling the upstream over
+		// the billed tunnel, so it must not be drivable by a spoofed source: a
+		// trickle of bare queries, one packet a minute per port, costing the
+		// sender nothing, would otherwise keep every port's three refresh
+		// streams running through an LTE failover indefinitely. Only a source
+		// that has echoed its challenge back - which a spoofer never sees -
+		// counts as demand, so the first query of an idle port costs a real
+		// client one extra retry (the verified retry stamps demand and nudges
+		// the refresher, and its next retry lands warm) and costs a spoofer
+		// everything.
 		kind, ch := classify(buf[:n])
 		switch kind {
-		case queryInfoBare:
-			p.info.stampDemand(now)
-			p.maybeNudge()
+		case queryInfoBare, queryPlayerBare, queryRulesBare:
 			p.sendChallenge(src, now)
 		case queryInfoChallenged:
-			p.info.stampDemand(now)
 			p.answerOrChallenge(&p.info, src, ch, now)
-		case queryPlayerBare:
-			p.player.stampDemand(now)
-			p.maybeNudge()
-			p.sendChallenge(src, now)
 		case queryPlayerChallenged:
-			p.player.stampDemand(now)
 			p.answerOrChallenge(&p.player, src, ch, now)
-		case queryRulesBare:
-			p.rules.stampDemand(now)
-			p.maybeNudge()
-			p.sendChallenge(src, now)
 		case queryRulesChallenged:
-			p.rules.stampDemand(now)
 			p.answerOrChallenge(&p.rules, src, ch, now)
 		}
 	}
@@ -352,10 +360,12 @@ func (p *portCache) verify(src *net.UDPAddr, got []byte, now time.Time) bool {
 func (p *portCache) answerOrChallenge(e *cacheEntry, src *net.UDPAddr, ch []byte, now time.Time) {
 	if !p.verify(src, ch, now) {
 		// A wrong challenge is an expired one, or a spoofer guessing. Either
-		// way the answer is a fresh challenge, never a payload.
+		// way the answer is a fresh challenge, never a payload - and never a
+		// demand stamp, for the reason serve gives.
 		p.sendChallenge(src, now)
 		return
 	}
+	e.stampDemand(now)
 	datagrams := e.fresh(now, p.c.cfg.StaleAfter)
 	if datagrams == nil {
 		// Correctly challenged and nothing fresh to say. Dropping is the
@@ -394,7 +404,12 @@ func (p *portCache) refresh(ctx context.Context) {
 func (p *portCache) refreshEntry(ctx context.Context, e *cacheEntry, what string, build func([]byte) []byte, now time.Time) {
 	e.mu.Lock()
 	wanted := !e.demand.IsZero() && now.Sub(e.demand) <= p.c.cfg.IdleAfter
-	due := e.fetched.IsZero() || now.Sub(e.fetched) >= p.c.cfg.RefreshEvery
+	// Due is measured from the last attempt, not the last success: the ticker
+	// runs at RefreshEvery/4 so a nudge or a due fetch lands promptly, and on
+	// fetched alone a failing upstream was due again on every tick - see the
+	// field. A zero attempted (never tried) is due at once, which is what the
+	// cold-cache nudge exists for.
+	due := e.attempted.IsZero() || now.Sub(e.attempted) >= p.c.cfg.RefreshEvery
 	e.mu.Unlock()
 	if !wanted || !due {
 		return
@@ -402,9 +417,10 @@ func (p *portCache) refreshEntry(ctx context.Context, e *cacheEntry, what string
 	datagrams, err := p.fetch(ctx, build)
 	e.mu.Lock()
 	wasOK := e.fetchOK
+	e.attempted = time.Now()
 	if err == nil {
 		e.datagrams = datagrams
-		e.fetched = time.Now()
+		e.fetched = e.attempted
 		e.fetchOK = true
 		e.fetchErr = ""
 	} else {

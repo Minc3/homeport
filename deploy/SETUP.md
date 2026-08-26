@@ -595,8 +595,11 @@ then set only the thresholds you want. Each is off at 0.
 | Drop legacy Source queries | the two dead query types (GETCHALLENGE, A2A_PING); needs a **Source engine** tick below or it drops nothing |
 
 For a Source game port, tick **Source engine** on that service row. It limits
-only connectionless packets, so a limit of two or three per second cannot touch
-a connected player. **Ceiling pps** caps one service across every client.
+only connectionless packets, so it cannot touch a connected player - but a
+server-browser refresh sends three A2S queries at once, so keep the limit at
+10 a second or more (the presets' floor): a single-digit limit parks a player
+who refreshes twice in a second, and everybody behind their carrier NAT with
+them. **Ceiling pps** caps one service across every client.
 
 Every drop is counted, and the counters show in the portal beside the parked
 sources. Start loose and tighten while watching them.

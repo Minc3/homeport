@@ -2,12 +2,65 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
 	"github.com/quinlan102/homeport/internal/qcache"
 )
+
+// qcacheAppliedMetaKey records the enumeration the loaded ruleset actually
+// redirects: written by applySystemConfig whenever an armed apply loads the
+// ruleset, cleared by Revert when the ruleset comes out. That is the
+// redirects' own lifecycle, and persisting it is not a nicety - the unit runs
+// under Restart=always, so any in-memory record of "rules are loaded" dies
+// with a crash while the rules themselves stay in the kernel, and a process
+// that came back starting no cache left every redirected query pointing at a
+// closed socket.
+const qcacheAppliedMetaKey = "qcache_applied"
+
+// persistAppliedQueryCache records what the ruleset just loaded redirects.
+// Called only from applySystemConfig's success branch, beside dataPlane,
+// because the record must describe the kernel and not the configuration: the
+// two agree only at the moment an armed apply lands.
+func (e *Engine) persistAppliedQueryCache(cfg model.Config) {
+	val := ""
+	if spans := model.QueryCachePorts(cfg); len(spans) > 0 {
+		b, err := json.Marshal(spans)
+		if err != nil {
+			e.log.Error("cannot record the applied query cache ports", "err", err)
+			return
+		}
+		val = string(b)
+	}
+	if err := e.st.SetMeta(qcacheAppliedMetaKey, val); err != nil {
+		e.log.Error("cannot record the applied query cache ports", "err", err,
+			"note", "after a disarm or a restart the cache may not match the loaded redirects")
+	}
+}
+
+// appliedQueryCacheSpans reads that record back. A read failure starts no
+// cache and says so loudly: with redirects loaded that is the blackhole, but
+// there is no safe enumeration to invent, and the next armed apply rewrites
+// the record.
+func (e *Engine) appliedQueryCacheSpans() []model.QueryCacheSpan {
+	raw, err := e.st.MetaChecked(qcacheAppliedMetaKey)
+	if err != nil {
+		e.log.Error("cannot read the applied query cache ports; starting no cache", "err", err,
+			"hint", "if redirect rules are loaded their queries go unanswered until settings are saved while armed")
+		return nil
+	}
+	if raw == "" {
+		return nil
+	}
+	var spans []model.QueryCacheSpan
+	if err := json.Unmarshal([]byte(raw), &spans); err != nil {
+		e.log.Error("cannot parse the applied query cache ports; starting no cache", "err", err)
+		return nil
+	}
+	return spans
+}
 
 // queryCacheTimings resolves the refresh interval and staleness bound a
 // stored configuration gives the cache. The floors are validate's, held
@@ -50,34 +103,31 @@ func queryCacheTimings(qc model.QueryCacheConfig) (refresh, stale time.Duration)
 // answering nothing. Every caller holds reconfMu, which is what makes the
 // stop-then-start sequence atomic against the other callers.
 //
-// The cache runs where its redirect rules are: armed, or disarmed with the
-// data plane still loaded. Observe with nothing loaded starts nothing, and
-// that is a promise rather than an optimisation - the sockets would sit
-// unreachable while the refresher sent query traffic down the active tunnel,
-// and observe mode's promise is that nothing the agent does can be felt or
-// billed.
+// The cache serves the redirects the kernel actually holds, which is not
+// always the saved configuration. Armed, the two agree: applySystemConfig has
+// just loaded the ruleset generated from cfg and recorded its enumeration in
+// the same breath. Not armed, the kernel holds whatever the last armed apply
+// loaded - invariant 13's disarm deliberately keeps the installed ruleset,
+// redirects included, and a disarmed save reloads nothing - so the sockets
+// are built from the recorded enumeration, never from cfg. Building them from
+// cfg was the blackhole twice over: a save that shrank the enumeration while
+// disarmed (the cache unticked, a service disabled, a range narrowed) stopped
+// sockets the still-loaded redirects kept delivering to, and a crash-restart
+// while disarmed started none at all, because the old gate read an in-memory
+// flag. Observe with nothing recorded still starts nothing, which keeps
+// observe's promise that no refresh traffic is sent or billed.
 func (e *Engine) startQueryCache(parent context.Context) {
 	e.stopQueryCache()
 
 	e.mu.RLock()
 	cfg := e.cfg
-	dataPlane := e.dataPlane
 	e.mu.RUnlock()
-	// Armed, or disarmed with the rules still loaded. Invariant 13: going
-	// armed to observe deliberately leaves the installed ruleset in the
-	// kernel, and the qcache redirects ride that ruleset - so a cache
-	// stopped on the mode alone left every redirected query pointing at a
-	// closed socket, and the server dropped out of browsers the moment the
-	// operator disarmed, with the portal showing rules active throughout.
-	// The sockets follow the rules, not the mode. Observe with nothing
-	// loaded still starts nothing, which keeps observe's promise that no
-	// refresh traffic is sent or billed. dataPlane is in-memory, so a
-	// restart while disarmed-with-rules starts no cache; that is the same
-	// approximation RulesActive itself reports after such a restart.
-	if cfg.Mode != model.ModeArmed && !dataPlane {
-		return
+	var spans []model.QueryCacheSpan
+	if cfg.Mode == model.ModeArmed {
+		spans = model.QueryCachePorts(cfg)
+	} else {
+		spans = e.appliedQueryCacheSpans()
 	}
-	spans := model.QueryCachePorts(cfg)
 	if len(spans) == 0 {
 		return
 	}

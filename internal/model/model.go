@@ -95,10 +95,13 @@ type Config struct {
 // It is independent of ProtectConfig on purpose. A site can run the cache
 // with every per-source limit at zero and let it absorb floods, or run both,
 // in which case the limits drop first: the protect chains run before
-// destination NAT, where the cache's redirect lives. Armed mode only, like
-// the DNAT beside it - the redirect rules ride the same table, which observe
-// mode never loads, and the cache's refresh traffic rides the active tunnel,
-// which observe mode must not send anything down.
+// destination NAT, where the cache's redirect lives. The responder runs
+// wherever those redirects are loaded, which is not the same thing as armed
+// mode: disarming deliberately leaves the installed ruleset - redirects
+// included - in the kernel, so the cache keeps running after a disarm, and a
+// cache stopped on the mode alone would leave every redirected query pointing
+// at a closed socket. Observe with nothing loaded runs nothing, so a host
+// that is only measuring sends and bills no refresh traffic.
 type QueryCacheConfig struct {
 	Enabled bool `json:"enabled,omitempty"`
 
@@ -1097,6 +1100,13 @@ type QueryCacheState struct {
 	InfoAgeSec   float64 `json:"info_age_sec"`
 	PlayerAgeSec float64 `json:"player_age_sec"`
 	RulesAgeSec  float64 `json:"rules_age_sec"`
+
+	// StaleSec is the staleness bound this cache is actually serving under,
+	// carried with the ages so the portal can mark an age past it as no
+	// longer served. The dashboard's first version hardcoded a copy instead,
+	// which had already drifted from the shipped default and was wrong in
+	// both directions the moment the bound was configurable.
+	StaleSec float64 `json:"stale_sec"`
 
 	// Error is a port whose socket could not be bound: something else on the
 	// frontend holds it, and every query to it is being redirected to nothing.
