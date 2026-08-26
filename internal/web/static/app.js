@@ -483,9 +483,13 @@ function renderQueryCache(states) {
       el('td', { text: age(q.rules_age_sec) }),
       // An icon with the message on hover, not the message itself: the error
       // strings carry whole socket addresses and were wider than the rest of
-      // the table put together.
-      el('td', q.error ? { text: '✖', title: `cannot bind: ${q.error}` }
-        : q.refresh_error ? { text: '⚠', title: `no answer from ${q.target}: ${q.refresh_error}` }
+      // the table put together. data-tip, not title: the browser sits on a
+      // native title for a second before showing it, and the one column an
+      // operator hovers is the one that must answer at once. The tip rides
+      // the same instant bubble the help markers use, and the icon is
+      // focusable so keyboard and touch reach the same text.
+      el('td', q.error ? { text: '✖', 'data-tip': `cannot bind: ${q.error}`, tabindex: '0', role: 'img', 'aria-label': `cannot bind: ${q.error}` }
+        : q.refresh_error ? { text: '⚠', 'data-tip': `no answer from ${q.target}: ${q.refresh_error}`, tabindex: '0', role: 'img', 'aria-label': `no answer from ${q.target}: ${q.refresh_error}` }
         : { text: '' })))))));
   const hidden = all.length - list.length;
   if (hidden > 0) {
