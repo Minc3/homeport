@@ -521,23 +521,11 @@ func validate(cfg *model.Config) error {
 			return fmt.Errorf("protection: %s cannot be negative", v.what)
 		}
 	}
-	for i := range cfg.Services {
-		sv := &cfg.Services[i]
-		if sv.CeilingPPS < 0 {
-			return fmt.Errorf("service %s has a negative packet ceiling", sv.Name)
-		}
-		if sv.NewConnsPerSec < 0 || sv.MaxConnsPerSource < 0 {
-			return fmt.Errorf("service %s has a negative per-source connection limit", sv.Name)
-		}
-		// The two overrides ride connection-state rules and mean nothing on a
-		// udp row. Refused rather than silently dropped, because the operator
-		// who set one believes a limit now exists - the UDP counterpart is
-		// the per-source packet rate under Protection.
-		if !strings.EqualFold(sv.Proto, "tcp") && (sv.NewConnsPerSec > 0 || sv.MaxConnsPerSource > 0) {
-			return fmt.Errorf("service %s is not tcp, and the per-source connection overrides are TCP only: "+
-				"clear them, or use the UDP packet rate under Protection", sv.Name)
-		}
-	}
+	// The per-service protect figures are checked in the services loop below,
+	// after the row's proto has been validated: checked here they ran ahead
+	// of the proto check, so a row with a broken proto was blamed on its
+	// override first and on its proto only after the operator cleared a field
+	// that was never the fault.
 
 	// The query cache's refresh interval. Zero is the shipped default. The
 	// floor exists because below it the refresher is a continuous poll of
@@ -727,6 +715,21 @@ func validate(cfg *model.Config) error {
 		if sv.PortEnd != 0 && (sv.PortEnd < sv.Port || sv.PortEnd > 65535) {
 			return fmt.Errorf("service %s has an invalid port range", sv.Name)
 		}
+		if sv.CeilingPPS < 0 {
+			return fmt.Errorf("service %s has a negative packet ceiling", sv.Name)
+		}
+		if sv.NewConnsPerSec < 0 || sv.MaxConnsPerSource < 0 {
+			return fmt.Errorf("service %s has a negative per-source connection limit", sv.Name)
+		}
+		// The two overrides ride connection-state rules and mean nothing on a
+		// udp row. Refused rather than silently dropped, because the operator
+		// who set one believes a limit now exists - the UDP counterpart is
+		// the per-source packet rate under Protection. Proto is exactly "tcp"
+		// or "udp" by this point, so the comparison is exact too.
+		if sv.Proto != "tcp" && (sv.NewConnsPerSec > 0 || sv.MaxConnsPerSource > 0) {
+			return fmt.Errorf("service %s is not tcp, and the per-source connection overrides are TCP only: "+
+				"clear them, or use the UDP packet rate under Protection", sv.Name)
+		}
 		sv.Target = trimmed(sv.Target)
 		if sv.Target != "" {
 			if net.ParseIP(sv.Target) == nil {
@@ -793,6 +796,36 @@ func validate(cfg *model.Config) error {
 		if sv.GeoAutoPPS > 0 && len(sv.GeoRegions) == 0 {
 			return fmt.Errorf("service %s has an auto-lock threshold but no regions to lock to; "+
 				"name at least one region, or clear the threshold", sv.Name)
+		}
+	}
+
+	// Two enabled rows that both override the same connection limit must not
+	// overlap on ports. An override overlapping a plain row is fine, because
+	// the generator subtracts its interval from the shared rule - but between
+	// two overrides there is nothing to subtract from: both rules match the
+	// shared port and the tighter figure governs ports it was not chosen for,
+	// silently, while each row's counter reads as if its own number stood.
+	for _, lim := range []struct {
+		what string
+		on   func(model.Service) bool
+	}{
+		{"connection rate", func(s model.Service) bool { return s.NewConnsPerSec > 0 }},
+		{"connection cap", func(s model.Service) bool { return s.MaxConnsPerSource > 0 }},
+	} {
+		var seen []model.Service
+		for _, sv := range cfg.Services {
+			if !sv.Enabled || sv.Proto != "tcp" || !lim.on(sv) {
+				continue
+			}
+			hi := max(sv.Port, sv.PortEnd)
+			for _, prev := range seen {
+				if sv.Port <= max(prev.Port, prev.PortEnd) && prev.Port <= hi {
+					return fmt.Errorf("services %s and %s both override the per-source %s and overlap on ports: "+
+						"both rules would match the shared ports and whichever figure is tighter would win, silently; "+
+						"give the overlap to one row, or drop one override", prev.Name, sv.Name, lim.what)
+				}
+			}
+			seen = append(seen, sv)
 		}
 	}
 	return nil

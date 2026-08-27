@@ -736,28 +736,32 @@ function markSaved() {
 }
 
 // Delegated, because renderSettings rebuilds everything inside the form.
-// updateGeoWarn says out loud that a region lock on a service row does not
-// exist while Protection is disabled. Nothing refuses that state on purpose:
-// unticking Protection has to stay the one-click way to back every filter out,
-// locks included, so the save is legal - which is exactly why it needs saying,
-// because a lock somebody believes is standing is worse than none. Driven by
-// the same delegated form events as the dirty badge, so it tracks the region
-// dropdowns, the row enable boxes and the Protection switch live.
+// updateGeoWarn says out loud that the per-row protection settings - a region
+// lock, a packet ceiling, a connection override - do not exist while
+// Protection is disabled. Nothing refuses that state on purpose: unticking
+// Protection has to stay the one-click way to back every filter out, the row
+// settings included, so the save is legal - which is exactly why it needs
+// saying, because a limit somebody believes is standing is worse than none.
+// Driven by the same delegated form events as the dirty badge, so it tracks
+// the row inputs, the row enable boxes and the Protection switch live.
 function updateGeoWarn() {
   const w = document.getElementById('geo-warn');
   if (!w || !config) return;
-  const locked = (config.services || [])
-    .filter((s) => s.enabled && (s.geo_regions || []).length)
+  const rows = (config.services || []).filter((s) => s.enabled);
+  const locked = rows.filter((s) => (s.geo_regions || []).length).map((s) => s.name || '(unnamed)');
+  const limited = rows.filter((s) => s.ceiling_pps || s.new_conns_per_sec || s.max_conns_per_source)
     .map((s) => s.name || '(unnamed)');
-  const show = locked.length > 0 && !(config.protect && config.protect.enabled);
+  const names = [...new Set([...locked, ...limited])];
+  const show = names.length > 0 && !(config.protect && config.protect.enabled);
   w.classList.toggle('hidden', !show);
   if (show) {
     w.textContent = '';
     w.append(
-      el('h3', { text: `Region lock${locked.length === 1 ? '' : 's'} NOT active: ${locked.join(', ')}` }),
-      el('p', { text: 'Protection is disabled, and the locks live in its table, so nothing is being dropped for these rows: '
-        + 'they are open to the whole world right now. Tick Enabled under Protection below and save to make the locks live, '
-        + 'or set the row back to anywhere if that is what you meant.' }),
+      el('h3', { text: `Per-row protection NOT active: ${names.join(', ')}` }),
+      el('p', { text: 'Protection is disabled, and the region locks, ceilings and connection limits on these rows all live in its table, '
+        + 'so none of them is dropping anything right now'
+        + (locked.length ? ' - the locked rows are open to the whole world' : '') + '. '
+        + 'Tick Enabled under Protection below and save to make them live, or clear the row settings if that is what you meant.' }),
     );
   }
 }
@@ -964,6 +968,14 @@ function num(label, value, onInput, opts = {}) {
   return field(label, value, onInput, { ...opts, type: 'number' });
 }
 
+// clearNum blanks a num() box's visible input; the caller zeroes the model
+// field beside it. One helper because reaching for the input means knowing
+// that field() wraps exactly one <input> in its label, and three call sites
+// each coupled to that shape would break separately - with the model zeroed
+// while the box still shows the old number, which is the on-screen/on-save
+// divergence the callers exist to prevent.
+function clearNum(box) { box.querySelector('input').value = ''; }
+
 // presetPicker is the dropdown mechanism the two preset families share: a
 // select listing the presets plus a Custom sentinel, the note under it, the
 // strict match of the config's numbers against each preset, and the change
@@ -1114,8 +1126,8 @@ function serviceRow(s, c, onRemove) {
     if (!tcp) {
       s.new_conns_per_sec = 0;
       s.max_conns_per_source = 0;
-      connRate.querySelector('input').value = '';
-      connCount.querySelector('input').value = '';
+      clearNum(connRate);
+      clearNum(connCount);
     }
   };
   syncConnCols();
@@ -1139,7 +1151,7 @@ function serviceRow(s, c, onRemove) {
       // what will be saved.
       if (!v.length && s.geo_auto_pps) {
         s.geo_auto_pps = 0;
-        autoPPS.querySelector('input').value = '';
+        clearNum(autoPPS);
       }
     })),
     el('td', {}, autoPPS),

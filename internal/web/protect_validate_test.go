@@ -120,6 +120,55 @@ func TestPerServiceConnOverridesAreRefusedOnUDP(t *testing.T) {
 	}
 }
 
+// Two enabled rows that both override the same connection limit must not
+// overlap on ports: both rules match the shared port, the tighter figure
+// governs ports it was not chosen for, and each row's counter reads as if its
+// own number stood. An override overlapping a plain row is the supported
+// case - the generator subtracts its interval from the shared rule - so that
+// must keep saving, as must overlapping rows overriding different limits
+// (the port coherently gets one row's rate and the other's cap) and a
+// disabled row, which generates nothing to collide with.
+func TestOverlappingConnOverridesAreRefused(t *testing.T) {
+	base := func() model.Config {
+		cfg := model.Defaults()
+		cfg.Frontend.PublicIface = "eth0"
+		cfg.Protect.Enabled = true
+		cfg.Services = []model.Service{
+			{Name: "game", Proto: "tcp", Port: 27015, PortEnd: 27020, Enabled: true, NewConnsPerSec: 5},
+			{Name: "rcon", Proto: "tcp", Port: 27020, Enabled: true},
+		}
+		return cfg
+	}
+
+	cfg := base()
+	cfg.Services[1].NewConnsPerSec = 2
+	err := validate(&cfg)
+	if err == nil {
+		t.Fatal("two rate overrides overlapping on a port were accepted")
+	}
+	if !strings.Contains(err.Error(), "overlap") {
+		t.Errorf("the error does not name the overlap: %v", err)
+	}
+
+	cfg = base()
+	cfg.Services[1].NewConnsPerSec = 2
+	cfg.Services[1].Enabled = false
+	if err := validate(&cfg); err != nil {
+		t.Errorf("a disabled overlapping override blocked the save: %v", err)
+	}
+
+	cfg = base()
+	cfg.Services[1].MaxConnsPerSource = 2
+	if err := validate(&cfg); err != nil {
+		t.Errorf("overlapping overrides of different limits were refused: %v", err)
+	}
+
+	cfg = base()
+	if err := validate(&cfg); err != nil {
+		t.Errorf("an override overlapping a plain row was refused, but that is the subtraction case: %v", err)
+	}
+}
+
 // Turning the master switch on and filling nothing in is a legitimate state -
 // it is what somebody does before deciding on their first threshold - and must
 // save without complaint, generating no rules at all.

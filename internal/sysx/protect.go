@@ -329,26 +329,85 @@ func geoElements(elems []string) string {
 }
 
 func (s ProtectSpec) ports(proto string) []string {
-	return s.portsWhere(proto, nil)
-}
-
-// portsWhere merges the ports of every service on proto for which skip, when
-// non-nil, does not say to leave it out. The shared connection rules use it
-// to exclude the services that override them: an override replaces the shared
-// figure for that row's ports, and a port left in both rules would face
-// whichever limit is tighter rather than the one chosen for it.
-func (s ProtectSpec) portsWhere(proto string, skip func(ProtectService) bool) []string {
 	var out []portRange
 	for _, sv := range s.Services {
 		if !strings.EqualFold(sv.Proto, proto) {
 			continue
 		}
-		if skip != nil && skip(sv) {
-			continue
-		}
 		out = append(out, portRange{sv.Port, max(sv.Port, sv.PortEnd)})
 	}
 	return mergePorts(out)
+}
+
+// overridesConnRate and overridesConnCount are the one definition of "this
+// row replaces a shared connection limit", consulted by connOverrides, the
+// shared rules' port subtraction and the rule emission alike. A gate written
+// out twice is two definitions (see active), and here the failure of a drift
+// is the silent kind: a port excluded from the shared rule by one definition
+// with no override rule emitted by the other is a published port with no
+// connection limit at all, loading clean. TCP only, because the rules these
+// select are connection-state rules.
+func (sv ProtectService) overridesConnRate() bool {
+	return strings.EqualFold(sv.Proto, "tcp") && sv.NewConnsPerSec > 0
+}
+
+func (sv ProtectService) overridesConnCount() bool {
+	return strings.EqualFold(sv.Proto, "tcp") && sv.MaxConnsPerSource > 0
+}
+
+// sharedConnPorts is the port set one shared connection rule covers: every
+// TCP row's ports, minus the port intervals of the rows overriding that
+// limit. Subtracted as intervals rather than by skipping the overriding rows,
+// because overlapping rows are a supported configuration (mergePorts exists
+// for them): skipped by row, any other row covering the same port put it
+// straight back into the shared rule, and a port in both rules faces
+// whichever limit is tighter rather than the one chosen for it - a loosening
+// override was silently dead. Overlap between two rows overriding the same
+// limit cannot be fixed by subtraction and is refused by web.validate; an
+// older blob carrying one gets both rules, which is the pre-refusal
+// behaviour, not a rejected table.
+func (s ProtectSpec) sharedConnPorts(overridden func(ProtectService) bool) []string {
+	var base, cut []portRange
+	for _, sv := range s.Services {
+		if !strings.EqualFold(sv.Proto, "tcp") {
+			continue
+		}
+		r := portRange{sv.Port, max(sv.Port, sv.PortEnd)}
+		if overridden(sv) {
+			cut = append(cut, r)
+		} else {
+			base = append(base, r)
+		}
+	}
+	return mergePorts(subtractRanges(base, cut))
+}
+
+// subtractRanges removes every interval in cut from every interval in base.
+// The result is not merged or ordered; callers hand it to mergePorts, which
+// already does both.
+func subtractRanges(base, cut []portRange) []portRange {
+	var out []portRange
+	for _, b := range base {
+		segs := []portRange{b}
+		for _, c := range cut {
+			var next []portRange
+			for _, s := range segs {
+				if c.hi < s.lo || c.lo > s.hi {
+					next = append(next, s)
+					continue
+				}
+				if c.lo > s.lo {
+					next = append(next, portRange{s.lo, c.lo - 1})
+				}
+				if c.hi < s.hi {
+					next = append(next, portRange{c.hi + 1, s.hi})
+				}
+			}
+			segs = next
+		}
+		out = append(out, segs...)
+	}
+	return out
 }
 
 // connOverride pairs a service that overrides a per-source connection limit
@@ -381,17 +440,14 @@ func (s ProtectSpec) connOverrides() []connOverride {
 		return name
 	}
 	for _, sv := range s.Services {
-		if !strings.EqualFold(sv.Proto, "tcp") {
-			continue
-		}
-		if sv.NewConnsPerSec <= 0 && sv.MaxConnsPerSource <= 0 {
+		if !sv.overridesConnRate() && !sv.overridesConnCount() {
 			continue
 		}
 		o := connOverride{svc: sv}
-		if sv.NewConnsPerSec > 0 {
+		if sv.overridesConnRate() {
 			o.rateSet = uniq(foldSetName("conn_rate_", sv.Name))
 		}
-		if sv.MaxConnsPerSource > 0 {
+		if sv.overridesConnCount() {
 			o.countSet = uniq(foldSetName("conn_count_", sv.Name))
 		}
 		out = append(out, o)
@@ -522,6 +578,24 @@ const (
 	CounterGeoTrip    = "geo-trip"
 )
 
+// connRateRule and connCountRule are the one spelling of the two connection
+// rules, written by the shared rules and the per-service overrides alike. One
+// spelling because everything load-bearing is in it: the `ct state new`
+// qualifier, the burst-is-twice-the-rate convention, and blockStmt's position
+// ahead of the counter. Written out twice, a change to any of those lands in
+// the copy an operator tunes and silently not in the copy a row overrides
+// with, and "the override behaves differently from the shared limit at the
+// same number" is exactly what nobody would suspect.
+func connRateRule(b *strings.Builder, ports, set string, rate int, blockStmt, comment string) {
+	fmt.Fprintf(b, "\t\tct state new tcp dport %s add @%s { ip saddr limit rate over %d/second burst %d packets } %scounter drop comment %q\n",
+		ports, set, rate, rate*2, blockStmt, comment)
+}
+
+func connCountRule(b *strings.Builder, ports, set string, most int, blockStmt, comment string) {
+	fmt.Fprintf(b, "\t\tct state new tcp dport %s add @%s { ip saddr ct count over %d } %scounter drop comment %q\n",
+		ports, set, most, blockStmt, comment)
+}
+
 // connectionlessMatch is the Source engine's connectionless header: every
 // query and connection attempt starts 0xFFFFFFFF in the first four bytes
 // after the 8-byte UDP header, and an in-game client's sequence-numbered
@@ -540,6 +614,8 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	geoSvcs := spec.geoServices(geoElems)
 	sePorts := spec.sourceEnginePorts()
 	overrides := spec.connOverrides()
+	sharedRatePorts := spec.sharedConnPorts(ProtectService.overridesConnRate)
+	sharedCountPorts := spec.sharedConnPorts(ProtectService.overridesConnCount)
 	if !spec.active(sePorts, geoSvcs, overrides) {
 		return ""
 	}
@@ -591,10 +667,15 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 		}
 		b.WriteString("\t}\n\n")
 	}
-	if spec.NewConnsPerSec > 0 {
+	// Gated on the rule surviving, not on the figure alone: with every TCP
+	// row overriding a shared limit (or none existing at all) the shared rule
+	// is omitted, and a set nothing consults is dead weight the kernel still
+	// has to hold - and a reader of `nft list ruleset` cannot trust the set
+	// list to mean the rule list.
+	if spec.NewConnsPerSec > 0 && len(sharedRatePorts) > 0 {
 		dynSet("conn_rate", 60)
 	}
-	if spec.MaxConnsPerSource > 0 {
+	if spec.MaxConnsPerSource > 0 && len(sharedCountPorts) > 0 {
 		dynSet("conn_count", 0)
 	}
 	if spec.PacketsPerSec > 0 {
@@ -772,46 +853,19 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 		fmt.Fprintf(&b, "\t\tct state invalid counter drop comment %q\n", CounterInvalid)
 	}
 
-	// The shared connection rules cover every TCP service that does not
-	// override them; an overriding service's ports come out of the shared
-	// rule (portsWhere explains why), and come out per limit, because a row
-	// may override one of the two and keep the other. The length guards also
-	// carry the case where every service overrides: portSet of nothing
-	// renders "{ }", which nft refuses along with the whole table.
-	if spec.NewConnsPerSec > 0 {
-		if tcp := spec.portsWhere("tcp", func(sv ProtectService) bool { return sv.NewConnsPerSec > 0 }); len(tcp) > 0 {
-			b.WriteString("\t\t# Connection attempts per source. Established connections are untouched.\n")
-			fmt.Fprintf(&b, "\t\tct state new tcp dport %s add @conn_rate { ip saddr limit rate over %d/second burst %d packets } %scounter drop comment %q\n",
-				portSet(tcp), spec.NewConnsPerSec, spec.NewConnsPerSec*2, blockStmt, CounterConnRate)
-		}
+	// The shared connection rules cover every TCP port no override claims;
+	// an overriding row's ports are subtracted per limit (sharedConnPorts
+	// explains why per limit, and why by interval rather than by row). The
+	// length guards also carry the case where every port is claimed: portSet
+	// of nothing renders "{  }", which nft refuses along with the whole
+	// table. Their sets above are gated on the same condition.
+	if spec.NewConnsPerSec > 0 && len(sharedRatePorts) > 0 {
+		b.WriteString("\t\t# Connection attempts per source. Established connections are untouched.\n")
+		connRateRule(&b, portSet(sharedRatePorts), "conn_rate", spec.NewConnsPerSec, blockStmt, CounterConnRate)
 	}
-	if spec.MaxConnsPerSource > 0 {
-		if tcp := spec.portsWhere("tcp", func(sv ProtectService) bool { return sv.MaxConnsPerSource > 0 }); len(tcp) > 0 {
-			b.WriteString("\t\t# Concurrent connections held by one source.\n")
-			fmt.Fprintf(&b, "\t\tct state new tcp dport %s add @conn_count { ip saddr ct count over %d } %scounter drop comment %q\n",
-				portSet(tcp), spec.MaxConnsPerSource, blockStmt, CounterConnCount)
-		}
-	}
-	// The overrides themselves, one rule per overridden limit with the row's
-	// own figure and set. The shared figures being zero changes nothing here:
-	// a row's limit stands on its own, which is what lets a site hold one
-	// game port tight without limiting its web ports at all. The counter
-	// carries the service's name the way the ceilings do, so the portal shows
-	// which row is dropping without further work.
-	if len(overrides) > 0 {
-		b.WriteString("\t\t# Per-service overrides of the connection limits; these rows' ports\n")
-		b.WriteString("\t\t# are excluded from the shared rules above.\n")
-	}
-	for _, o := range overrides {
-		sv := o.svc
-		if o.rateSet != "" {
-			fmt.Fprintf(&b, "\t\tct state new tcp dport %s add @%s { ip saddr limit rate over %d/second burst %d packets } %scounter drop comment %q\n",
-				portSpec(sv.Port, sv.PortEnd), o.rateSet, sv.NewConnsPerSec, sv.NewConnsPerSec*2, blockStmt, CounterConnRate+":"+sv.Name)
-		}
-		if o.countSet != "" {
-			fmt.Fprintf(&b, "\t\tct state new tcp dport %s add @%s { ip saddr ct count over %d } %scounter drop comment %q\n",
-				portSpec(sv.Port, sv.PortEnd), o.countSet, sv.MaxConnsPerSource, blockStmt, CounterConnCount+":"+sv.Name)
-		}
+	if spec.MaxConnsPerSource > 0 && len(sharedCountPorts) > 0 {
+		b.WriteString("\t\t# Concurrent connections held by one source.\n")
+		connCountRule(&b, portSet(sharedCountPorts), "conn_count", spec.MaxConnsPerSource, blockStmt, CounterConnCount)
 	}
 
 	if udp := spec.ports("udp"); len(udp) > 0 && spec.PacketsPerSec > 0 {
@@ -829,6 +883,31 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 		b.WriteString("\t\t# bytes after the 8-byte UDP header.\n")
 		fmt.Fprintf(&b, "\t\tudp dport %s %s add @query_rate { ip saddr limit rate over %d/second burst %d packets } %scounter drop comment %q\n",
 			portSet(sePorts), connectionlessMatch, spec.QueriesPerSec, spec.QueriesPerSec*2, blockStmt, CounterQueryRate)
+	}
+
+	// The per-service overrides, one rule per overridden limit with the row's
+	// own figure and set. The shared figures being zero changes nothing here:
+	// a row's limit stands on its own, which is what lets a site hold one
+	// game port tight without limiting its web ports at all. The counter
+	// carries the service's name the way the ceilings do, so the portal shows
+	// which row is dropping without further work. Below the UDP rules rather
+	// than beside the shared connection rules they replace, deliberately:
+	// order changes nothing (their ports are subtracted from the shared rules
+	// and a tcp match cannot take a udp packet), and the highest-pps path
+	// through this chain is a UDP flood, which should not walk one TCP-only
+	// rule per override before reaching its own limiter.
+	if len(overrides) > 0 {
+		b.WriteString("\t\t# Per-service overrides of the connection limits; these rows' ports\n")
+		b.WriteString("\t\t# are excluded from the shared rules above.\n")
+	}
+	for _, o := range overrides {
+		sv := o.svc
+		if o.rateSet != "" {
+			connRateRule(&b, portSpec(sv.Port, sv.PortEnd), o.rateSet, sv.NewConnsPerSec, blockStmt, CounterConnRate+":"+sv.Name)
+		}
+		if o.countSet != "" {
+			connCountRule(&b, portSpec(sv.Port, sv.PortEnd), o.countSet, sv.MaxConnsPerSource, blockStmt, CounterConnCount+":"+sv.Name)
+		}
 	}
 
 	// Aggregate ceilings last: a packet that survived every per-source limit

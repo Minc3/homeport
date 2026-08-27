@@ -1272,24 +1272,55 @@ tenfold looser than it needs. `Service.NewConnsPerSec` and
 per-service protect field) give the row rules of its own with its own numbers,
 and its ports leave the shared rules, per limit, because a row may override one
 figure and keep the other: a port left in both rules would face whichever limit
-is tighter rather than the one chosen for it. When every TCP service overrides
-a shared limit the shared rule is omitted entirely, since its port set would
-render `{  }` and nft refuses the whole table over it. Each override feeds a
-set of its own rather than the shared one, because the threshold lives in the
-set's elements, not in the rule: an element is created with the limiter of the
-rule that first added it, so one source touching two services through a shared
-set would keep whichever threshold its first packet happened to create. Set
-names fold from the service name exactly as region names do (`foldSetName` is
-the one fold both use), with a numeric suffix on a collision rather than a
-validate refusal, because unlike regions two services may legitimately carry
-names one fold collapses. The overrides are TCP only - they ride
-connection-state rules - and validate refuses a nonzero value on a udp row
-rather than ignoring it, since a limit the operator believes exists is worse
-than none; the portal hides the two columns on udp rows and clears them with
-the model when the protocol changes, so a hidden value can never block a save
-naming a field nobody can see. The counters carry `:name` the way the ceilings
-do, so the portal attributes the drops with no further work, and the presets
-are untouched: `Apply` still writes only the five shared limits.
+is tighter rather than the one chosen for it.
+
+**"Leave" means subtracted as port intervals (`sharedConnPorts`), not skipped
+as rows, and the first version got that wrong.** Overlapping service rows are
+a supported configuration - `mergePorts` exists because two rows on one port
+are ordinary - and with the overriding *row* skipped, any other row covering
+the same port put it straight back into the shared rule, which sits with the
+shared figure while the override rule carries the row's: a loosening override
+was silently dead, its clients dropped (and parked) at the shared rate, with
+the drops attributed to the bare shared counter. What subtraction cannot fix
+is two rows *both* overriding the same limit while overlapping - there is
+nothing to subtract from - so `web.validate` refuses that state; an older
+blob carrying one gets both rules, the pre-refusal behaviour, never a
+rejected table. Overlaps across different limits stay legal, because the port
+coherently gets one row's rate and the other's cap. When no shared port
+survives the subtraction the shared rule is omitted entirely, since its port
+set would render `{  }` and nft refuses the whole table over it - and its
+*set* is gated on the same condition, because a set nothing consults is dead
+weight the kernel holds and a set list a reader cannot trust to mean the rule
+list.
+
+Each override feeds a set of its own rather than the shared one, because the
+threshold lives in the set's elements, not in the rule: an element is created
+with the limiter of the rule that first added it, so one source touching two
+services through a shared set would keep whichever threshold its first packet
+happened to create. Set names fold from the service name exactly as region
+names do (`foldSetName` is the one fold both use), with a numeric suffix on a
+collision rather than a validate refusal, because unlike regions two services
+may legitimately carry names one fold collapses. The two rule shapes have one
+spelling each (`connRateRule`, `connCountRule`), written by the shared rules
+and the overrides alike, and "this row overrides" has one definition
+(`overridesConnRate`/`overridesConnCount`) consulted by the subtraction and
+the emission alike - written out twice, a drift between them is a published
+port with no connection limit at all, loading clean. The override rules are
+emitted below the UDP limiters, deliberately: order changes nothing (their
+ports are subtracted from the shared rules, and a tcp match cannot take a udp
+packet), and a UDP flood is the highest-pps path through the chain, which
+should not walk one TCP-only rule per override before reaching its own
+limiter. The overrides are TCP only - they ride connection-state rules - and
+validate refuses a nonzero value on a udp row rather than ignoring it, since
+a limit the operator believes exists is worse than none; the portal hides the
+two inputs on udp rows and clears them with the model when the protocol
+changes, so a hidden value can never block a save naming a field nobody can
+see, and the geo-warn banner now covers every per-row protect setting - a
+lock, a ceiling, a connection override - configured while Protection is
+disabled, because all of them live in the table the master switch removes.
+The counters carry `:name` the way the ceilings do, so the portal attributes
+the drops with no further work, and the presets are untouched: `Apply` still
+writes only the five shared limits.
 
 **No eligible path means keep the last route.** `selectPath` returns `0`, the
 caller leaves `e.active` alone, and the installed route stays. Withdrawing it
@@ -2935,17 +2966,25 @@ where a subtle regression would be invisible in production until an outage:
   The per-service connection overrides are pinned in the same file: an
   override splits the shared rules rather than stacking on them - the row gets
   its own figures, sets and `:name` counters while its ports leave the shared
-  rules per limit; an override alone activates the table with the shared
-  figures at zero; a shared rule every TCP service overrides is omitted rather
-  than emitted with an empty port set nft would refuse; the override sets keep
-  the shared sets' shapes (the rate set ages, the count set carries no
-  timeout, which is the connlimit refusal the shared test learned live);
+  rules per limit; the leaving is by port interval, so a plain row overlapping
+  the overriding one cannot resurrect the shared limit on the override's port
+  (the row-skipping first version's silent failure), and an override covering
+  every shared port leaves neither an empty port set nor an orphaned shared
+  set behind; an override alone activates the table with the shared figures at
+  zero; a shared rule every TCP service overrides is omitted rather than
+  emitted with an empty port set nft would refuse, and its set with it; the
+  override sets keep the shared sets' shapes (the rate set ages, the count set
+  carries no timeout, which is the connlimit refusal the shared test learned
+  live, both sliced by one `setBlock` helper so the slicing cannot drift);
   colliding folded service names get distinct sets rather than one set
   declared twice; and a udp row's overrides render nothing and activate
   nothing, because meeting one means a hand-edited blob.
   `web/protect_validate_test.go` holds the save side: the overrides save on a
-  TCP row, are refused on a udp one with the reason in the message, and a
-  negative one is refused with the other limits.
+  TCP row, are refused on a udp one with the reason in the message, a
+  negative one is refused with the other limits, and two rows overriding the
+  same limit on overlapping ports are refused - while a disabled row, an
+  overlap across different limits, and an override overlapping a plain row
+  (the subtraction case) all keep saving.
 
   The region locks are pinned in the same file: a lock alone activates the
   table, matches statelessly before conntrack, and its set carries `flags

@@ -863,16 +863,7 @@ func TestConnCountSetCarriesNoTimeout(t *testing.T) {
 	cfg.Protect.PacketsPerSec = 400
 	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
 
-	setBlock := func(name string) string {
-		start := strings.Index(ruleset, "set "+name+" {")
-		if start < 0 {
-			t.Fatalf("no %s set in the ruleset:\n%s", name, ruleset)
-		}
-		end := strings.Index(ruleset[start:], "}")
-		return ruleset[start : start+end]
-	}
-
-	cc := setBlock("conn_count")
+	cc := setBlock(t, ruleset, "conn_count")
 	if strings.Contains(cc, "timeout") {
 		t.Errorf("the conn_count set carries a timeout, which the kernel refuses for ct count:\n%s", cc)
 	}
@@ -880,10 +871,24 @@ func TestConnCountSetCarriesNoTimeout(t *testing.T) {
 		t.Errorf("the conn_count set is not dynamic, so every add from the packet path is refused:\n%s", cc)
 	}
 	for _, name := range []string{"conn_rate", "packet_rate"} {
-		if b := setBlock(name); !strings.Contains(b, "flags dynamic,timeout") {
+		if b := setBlock(t, ruleset, name); !strings.Contains(b, "flags dynamic,timeout") {
 			t.Errorf("the %s set lost its timeout; its entries would never age:\n%s", name, b)
 		}
 	}
+}
+
+// setBlock returns the body of one named set declaration. A package helper
+// rather than a closure per test, because two tests slice set bodies to make
+// kernel-refusal assertions and a fix to the slicing must not be able to land
+// in one and not the other.
+func setBlock(t *testing.T, ruleset, name string) string {
+	t.Helper()
+	start := strings.Index(ruleset, "set "+name+" {")
+	if start < 0 {
+		t.Fatalf("no %s set in the ruleset:\n%s", name, ruleset)
+	}
+	end := strings.Index(ruleset[start:], "}")
+	return ruleset[start : start+end]
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,6 +1007,57 @@ func TestOverridingEverySharedConnRuleOmitsIt(t *testing.T) {
 	if strings.Contains(ruleset, "{  }") {
 		t.Errorf("an empty set literal reached the ruleset, which nft refuses whole:\n%s", ruleset)
 	}
+	// The shared set goes with the shared rule. Declared anyway it is dead
+	// weight the kernel holds and a set list a reader cannot trust to mean
+	// the rule list.
+	if strings.Contains(ruleset, "set conn_rate {") {
+		t.Errorf("the shared conn_rate set is declared with no rule referencing it:\n%s", ruleset)
+	}
+}
+
+// An override's ports are subtracted from the shared rules as intervals, not
+// by skipping the overriding row: overlapping rows are a supported
+// configuration (mergePorts' own comment calls them ordinary), and skipped by
+// row, any other row covering the same port put it straight back into the
+// shared rule - which sat above the override, so a loosening override was
+// silently dead and the drops were attributed to the shared counter.
+func TestAnOverlappingPlainRowDoesNotResurrectTheSharedLimit(t *testing.T) {
+	cfg := protectCfg()
+	cfg.Protect.NewConnsPerSec = 20
+	cfg.Services = []model.Service{
+		{Name: "panel", Proto: "tcp", Port: 8000, PortEnd: 8100, Enabled: true},
+		{Name: "api", Proto: "tcp", Port: 8080, Enabled: true, NewConnsPerSec: 200},
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	shared := linesWithComment(ruleset, CounterConnRate)
+	if len(shared) != 1 {
+		t.Fatalf("expected exactly one shared conn-rate rule, got %d:\n%s", len(shared), ruleset)
+	}
+	if !strings.Contains(shared[0], "{ 8000-8079, 8081-8100 }") {
+		t.Errorf("the shared rule does not carve the override's port out of the overlapping row: %q", shared[0])
+	}
+	if got := linesWithComment(ruleset, CounterConnRate+":api"); len(got) != 1 || !strings.Contains(got[0], "dport 8080 ") {
+		t.Errorf("the override rule is missing or mis-scoped:\n%s", ruleset)
+	}
+
+	// The other edge: an override covering a plain row entirely leaves the
+	// shared rule with nothing, and it must be omitted with its set rather
+	// than rendered over an empty port list.
+	cfg.Services = []model.Service{
+		{Name: "web", Proto: "tcp", Port: 443, Enabled: true},
+		{Name: "web-tuned", Proto: "tcp", Port: 443, Enabled: true, NewConnsPerSec: 100},
+	}
+	ruleset = BuildProtectRuleset(ProtectSpecFrom(cfg))
+	if lines := linesWithComment(ruleset, CounterConnRate); len(lines) != 0 {
+		t.Errorf("the override covers every shared port, yet a shared rule was emitted: %q", lines[0])
+	}
+	if strings.Contains(ruleset, "set conn_rate {") || strings.Contains(ruleset, "{  }") {
+		t.Errorf("an orphaned shared set or empty port list reached the ruleset:\n%s", ruleset)
+	}
+	if len(linesWithComment(ruleset, CounterConnRate+":web-tuned")) != 1 {
+		t.Errorf("the override rule is missing:\n%s", ruleset)
+	}
 }
 
 // The override sets carry the same shapes as the shared sets they stand in
@@ -1013,18 +1069,10 @@ func TestOverridingEverySharedConnRuleOmitsIt(t *testing.T) {
 func TestPerServiceConnSetsMatchTheSharedSetShapes(t *testing.T) {
 	ruleset := BuildProtectRuleset(ProtectSpecFrom(connCfg()))
 
-	setBlock := func(name string) string {
-		start := strings.Index(ruleset, "set "+name+" {")
-		if start < 0 {
-			t.Fatalf("no %s set in the ruleset:\n%s", name, ruleset)
-		}
-		end := strings.Index(ruleset[start:], "}")
-		return ruleset[start : start+end]
-	}
-	if b := setBlock("conn_rate_minecraft"); !strings.Contains(b, "flags dynamic,timeout") {
+	if b := setBlock(t, ruleset, "conn_rate_minecraft"); !strings.Contains(b, "flags dynamic,timeout") {
 		t.Errorf("the override rate set lost its timeout; its entries would never age:\n%s", b)
 	}
-	cc := setBlock("conn_count_minecraft")
+	cc := setBlock(t, ruleset, "conn_count_minecraft")
 	if strings.Contains(cc, "timeout") {
 		t.Errorf("the override count set carries a timeout, which the kernel refuses for ct count:\n%s", cc)
 	}
