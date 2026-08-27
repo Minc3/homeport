@@ -522,8 +522,20 @@ func validate(cfg *model.Config) error {
 		}
 	}
 	for i := range cfg.Services {
-		if cfg.Services[i].CeilingPPS < 0 {
-			return fmt.Errorf("service %s has a negative packet ceiling", cfg.Services[i].Name)
+		sv := &cfg.Services[i]
+		if sv.CeilingPPS < 0 {
+			return fmt.Errorf("service %s has a negative packet ceiling", sv.Name)
+		}
+		if sv.NewConnsPerSec < 0 || sv.MaxConnsPerSource < 0 {
+			return fmt.Errorf("service %s has a negative per-source connection limit", sv.Name)
+		}
+		// The two overrides ride connection-state rules and mean nothing on a
+		// udp row. Refused rather than silently dropped, because the operator
+		// who set one believes a limit now exists - the UDP counterpart is
+		// the per-source packet rate under Protection.
+		if !strings.EqualFold(sv.Proto, "tcp") && (sv.NewConnsPerSec > 0 || sv.MaxConnsPerSource > 0) {
+			return fmt.Errorf("service %s is not tcp, and the per-source connection overrides are TCP only: "+
+				"clear them, or use the UDP packet rate under Protection", sv.Name)
 		}
 	}
 

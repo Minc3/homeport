@@ -63,12 +63,59 @@ func TestNegativeLimitsAreRefused(t *testing.T) {
 		"packets per second":     func(c *model.Config) { c.Protect.PacketsPerSec = -5 },
 		"block seconds":          func(c *model.Config) { c.Protect.BlockSeconds = -60 },
 		"service ceiling":        func(c *model.Config) { c.Services[0].CeilingPPS = -1 },
+		"service conn rate":      func(c *model.Config) { c.Services[0].NewConnsPerSec = -1 },
+		"service conn cap":       func(c *model.Config) { c.Services[0].MaxConnsPerSource = -1 },
 		"shaping rate":           func(c *model.Config) { c.Paths[0].Shape.ToFrontendMbit = -10 },
 	} {
 		cfg := base()
 		mutate(&cfg)
 		if err := validate(&cfg); err == nil {
 			t.Errorf("a negative %s was accepted", name)
+		}
+	}
+}
+
+// The per-service overrides of the two shared connection limits save on a
+// TCP row - both together and either alone, because a row may override one
+// figure and keep the shared other.
+func TestPerServiceConnOverridesSaveOnTCP(t *testing.T) {
+	cfg := model.Defaults()
+	cfg.Frontend.PublicIface = "eth0"
+	cfg.Protect.Enabled = true
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].NewConnsPerSec = 2
+			cfg.Services[i].MaxConnsPerSource = 6
+		}
+	}
+	if err := validate(&cfg); err != nil {
+		t.Fatalf("a TCP row's connection overrides were rejected: %v", err)
+	}
+}
+
+// The overrides ride connection-state rules and mean nothing on a udp row.
+// Refused rather than silently dropped: the operator who set one believes a
+// limit now exists, and a protection that does not exist is worse than a save
+// that fails with the reason in it.
+func TestPerServiceConnOverridesAreRefusedOnUDP(t *testing.T) {
+	for name, mutate := range map[string]func(*model.Service){
+		"connection rate": func(s *model.Service) { s.NewConnsPerSec = 2 },
+		"connection cap":  func(s *model.Service) { s.MaxConnsPerSource = 6 },
+	} {
+		cfg := model.Defaults()
+		cfg.Frontend.PublicIface = "eth0"
+		for i := range cfg.Services {
+			if cfg.Services[i].Proto == "udp" {
+				mutate(&cfg.Services[i])
+			}
+		}
+		err := validate(&cfg)
+		if err == nil {
+			t.Errorf("a %s override on a udp service was accepted", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "TCP only") {
+			t.Errorf("the error does not say the overrides are TCP only: %v", err)
 		}
 	}
 }

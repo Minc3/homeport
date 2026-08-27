@@ -530,6 +530,8 @@ function counterInfo(name) {
     if (kind === 'ceiling') return [`ceiling: ${svc}`, `Packets over that service's total cap, across every client.`];
     if (kind === 'geo') return [`region lock: ${svc}`, `Packets dropped by that service's region lock.`];
     if (kind === 'geo-trip') return [`auto-lock trips: ${svc}`, 'Packets over the auto-lock threshold. Not drops: each one engaged or refreshed the region lock.'];
+    if (kind === 'conn-rate') return [`connection rate: ${svc}`, `TCP connection attempts over that service's own per-source rate. Established connections are never touched.`];
+    if (kind === 'conn-count') return [`connections held: ${svc}`, `Connection attempts from sources already holding too many open connections to that service.`];
   }
   return [name, ''];
 }
@@ -1096,7 +1098,28 @@ function serviceRow(s, c, onRemove) {
     if (s.proto === v) o.selected = true;
     proto.append(o);
   }
-  proto.addEventListener('change', () => (s.proto = proto.value));
+  // The two per-source connection overrides ride TCP connection-state rules,
+  // so they are hidden on a udp row - and cleared with the model, not just
+  // hidden, because validate refuses a nonzero value on a udp service and a
+  // hidden field the save names is one the operator cannot see or reach: the
+  // same failure the region dropdown clears the auto-lock threshold to
+  // avoid. Clearing on render too, not only on a protocol change, keeps what
+  // is on screen equal to what would be saved for a hand-edited blob.
+  const connRate = num('', s.new_conns_per_sec, (v) => (s.new_conns_per_sec = v || 0), { min: 0, placeholder: '0 = shared' });
+  const connCount = num('', s.max_conns_per_source, (v) => (s.max_conns_per_source = v || 0), { min: 0, placeholder: '0 = shared' });
+  const syncConnCols = () => {
+    const tcp = proto.value === 'tcp';
+    connRate.classList.toggle('hidden', !tcp);
+    connCount.classList.toggle('hidden', !tcp);
+    if (!tcp) {
+      s.new_conns_per_sec = 0;
+      s.max_conns_per_source = 0;
+      connRate.querySelector('input').value = '';
+      connCount.querySelector('input').value = '';
+    }
+  };
+  syncConnCols();
+  proto.addEventListener('change', () => { s.proto = proto.value; syncConnCols(); });
 
   return el('tr', {},
     el('td', {}, field('', s.name, (v) => (s.name = v), { placeholder: 'gmod' })),
@@ -1105,6 +1128,8 @@ function serviceRow(s, c, onRemove) {
     el('td', {}, num('', s.port_end, (v) => (s.port_end = v), { min: 0, placeholder: '0 = single port' })),
     el('td', {}, hostSelect(s.target, c, (v) => (s.target = v))),
     el('td', {}, num('', s.ceiling_pps, (v) => (s.ceiling_pps = v || 0), { min: 0, placeholder: '0 = off' })),
+    el('td', {}, connRate),
+    el('td', {}, connCount),
     el('td', {}, regionSelect(s, c, (v, block) => {
       s.geo_regions = v; s.geo_block = block;
       // Back to "anywhere" takes the auto-lock threshold with it: a
@@ -1667,6 +1692,13 @@ function renderSettings() {
         th('Ceiling pps', 'A cap on this service in total, across every client, in packets per second. 0 is off. '
           + 'Set it above the busiest legitimate moment you have measured and below what the active tunnel can carry: '
           + 'the point is that a flood is discarded here rather than filling a 20 Mbit LTE link and being billed to your quota.'),
+        th('Conns/s', 'Overrides the shared "new connections per second" per-source limit from the Protection section, for this row\'s ports alone. '
+          + '0 means the shared figure applies, and like everything in that section it only exists while protection is enabled. TCP rows only. '
+          + 'The shared figure has to leave room for the hungriest service (a browser opens a handful of connections per page), so a game port '
+          + 'whose clients hold one connection each can be held far tighter here: a join flood is connection churn, and this is the limit that meets it.'),
+        th('Max conns', 'Overrides the shared "concurrent connections per source" limit for this row\'s ports alone. 0 means the shared figure, '
+          + 'TCP rows only, and it does nothing unless protection is enabled. A game client holds exactly one connection while playing, but a '
+          + 'household or carrier NAT shares one address across several players, so leave room: 6 to 8, not 1 or 2.'),
         th('Region', 'Two directions per region: "only x" admits that region and drops the rest of the world, "block x" drops '
           + 'that region and admits everyone else. Either way the drop happens before anything is translated or sent down a '
           + 'tunnel, and anywhere means no lock. The regions on offer are defined in the Protection section below, so add one '
@@ -1759,12 +1791,14 @@ function renderSettings() {
       protectField('new_conns_per_sec', 'New connections per second', pr.new_conns_per_sec, (v) => (pr.new_conns_per_sec = v), {
         min: 0, placeholder: '0 = off',
         help: 'TCP connection attempts from one address, per second. Established connections are never touched, so this only affects how fast a client may open new ones. '
-          + 'A browser opens a handful per page; 20 is generous. Stops connection floods and a stuck client reconnecting in a loop.',
+          + 'A browser opens a handful per page; 20 is generous. Stops connection floods and a stuck client reconnecting in a loop. '
+          + 'A service row can override this for its own ports (the Conns/s column above); this figure covers every TCP service without one.',
       }),
       protectField('max_conns_per_source', 'Concurrent connections per source', pr.max_conns_per_source, (v) => (pr.max_conns_per_source = v), {
         min: 0, placeholder: '0 = off',
         help: 'How many tracked TCP connections one address may hold open at once. Shared connections behind one office or carrier NAT can be surprisingly many, '
-          + 'so keep it well clear of what you see in normal use: 50 to 100 for a web service.',
+          + 'so keep it well clear of what you see in normal use: 50 to 100 for a web service. '
+          + 'A service row can override this for its own ports (the Max conns column above); this figure covers every TCP service without one.',
       }),
       protectField('packets_per_sec', 'UDP packets per second per source', pr.packets_per_sec, (v) => (pr.packets_per_sec = v), {
         min: 0, placeholder: '0 = off',

@@ -854,6 +854,26 @@ type Service struct {
 	// service and bill you for it.
 	CeilingPPS int `json:"ceiling_pps,omitempty"`
 
+	// NewConnsPerSec overrides the shared per-source connection rate
+	// (Protect.NewConnsPerSec) for this service's ports alone. Zero means the
+	// shared figure applies, which is what every service meant before this
+	// existed. It exists because the shared figure is sized by the hungriest
+	// TCP service - a browser holds six connections to one host, a panel
+	// more - while a game client holds exactly one, so a limit safe for the
+	// web ports leaves the game port protected roughly tenfold looser than it
+	// needs. TCP only: the rules it rides are connection-state rules, and
+	// validation refuses it on a udp row rather than ignoring it, because a
+	// limit the operator believes exists is worse than none.
+	NewConnsPerSec int `json:"new_conns_per_sec,omitempty"`
+
+	// MaxConnsPerSource overrides the shared per-source concurrent
+	// connection cap (Protect.MaxConnsPerSource) the same way, under the
+	// same rules. Sizing note that does not fit in a field name: parking is
+	// by address and a household or carrier NAT shares one, so "one
+	// connection per playing client" still wants room for several clients -
+	// 6 to 8, not 1 or 2.
+	MaxConnsPerSource int `json:"max_conns_per_source,omitempty"`
+
 	// GeoRegions locks this service to sources inside the named protection
 	// regions: with one or more set, everything arriving from outside their
 	// union is dropped before it is translated or sent down a tunnel. Empty

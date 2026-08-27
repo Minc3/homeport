@@ -1262,6 +1262,35 @@ nobody asked it to. The most generous preset parks a tripping source for the
 shortest time, deliberately: on a shared address one park is every household
 behind that NAT.
 
+**The two TCP connection limits can be overridden per service, and an override
+replaces the shared rule for that row's ports rather than stacking on it.**
+The shared figures have to be sized for the hungriest TCP service - a browser
+holds six connections to one host, the panel more - while a game client holds
+exactly one, so a single shared figure leaves a game port protected roughly
+tenfold looser than it needs. `Service.NewConnsPerSec` and
+`Service.MaxConnsPerSource` (zero meaning the shared figure, like every
+per-service protect field) give the row rules of its own with its own numbers,
+and its ports leave the shared rules, per limit, because a row may override one
+figure and keep the other: a port left in both rules would face whichever limit
+is tighter rather than the one chosen for it. When every TCP service overrides
+a shared limit the shared rule is omitted entirely, since its port set would
+render `{  }` and nft refuses the whole table over it. Each override feeds a
+set of its own rather than the shared one, because the threshold lives in the
+set's elements, not in the rule: an element is created with the limiter of the
+rule that first added it, so one source touching two services through a shared
+set would keep whichever threshold its first packet happened to create. Set
+names fold from the service name exactly as region names do (`foldSetName` is
+the one fold both use), with a numeric suffix on a collision rather than a
+validate refusal, because unlike regions two services may legitimately carry
+names one fold collapses. The overrides are TCP only - they ride
+connection-state rules - and validate refuses a nonzero value on a udp row
+rather than ignoring it, since a limit the operator believes exists is worse
+than none; the portal hides the two columns on udp rows and clears them with
+the model when the protocol changes, so a hidden value can never block a save
+naming a field nobody can see. The counters carry `:name` the way the ceilings
+do, so the portal attributes the drops with no further work, and the presets
+are untouched: `Apply` still writes only the five shared limits.
+
 **No eligible path means keep the last route.** `selectPath` returns `0`, the
 caller leaves `e.active` alone, and the installed route stays. Withdrawing it
 would blackhole traffic; leaving it means a path that recovers finds the route
@@ -2638,6 +2667,7 @@ because zero is already the right answer.
 | `Path.Shape` | no shaping; no `tc` command changes anything | portal |
 | `Config.Protect` | no filtering; the table is not loaded at all | portal |
 | `Service.SourceEngine`, `Service.CeilingPPS` | an ordinary published port | portal |
+| `Service.NewConnsPerSec`, `Service.MaxConnsPerSource` | the shared per-source connection limits apply | portal |
 | `Protect.Regions`, `Service.GeoRegions` | no region locks; reachable from anywhere | portal |
 | `Service.GeoAutoPPS` | a lock with regions set is unconditional | portal |
 | `Config.QueryCache` | no query cache; A2S queries reach the real server | portal |
@@ -2901,6 +2931,21 @@ where a subtle regression would be invisible in production until an outage:
   counted; the blocklist set is dynamic and bounded; two services on one port
   still produce a set nftables will accept; and the counters and blocklist
   parse back out of `nft -j`.
+
+  The per-service connection overrides are pinned in the same file: an
+  override splits the shared rules rather than stacking on them - the row gets
+  its own figures, sets and `:name` counters while its ports leave the shared
+  rules per limit; an override alone activates the table with the shared
+  figures at zero; a shared rule every TCP service overrides is omitted rather
+  than emitted with an empty port set nft would refuse; the override sets keep
+  the shared sets' shapes (the rate set ages, the count set carries no
+  timeout, which is the connlimit refusal the shared test learned live);
+  colliding folded service names get distinct sets rather than one set
+  declared twice; and a udp row's overrides render nothing and activate
+  nothing, because meeting one means a hand-edited blob.
+  `web/protect_validate_test.go` holds the save side: the overrides save on a
+  TCP row, are refused on a udp one with the reason in the message, and a
+  negative one is refused with the other limits.
 
   The region locks are pinned in the same file: a lock alone activates the
   table, matches statelessly before conntrack, and its set carries `flags

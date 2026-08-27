@@ -885,3 +885,197 @@ func TestConnCountSetCarriesNoTimeout(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Per-service connection limits
+// ---------------------------------------------------------------------------
+
+// connCfg is protectCfg with the shared connection limits set and the
+// minecraft row overriding both. The shared figures have to be sized for the
+// hungriest TCP service - a browser holds six connections, a panel more -
+// while a game client holds exactly one, so without the override the game
+// port is protected roughly tenfold looser than it needs.
+func connCfg() model.Config {
+	cfg := protectCfg()
+	cfg.Protect.NewConnsPerSec = 20
+	cfg.Protect.MaxConnsPerSource = 50
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].NewConnsPerSec = 2
+			cfg.Services[i].MaxConnsPerSource = 6
+		}
+	}
+	return cfg
+}
+
+// linesWithComment returns the trimmed rule lines carrying exactly this
+// comment. Exact, because the shared rules' comments are prefixes of the
+// per-service ones ("conn-rate" of "conn-rate:minecraft") and a Contains here
+// would let the two answer for each other.
+func linesWithComment(ruleset, comment string) []string {
+	var out []string
+	for _, line := range strings.Split(ruleset, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasSuffix(line, ` comment "`+comment+`"`) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// An override replaces the shared limit for that row's ports; it does not
+// stack on top of it. The row gets rules of its own, with its own figures,
+// its own sets and a named counter, and its ports leave the shared rules -
+// left in both, the port would face whichever limit is tighter rather than
+// the one chosen for it, and a row loosening its limit would find the shared
+// rule still dropping at the shared rate.
+func TestPerServiceConnLimitsSplitTheSharedRules(t *testing.T) {
+	cfg := connCfg()
+	cfg.Protect.BlockSeconds = 600
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	wantRate := `ct state new tcp dport 25565 add @conn_rate_minecraft { ip saddr limit rate over 2/second burst 4 packets } add @blocked { ip saddr } counter drop comment "conn-rate:minecraft"`
+	wantCount := `ct state new tcp dport 25565 add @conn_count_minecraft { ip saddr ct count over 6 } add @blocked { ip saddr } counter drop comment "conn-count:minecraft"`
+	for _, want := range []string{wantRate, wantCount} {
+		if !strings.Contains(ruleset, want) {
+			t.Errorf("missing the override rule %q in:\n%s", want, ruleset)
+		}
+	}
+	for _, name := range []string{"conn_rate_minecraft", "conn_count_minecraft"} {
+		if !strings.Contains(ruleset, "set "+name+" {") {
+			t.Errorf("the override rule feeds %s but the set is never declared:\n%s", name, ruleset)
+		}
+	}
+	for _, shared := range []string{CounterConnRate, CounterConnCount} {
+		lines := linesWithComment(ruleset, shared)
+		if len(lines) != 1 {
+			t.Fatalf("expected exactly one shared %s rule, got %d:\n%s", shared, len(lines), ruleset)
+		}
+		if strings.Contains(lines[0], "25565") {
+			t.Errorf("the shared %s rule still covers the overriding row's port: %q", shared, lines[0])
+		}
+	}
+}
+
+// A row's limit stands on its own: with the shared figures at zero, setting
+// only the row's number must still generate the table and the rule, or the
+// save reads as protection and protects nothing.
+func TestAPerServiceConnLimitActivatesTheTableOnItsOwn(t *testing.T) {
+	cfg := protectCfg()
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].NewConnsPerSec = 2
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	if ruleset == "" {
+		t.Fatal("a per-service connection limit alone generated no table")
+	}
+	if len(linesWithComment(ruleset, CounterConnRate+":minecraft")) != 1 {
+		t.Errorf("the override rule is missing:\n%s", ruleset)
+	}
+	// No shared figure, no shared rule or set - the override must not conjure
+	// the shared machinery into existence.
+	if len(linesWithComment(ruleset, CounterConnRate)) != 0 || strings.Contains(ruleset, "set conn_rate {") {
+		t.Errorf("a shared connection-rate rule appeared with the shared figure at zero:\n%s", ruleset)
+	}
+}
+
+// When every TCP service overrides a shared limit, the shared rule has
+// nothing left to match and must be omitted entirely: emitted anyway, its
+// port set renders "{ }", which nft refuses - taking the whole table and
+// every other limit down with it.
+func TestOverridingEverySharedConnRuleOmitsIt(t *testing.T) {
+	cfg := protectCfg()
+	cfg.Protect.NewConnsPerSec = 20
+	for i := range cfg.Services {
+		if cfg.Services[i].Proto == "tcp" {
+			cfg.Services[i].NewConnsPerSec = 5
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	if lines := linesWithComment(ruleset, CounterConnRate); len(lines) != 0 {
+		t.Errorf("every TCP service overrides the rate, yet a shared rule was emitted: %q", lines[0])
+	}
+	if strings.Contains(ruleset, "{  }") {
+		t.Errorf("an empty set literal reached the ruleset, which nft refuses whole:\n%s", ruleset)
+	}
+}
+
+// The override sets carry the same shapes as the shared sets they stand in
+// for, and for the same kernel reasons: a rate set's entries age on a
+// timeout, while a count set must carry none at all - `ct count` is a
+// connlimit expression, the kernel refuses one in a timeout-flagged set, and
+// nft rejects the whole table with it. See TestConnCountSetCarriesNoTimeout
+// for the live failure that pinned the shared half of this.
+func TestPerServiceConnSetsMatchTheSharedSetShapes(t *testing.T) {
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(connCfg()))
+
+	setBlock := func(name string) string {
+		start := strings.Index(ruleset, "set "+name+" {")
+		if start < 0 {
+			t.Fatalf("no %s set in the ruleset:\n%s", name, ruleset)
+		}
+		end := strings.Index(ruleset[start:], "}")
+		return ruleset[start : start+end]
+	}
+	if b := setBlock("conn_rate_minecraft"); !strings.Contains(b, "flags dynamic,timeout") {
+		t.Errorf("the override rate set lost its timeout; its entries would never age:\n%s", b)
+	}
+	cc := setBlock("conn_count_minecraft")
+	if strings.Contains(cc, "timeout") {
+		t.Errorf("the override count set carries a timeout, which the kernel refuses for ct count:\n%s", cc)
+	}
+	if !strings.Contains(cc, "flags dynamic") {
+		t.Errorf("the override count set is not dynamic, so every add from the packet path is refused:\n%s", cc)
+	}
+}
+
+// Service names fold into set identifiers the way region names do, and two
+// that fold to one identifier would be one set declared twice - which nft
+// refuses along with the whole table. Unlike regions there is no validate
+// collision check to lean on (two services may legitimately share a name a
+// fold collapses), so the generator suffixes the second instead.
+func TestCollidingServiceNamesGetDistinctConnSets(t *testing.T) {
+	cfg := protectCfg()
+	cfg.Services = append(cfg.Services,
+		model.Service{Name: "mc one", Proto: "tcp", Port: 25566, Enabled: true, NewConnsPerSec: 2},
+		model.Service{Name: "mc-one", Proto: "tcp", Port: 25567, Enabled: true, NewConnsPerSec: 4},
+	)
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+
+	for _, name := range []string{"conn_rate_mc_one", "conn_rate_mc_one_2"} {
+		if strings.Count(ruleset, "set "+name+" {") != 1 {
+			t.Errorf("expected exactly one declaration of %s:\n%s", name, ruleset)
+		}
+	}
+	if !strings.Contains(ruleset, "dport 25567 add @conn_rate_mc_one_2 { ip saddr limit rate over 4/second") {
+		t.Errorf("the suffixed set is not the one the second service's rule feeds:\n%s", ruleset)
+	}
+}
+
+// validate refuses the overrides on a udp row, so meeting one means a
+// hand-edited blob - and the generator must ignore it rather than emit a
+// connection-state rule for a protocol that has no connections to count.
+// Ignored means ignored twice over: it emits nothing, and it does not
+// activate the table on its own.
+func TestConnOverridesOnAUDPServiceRenderNothing(t *testing.T) {
+	cfg := protectCfg()
+	for i := range cfg.Services {
+		if cfg.Services[i].Proto == "udp" {
+			cfg.Services[i].NewConnsPerSec = 5
+			cfg.Services[i].MaxConnsPerSource = 5
+		}
+	}
+	if got := BuildProtectRuleset(ProtectSpecFrom(cfg)); got != "" {
+		t.Fatalf("a udp row's connection overrides generated a table on their own:\n%s", got)
+	}
+
+	cfg.Protect.PacketsPerSec = 400
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+	if strings.Contains(ruleset, "conn_rate_") || strings.Contains(ruleset, "conn_count_") {
+		t.Errorf("a udp row's connection overrides reached the ruleset:\n%s", ruleset)
+	}
+}
