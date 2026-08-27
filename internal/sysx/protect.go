@@ -357,15 +357,15 @@ func (sv ProtectService) overridesConnCount() bool {
 
 // sharedConnPorts is the port set one shared connection rule covers: every
 // TCP row's ports, minus the port intervals of the rows overriding that
-// limit. Subtracted as intervals rather than by skipping the overriding rows,
-// because overlapping rows are a supported configuration (mergePorts exists
-// for them): skipped by row, any other row covering the same port put it
-// straight back into the shared rule, and a port in both rules faces
-// whichever limit is tighter rather than the one chosen for it - a loosening
-// override was silently dead. Overlap between two rows overriding the same
-// limit cannot be fixed by subtraction and is refused by web.validate; an
-// older blob carrying one gets both rules, which is the pre-refusal
-// behaviour, not a rejected table.
+// limit. Subtracted as intervals rather than by skipping the overriding rows:
+// skipped by row, any other row covering the same port put it straight back
+// into the shared rule, and a port in both rules faces whichever limit is
+// tighter rather than the one chosen for it - a loosening override was
+// silently dead. web.validate now refuses enabled same-protocol rows from
+// overlapping at all, so through the portal this only ever subtracts a row's
+// own ports; the interval arithmetic stays because a blob saved before that
+// refusal can carry an overlap and must keep generating the rules the
+// operator meant, not a rejected table.
 func (s ProtectSpec) sharedConnPorts(overridden func(ProtectService) bool) []string {
 	var base, cut []portRange
 	for _, sv := range s.Services {
@@ -472,9 +472,12 @@ type portRange struct{ lo, hi int }
 //
 // It has to merge rather than just list, because an nftables set rejects both a
 // repeated element and two intervals that overlap - and the whole table fails
-// to load, taking every other limit with it. Two service rows on port 80, or
-// one on 27015 beside another on 27015-27020, are both ordinary things for an
-// operator to configure and neither is an error worth refusing a save over.
+// to load, taking every other limit with it. web.validate now refuses enabled
+// same-protocol rows from overlapping, but this must keep merging regardless:
+// a blob saved before that refusal can still carry an overlap, and adjacent
+// ranges (80 beside 81-90) are legal to save while still being one interval
+// to the kernel - listed separately they are a rejected duplicate at the
+// boundary.
 func mergePorts(in []portRange) []string {
 	if len(in) == 0 {
 		return nil

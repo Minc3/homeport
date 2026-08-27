@@ -1262,6 +1262,25 @@ nobody asked it to. The most generous preset parks a tripping source for the
 shortest time, deliberately: on a shared address one park is every household
 behind that NAT.
 
+**A port is published by one enabled row per protocol, and `web.validate`
+refuses the overlap at save.** A service row is a DNAT rule and DNAT is
+first-match, so two enabled rows of one protocol sharing a port were never a
+tie: the later row's overlap silently received nothing, which reads as the
+service being down at the far end - and every per-row protect figure (a
+ceiling, a lock, a connection override) was ambiguous about which row's
+number governed the shared port. The allowances are as deliberate as the
+refusal: a *disabled* duplicate row is a legitimate parked alternative (same
+port, different target, flip which is enabled) and generates no rule to
+conflict with - enabling it triggers the check at that save, which is the
+right moment; the same port on tcp and udp is two ports to the kernel; and an
+adjacent range shares no port. The portal also names the clash live
+(`updatePortClashWarn`, the geo-warn pattern), because the validate refusal
+lands only after Save is clicked and blocks every unrelated edit in the form
+with it. The generators still tolerate an overlap (`mergePorts`,
+`sharedConnPorts`), because a blob saved before this check can carry one and
+must keep loading; a site with one stored finds every save refused until the
+overlap is fixed, with both rows named in the message.
+
 **The two TCP connection limits can be overridden per service, and an override
 replaces the shared rule for that row's ports rather than stacking on it.**
 The shared figures have to be sized for the hungriest TCP service - a browser
@@ -1275,23 +1294,20 @@ figure and keep the other: a port left in both rules would face whichever limit
 is tighter rather than the one chosen for it.
 
 **"Leave" means subtracted as port intervals (`sharedConnPorts`), not skipped
-as rows, and the first version got that wrong.** Overlapping service rows are
-a supported configuration - `mergePorts` exists because two rows on one port
-are ordinary - and with the overriding *row* skipped, any other row covering
-the same port put it straight back into the shared rule, which sits with the
-shared figure while the override rule carries the row's: a loosening override
-was silently dead, its clients dropped (and parked) at the shared rate, with
-the drops attributed to the bare shared counter. What subtraction cannot fix
-is two rows *both* overriding the same limit while overlapping - there is
-nothing to subtract from - so `web.validate` refuses that state; an older
-blob carrying one gets both rules, the pre-refusal behaviour, never a
-rejected table. Overlaps across different limits stay legal, because the port
-coherently gets one row's rate and the other's cap. When no shared port
-survives the subtraction the shared rule is omitted entirely, since its port
-set would render `{  }` and nft refuses the whole table over it - and its
-*set* is gated on the same condition, because a set nothing consults is dead
-weight the kernel holds and a set list a reader cannot trust to mean the rule
-list.
+as rows, and the first version got that wrong.** With the overriding *row*
+skipped, any other row covering the same port put it straight back into the
+shared rule, which sits with the shared figure while the override rule
+carries the row's: a loosening override was silently dead, its clients
+dropped (and parked) at the shared rate, with the drops attributed to the
+bare shared counter. The overlap refusal above now keeps that state out of
+the portal entirely, so through a save the subtraction only ever removes a
+row's own ports - the interval arithmetic stays for the blob saved before
+the refusal existed, which must keep generating the rules the operator
+meant, never a rejected table. When no shared port survives the subtraction
+the shared rule is omitted entirely, since its port set would render `{  }`
+and nft refuses the whole table over it - and its *set* is gated on the same
+condition, because a set nothing consults is dead weight the kernel holds
+and a set list a reader cannot trust to mean the rule list.
 
 Each override feeds a set of its own rather than the shared one, because the
 threshold lives in the set's elements, not in the rule: an element is created
@@ -2980,11 +2996,12 @@ where a subtle regression would be invisible in production until an outage:
   declared twice; and a udp row's overrides render nothing and activate
   nothing, because meeting one means a hand-edited blob.
   `web/protect_validate_test.go` holds the save side: the overrides save on a
-  TCP row, are refused on a udp one with the reason in the message, a
-  negative one is refused with the other limits, and two rows overriding the
-  same limit on overlapping ports are refused - while a disabled row, an
-  overlap across different limits, and an override overlapping a plain row
-  (the subtraction case) all keep saving.
+  TCP row, are refused on a udp one with the reason in the message, and a
+  negative one is refused with the other limits. The overlap rule is pinned
+  there too: two enabled rows of one protocol sharing a port are refused with
+  both rows and the port in the message, overriding rows ride the same
+  refusal, and the three allowances all keep saving - a disabled duplicate,
+  the same port on tcp and udp, and an adjacent range.
 
   The region locks are pinned in the same file: a lock alone activates the
   table, matches statelessly before conntrack, and its set carries `flags

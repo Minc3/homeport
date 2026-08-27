@@ -120,52 +120,63 @@ func TestPerServiceConnOverridesAreRefusedOnUDP(t *testing.T) {
 	}
 }
 
-// Two enabled rows that both override the same connection limit must not
-// overlap on ports: both rules match the shared port, the tighter figure
-// governs ports it was not chosen for, and each row's counter reads as if its
-// own number stood. An override overlapping a plain row is the supported
-// case - the generator subtracts its interval from the shared rule - so that
-// must keep saving, as must overlapping rows overriding different limits
-// (the port coherently gets one row's rate and the other's cap) and a
-// disabled row, which generates nothing to collide with.
-func TestOverlappingConnOverridesAreRefused(t *testing.T) {
+// Each port belongs to one enabled row per protocol. A service row is a DNAT
+// rule and DNAT is first-match, so the later row's overlap silently receives
+// nothing and looks exactly like the service being down at the far end - and
+// every per-row protect figure is ambiguous about which row governs the
+// shared port. The allowances are as deliberate as the refusal: a disabled
+// duplicate is a parked alternative that generates no rule, the same port on
+// tcp and udp is two ports to the kernel, and an adjacent range shares no
+// port at all.
+func TestOverlappingServiceRowsAreRefused(t *testing.T) {
 	base := func() model.Config {
 		cfg := model.Defaults()
 		cfg.Frontend.PublicIface = "eth0"
-		cfg.Protect.Enabled = true
 		cfg.Services = []model.Service{
-			{Name: "game", Proto: "tcp", Port: 27015, PortEnd: 27020, Enabled: true, NewConnsPerSec: 5},
-			{Name: "rcon", Proto: "tcp", Port: 27020, Enabled: true},
+			{Name: "gmod", Proto: "tcp", Port: 25565, PortEnd: 25580, Enabled: true},
+			{Name: "gmod-two", Proto: "tcp", Port: 25580, PortEnd: 25584, Enabled: true},
 		}
 		return cfg
 	}
 
 	cfg := base()
-	cfg.Services[1].NewConnsPerSec = 2
 	err := validate(&cfg)
 	if err == nil {
-		t.Fatal("two rate overrides overlapping on a port were accepted")
+		t.Fatal("two enabled tcp rows sharing port 25580 were accepted")
 	}
-	if !strings.Contains(err.Error(), "overlap") {
-		t.Errorf("the error does not name the overlap: %v", err)
+	for _, want := range []string{"25580", "gmod", "gmod-two"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not name %q, so the operator cannot find the clash: %v", want, err)
+		}
+	}
+
+	// The overriding-rows case rides the same rule: with no two enabled
+	// same-protocol rows able to overlap, no two connection overrides can
+	// either, which is what keeps the per-row figures unambiguous.
+	cfg = base()
+	cfg.Protect.Enabled = true
+	cfg.Services[0].NewConnsPerSec = 5
+	cfg.Services[1].NewConnsPerSec = 2
+	if err := validate(&cfg); err == nil {
+		t.Error("two overlapping rows with connection overrides were accepted")
 	}
 
 	cfg = base()
-	cfg.Services[1].NewConnsPerSec = 2
 	cfg.Services[1].Enabled = false
 	if err := validate(&cfg); err != nil {
-		t.Errorf("a disabled overlapping override blocked the save: %v", err)
+		t.Errorf("a disabled duplicate blocked the save, but it generates no rule to conflict with: %v", err)
 	}
 
 	cfg = base()
-	cfg.Services[1].MaxConnsPerSource = 2
+	cfg.Services[1].Proto = "udp"
 	if err := validate(&cfg); err != nil {
-		t.Errorf("overlapping overrides of different limits were refused: %v", err)
+		t.Errorf("the same port on tcp and udp was refused, but those are two ports to the kernel: %v", err)
 	}
 
 	cfg = base()
+	cfg.Services[1].Port = 25581
 	if err := validate(&cfg); err != nil {
-		t.Errorf("an override overlapping a plain row was refused, but that is the subtraction case: %v", err)
+		t.Errorf("an adjacent range was refused, but it shares no port: %v", err)
 	}
 }
 

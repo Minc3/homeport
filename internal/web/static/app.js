@@ -766,6 +766,44 @@ function updateGeoWarn() {
   }
 }
 
+// updatePortClashWarn names two enabled rows of one protocol publishing the
+// same port, before the save is attempted. validate refuses the state - a
+// service row is a DNAT rule, DNAT is first-match, and the other row's
+// overlap silently receives nothing - but a validate refusal lands after
+// Save is clicked and blocks every unrelated edit in the form with it, so
+// the clash is worth naming while it is still being typed. The mirror of
+// validate's rule, not a second opinion: enabled rows only, same protocol
+// only, first clashing pair named. Port fields speak through 'change', so
+// the banner appears when the operator leaves the field.
+function updatePortClashWarn() {
+  const w = document.getElementById('port-clash-warn');
+  if (!w || !config) return;
+  const rows = (config.services || []).filter((s) => s.enabled);
+  let clash = null;
+  for (let i = 0; i < rows.length && !clash; i++) {
+    for (let j = i + 1; j < rows.length; j++) {
+      const a = rows[i], b = rows[j];
+      if (a.proto !== b.proto) continue;
+      const hiA = Math.max(a.port, a.port_end || 0), hiB = Math.max(b.port, b.port_end || 0);
+      if (a.port > hiB || b.port > hiA) continue;
+      const lo = Math.max(a.port, b.port), hi = Math.min(hiA, hiB);
+      clash = { a, b, ports: hi > lo ? `${lo}-${hi}` : `${lo}` };
+      break;
+    }
+  }
+  w.classList.toggle('hidden', !clash);
+  if (clash) {
+    w.textContent = '';
+    w.append(
+      el('h3', { text: `Port${clash.ports.includes('-') ? 's' : ''} ${clash.ports} published twice: `
+        + `${clash.a.name || '(unnamed)'} and ${clash.b.name || '(unnamed)'}` }),
+      el('p', { text: 'Each port can be published by one enabled row per protocol: the translation is first-match, so the other '
+        + 'row\'s overlap would silently receive nothing and look exactly like the service being down. Saving will be refused '
+        + 'until the range is split or one row is disabled.' }),
+    );
+  }
+}
+
 // updateQcacheWarn notes, without refusing anything, that the query cache is
 // on while Protection is off. That combination is supported by design - the
 // cache absorbs floods the limits cannot see - but with protection off there
@@ -815,6 +853,7 @@ function updateQcacheWarn() {
     form.addEventListener(evt, updateDirty);
     form.addEventListener(evt, updateGeoWarn);
     form.addEventListener(evt, updateQcacheWarn);
+    form.addEventListener(evt, updatePortClashWarn);
   }
 }
 
@@ -1689,6 +1728,11 @@ function renderSettings() {
     // believes exists is worse than none. First in the section, above the
     // table, because the first real use scrolled past it at the bottom.
     el('div', { class: 'alert warn hidden', id: 'geo-warn' }),
+    // Filled by updatePortClashWarn, on the same delegated events: validate
+    // refuses the save, but the refusal arrives after Save is clicked and
+    // blocks every unrelated edit with it, so the clash is worth naming
+    // while it is being typed.
+    el('div', { class: 'alert warn hidden', id: 'port-clash-warn' }),
     el('div', { class: 'table-wrap' }, el('table', {},
       el('thead', {}, el('tr', {},
         th('Name', 'Label only: it appears as a comment in the generated ruleset and in this table. Examples: gmod, gmod-hltv, https.'),
@@ -2186,6 +2230,7 @@ async function loadSettings() {
     // already carrying either mismatch.
     updateGeoWarn();
     updateQcacheWarn();
+    updatePortClashWarn();
   } catch (e) {
     toast(e.message, true);
   }

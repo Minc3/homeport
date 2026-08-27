@@ -799,33 +799,40 @@ func validate(cfg *model.Config) error {
 		}
 	}
 
-	// Two enabled rows that both override the same connection limit must not
-	// overlap on ports. An override overlapping a plain row is fine, because
-	// the generator subtracts its interval from the shared rule - but between
-	// two overrides there is nothing to subtract from: both rules match the
-	// shared port and the tighter figure governs ports it was not chosen for,
-	// silently, while each row's counter reads as if its own number stood.
-	for _, lim := range []struct {
-		what string
-		on   func(model.Service) bool
-	}{
-		{"connection rate", func(s model.Service) bool { return s.NewConnsPerSec > 0 }},
-		{"connection cap", func(s model.Service) bool { return s.MaxConnsPerSource > 0 }},
-	} {
-		var seen []model.Service
-		for _, sv := range cfg.Services {
-			if !sv.Enabled || sv.Proto != "tcp" || !lim.on(sv) {
+	// Each port belongs to one enabled row per protocol. Two enabled rows of
+	// one protocol overlapping is not tidiness: a service row is a DNAT rule
+	// and DNAT is first-match, so the later row's overlap silently receives
+	// nothing and reads as the service being down at the far end - and every
+	// per-row protect figure (a ceiling, a lock, a connection override) is
+	// ambiguous about which row's number governs the shared port. Disabled
+	// rows are exempt on purpose: a parked duplicate kept as an alternative
+	// target is a legitimate workflow and generates no rule to conflict with;
+	// enabling it triggers this check at that save, which is the right
+	// moment. Different protocols never collide - 27015/tcp beside 27015/udp
+	// is two ports to the kernel. The generators still tolerate an overlap
+	// (mergePorts, sharedConnPorts), because a blob saved before this check
+	// can carry one and must keep loading.
+	for i, a := range cfg.Services {
+		if !a.Enabled {
+			continue
+		}
+		for _, b := range cfg.Services[:i] {
+			if !b.Enabled || b.Proto != a.Proto {
 				continue
 			}
-			hi := max(sv.Port, sv.PortEnd)
-			for _, prev := range seen {
-				if sv.Port <= max(prev.Port, prev.PortEnd) && prev.Port <= hi {
-					return fmt.Errorf("services %s and %s both override the per-source %s and overlap on ports: "+
-						"both rules would match the shared ports and whichever figure is tighter would win, silently; "+
-						"give the overlap to one row, or drop one override", prev.Name, sv.Name, lim.what)
-				}
+			loA, hiA := a.Port, max(a.Port, a.PortEnd)
+			loB, hiB := b.Port, max(b.Port, b.PortEnd)
+			if loA > hiB || loB > hiA {
+				continue
 			}
-			seen = append(seen, sv)
+			lo, hi := max(loA, loB), min(hiA, hiB)
+			ports := fmt.Sprintf("%d", lo)
+			if hi > lo {
+				ports = fmt.Sprintf("%d-%d", lo, hi)
+			}
+			return fmt.Errorf("services %s and %s both publish %s port(s) %s: each port can be published by "+
+				"one enabled row per protocol, because the translation is first-match and the other row's "+
+				"overlap would silently receive nothing; split the range, or disable one row", b.Name, a.Name, a.Proto, ports)
 		}
 	}
 	return nil

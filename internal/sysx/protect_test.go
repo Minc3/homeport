@@ -1016,11 +1016,14 @@ func TestOverridingEverySharedConnRuleOmitsIt(t *testing.T) {
 }
 
 // An override's ports are subtracted from the shared rules as intervals, not
-// by skipping the overriding row: overlapping rows are a supported
-// configuration (mergePorts' own comment calls them ordinary), and skipped by
-// row, any other row covering the same port put it straight back into the
-// shared rule - which sat above the override, so a loosening override was
-// silently dead and the drops were attributed to the shared counter.
+// by skipping the overriding row: skipped by row, any other row covering the
+// same port put it straight back into the shared rule - which sat above the
+// override, so a loosening override was silently dead and the drops were
+// attributed to the shared counter. web.validate now refuses enabled
+// same-protocol rows from overlapping at all, so the configurations below
+// are what an older blob can carry, and the generator must keep serving the
+// rules the operator meant rather than a rejected table - which is exactly
+// why this test builds specs directly instead of going through validate.
 func TestAnOverlappingPlainRowDoesNotResurrectTheSharedLimit(t *testing.T) {
 	cfg := protectCfg()
 	cfg.Protect.NewConnsPerSec = 20
