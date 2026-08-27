@@ -772,34 +772,44 @@ function updateGeoWarn() {
 // overlap silently receives nothing - but a validate refusal lands after
 // Save is clicked and blocks every unrelated edit in the form with it, so
 // the clash is worth naming while it is still being typed. The mirror of
-// validate's rule, not a second opinion: enabled rows only, same protocol
-// only, first clashing pair named. Port fields speak through 'change', so
-// the banner appears when the operator leaves the field.
+// validate's rule, not a second opinion, and mirrored in three particulars
+// that each earned their line: rows without a usable port are skipped,
+// because a cleared Port box holds 0 in the model until it is retyped, and
+// validate refuses that row as an invalid port before its overlap loop ever
+// runs - scanned here, a half-edited row announced a phantom clash against a
+// row the operator never touched; the scan runs in validate's own order
+// (each row against the rows before it), so with two independent clashes
+// the banner and the refusal name the same pair, not different ones; and
+// the earlier row is named first, as the refusal names it. Port fields
+// speak through 'change', so the banner appears when the operator leaves
+// the field.
 function updatePortClashWarn() {
   const w = document.getElementById('port-clash-warn');
   if (!w || !config) return;
-  const rows = (config.services || []).filter((s) => s.enabled);
-  let clash = null;
-  for (let i = 0; i < rows.length && !clash; i++) {
-    for (let j = i + 1; j < rows.length; j++) {
-      const a = rows[i], b = rows[j];
-      if (a.proto !== b.proto) continue;
-      const hiA = Math.max(a.port, a.port_end || 0), hiB = Math.max(b.port, b.port_end || 0);
-      if (a.port > hiB || b.port > hiA) continue;
-      const lo = Math.max(a.port, b.port), hi = Math.min(hiA, hiB);
-      clash = { a, b, ports: hi > lo ? `${lo}-${hi}` : `${lo}` };
-      break;
+  const rows = (config.services || []).filter((s) => s.enabled && s.port >= 1);
+  const clash = (() => {
+    for (let i = 1; i < rows.length; i++) {
+      for (let j = 0; j < i; j++) {
+        const a = rows[i], b = rows[j];
+        if (a.proto !== b.proto) continue;
+        const hiA = Math.max(a.port, a.port_end || 0), hiB = Math.max(b.port, b.port_end || 0);
+        if (a.port > hiB || b.port > hiA) continue;
+        const lo = Math.max(a.port, b.port), hi = Math.min(hiA, hiB);
+        return { first: b, second: a, range: hi > lo, ports: hi > lo ? `${lo}-${hi}` : `${lo}` };
+      }
     }
-  }
+    return null;
+  })();
   w.classList.toggle('hidden', !clash);
   if (clash) {
     w.textContent = '';
     w.append(
-      el('h3', { text: `Port${clash.ports.includes('-') ? 's' : ''} ${clash.ports} published twice: `
-        + `${clash.a.name || '(unnamed)'} and ${clash.b.name || '(unnamed)'}` }),
+      el('h3', { text: `Port${clash.range ? 's' : ''} ${clash.ports} published twice: `
+        + `${clash.first.name || '(unnamed)'} and ${clash.second.name || '(unnamed)'}` }),
       el('p', { text: 'Each port can be published by one enabled row per protocol: the translation is first-match, so the other '
         + 'row\'s overlap would silently receive nothing and look exactly like the service being down. Saving will be refused '
-        + 'until the range is split or one row is disabled.' }),
+        + 'until the overlap is gone. Split the range so each port appears on one row; disabling a row instead is only right for '
+        + 'a true duplicate, because if the two rows publish to different hosts it silently moves the port to the other one.' }),
     );
   }
 }
@@ -1774,7 +1784,23 @@ function renderSettings() {
       servicesBody)),
     el('div', { class: 'row' }, el('button', {
       class: 'btn', type: 'button',
-      onclick: () => { c.services.push({ name: 'new', proto: 'tcp', port: 5000, port_end: 0, enabled: true }); renderServices(); },
+      // The seed port walks up from 5000 to the first port no existing row
+      // covers, whatever its protocol or enabled state. A fixed 5000 broke
+      // the rule this form itself enforces: the save refuses two enabled
+      // rows of one protocol on a port, so two clicks of this button built
+      // a form Save then rejected, naming "new and new" - and a button must
+      // never build a row the Save button refuses, which is the same
+      // invariant the region dropdown holds by clearing the auto-lock
+      // threshold. Every proto and disabled rows too, because the new row's
+      // protocol can be flipped and a parked row can be enabled, and a seed
+      // that is simply free of everything cannot be argued into a clash.
+      onclick: () => {
+        const covers = (p) => c.services.some((s) => p >= s.port && p <= Math.max(s.port, s.port_end || 0));
+        let port = 5000;
+        while (covers(port) && port < 65535) port++;
+        c.services.push({ name: 'new', proto: 'tcp', port, port_end: 0, enabled: true });
+        renderServices();
+      },
     }, 'Add service')),
     el('p', { class: 'hint', text: 'Destination NAT only. Source addresses are never rewritten, so the game server and the web server see real client IPs.' }),
   ));

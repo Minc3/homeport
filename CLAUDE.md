@@ -1276,10 +1276,32 @@ right moment; the same port on tcp and udp is two ports to the kernel; and an
 adjacent range shares no port. The portal also names the clash live
 (`updatePortClashWarn`, the geo-warn pattern), because the validate refusal
 lands only after Save is clicked and blocks every unrelated edit in the form
-with it. The generators still tolerate an overlap (`mergePorts`,
-`sharedConnPorts`), because a blob saved before this check can carry one and
-must keep loading; a site with one stored finds every save refused until the
-overlap is fixed, with both rows named in the message.
+with it. That mirror holds three particulars deliberately: rows without a
+usable port are skipped, because a cleared Port box holds 0 in the model and
+validate refuses that row as an invalid port before its overlap loop runs -
+scanned, a half-edited row announced a phantom clash against a row the
+operator never touched; the scan runs in validate's order so two independent
+clashes cannot have the banner and the refusal naming different pairs; and
+the Add button seeds each new row with the first port from 5000 no existing
+row covers, because a fixed seed meant two clicks of Add built the very form
+this rule refuses, named "new and new". The refusal message identifies rows
+by name alone and names are not required to be unique or non-empty, so a
+blank renders as "(unnamed)" rather than as nothing.
+
+What the rule deliberately removes is worth recording: a narrow enabled row
+inside a wider enabled row's range used to work in two shapes - listed
+first, it sent one port of a range to a different host (DNAT rules are
+emitted in row order), and in any position its ceiling or region lock applied
+to its sub-range regardless of which row's DNAT matched. Both were
+order-dependent or invisible-by-inspection, and both are now expressed by
+splitting the wide row so each port appears exactly once. The message warns
+that disabling a row instead is only right for a true duplicate, because for
+rows publishing to different hosts it silently moves the ports to the other
+host - the very misdelivery the refusal exists to prevent. The generators
+still tolerate an overlap (`mergePorts`, `sharedConnPorts`, and the `claimed`
+dedupe in `model.QueryCachePorts`), because a blob saved before this check
+can carry one and must keep loading; a site with one stored finds every save
+refused until the overlap is fixed, with both rows named in the message.
 
 **The two TCP connection limits can be overridden per service, and an override
 replaces the shared rule for that row's ports rather than stacking on it.**
@@ -2761,8 +2783,10 @@ failback hold-down, 60 GB and 20 GB quotas resetting on the 1st in
 a row is a DNAT rule, and a fresh install must not publish a port on the
 strength of nobody having deleted it. Arming is when the shipped list would
 have gone live, which is why observe mode is not the answer to this on its own.
-A row added in the portal starts at `5000/tcp`, a port nothing here listens on,
-so a row saved before it was edited publishes nothing that exists.
+A row added in the portal starts at the first port from `5000/tcp` upward that
+no existing row covers - a port nothing here listens on, so a row saved before
+it was edited publishes nothing that exists, and a port no row holds, so two
+clicks of Add cannot build the overlap the save refuses.
 
 The one shipped egress source, `pterodactyl` on `172.18.0.0/16`, is disabled
 for the same reason and needs it more: enabled, it would pull every container
@@ -2999,9 +3023,13 @@ where a subtle regression would be invisible in production until an outage:
   TCP row, are refused on a udp one with the reason in the message, and a
   negative one is refused with the other limits. The overlap rule is pinned
   there too: two enabled rows of one protocol sharing a port are refused with
-  both rows and the port in the message, overriding rows ride the same
-  refusal, and the three allowances all keep saving - a disabled duplicate,
-  the same port on tcp and udp, and an adjacent range.
+  both rows and the port in the message (the fixture names share no prefix,
+  because "gmod" beside "gmod-two" let a message naming only one row pass the
+  check for both), a blank name renders as "(unnamed)" rather than as
+  nothing, overriding rows ride the same refusal with the message checked so
+  it pins the overlap specifically, and the three allowances all keep
+  saving - a disabled duplicate, the same port on tcp and udp, and an
+  adjacent range.
 
   The region locks are pinned in the same file: a lock alone activates the
   table, matches statelessly before conntrack, and its set carries `flags

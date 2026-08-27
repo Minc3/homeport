@@ -830,9 +830,25 @@ func validate(cfg *model.Config) error {
 			if hi > lo {
 				ports = fmt.Sprintf("%d-%d", lo, hi)
 			}
+			// Nothing requires a service name to be non-empty, and this
+			// message identifies the rows by nothing else, so a blank is
+			// spelled out the way the portal's banner already spells it -
+			// "services  and  both publish" points at nothing.
+			nameOr := func(n string) string {
+				if n == "" {
+					return "(unnamed)"
+				}
+				return n
+			}
+			// The remedy names splitting first and warns about disabling,
+			// because for rows publishing to different hosts disabling is
+			// not a fix: it silently hands the overlap to the other row's
+			// host, which is the misdelivery this refusal exists to prevent.
 			return fmt.Errorf("services %s and %s both publish %s port(s) %s: each port can be published by "+
 				"one enabled row per protocol, because the translation is first-match and the other row's "+
-				"overlap would silently receive nothing; split the range, or disable one row", b.Name, a.Name, a.Proto, ports)
+				"overlap would silently receive nothing; split the range so each port appears on one row, "+
+				"or disable one row - only if it is a true duplicate, since if the rows publish to different "+
+				"hosts that silently moves the ports to the other host", nameOr(b.Name), nameOr(a.Name), a.Proto, ports)
 		}
 	}
 	return nil

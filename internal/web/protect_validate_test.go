@@ -129,12 +129,15 @@ func TestPerServiceConnOverridesAreRefusedOnUDP(t *testing.T) {
 // tcp and udp is two ports to the kernel, and an adjacent range shares no
 // port at all.
 func TestOverlappingServiceRowsAreRefused(t *testing.T) {
+	// The two names share no prefix on purpose: with "gmod" beside
+	// "gmod-two", Contains("gmod") passed on a message naming only the
+	// second row, so the assertion that BOTH rows are named could not fail.
 	base := func() model.Config {
 		cfg := model.Defaults()
 		cfg.Frontend.PublicIface = "eth0"
 		cfg.Services = []model.Service{
 			{Name: "gmod", Proto: "tcp", Port: 25565, PortEnd: 25580, Enabled: true},
-			{Name: "gmod-two", Proto: "tcp", Port: 25580, PortEnd: 25584, Enabled: true},
+			{Name: "hltv", Proto: "tcp", Port: 25580, PortEnd: 25584, Enabled: true},
 		}
 		return cfg
 	}
@@ -144,21 +147,37 @@ func TestOverlappingServiceRowsAreRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("two enabled tcp rows sharing port 25580 were accepted")
 	}
-	for _, want := range []string{"25580", "gmod", "gmod-two"} {
+	for _, want := range []string{"25580", "gmod", "hltv"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error does not name %q, so the operator cannot find the clash: %v", want, err)
 		}
 	}
 
+	// Names are the only row identifier in the message and nothing requires
+	// them to be non-empty, so a blank is spelled out rather than rendered
+	// as "services  and  both publish", which points at nothing.
+	cfg = base()
+	cfg.Services[0].Name = ""
+	cfg.Services[1].Name = ""
+	err = validate(&cfg)
+	if err == nil {
+		t.Fatal("two unnamed clashing rows were accepted")
+	}
+	if !strings.Contains(err.Error(), "(unnamed)") {
+		t.Errorf("a blank row name is not spelled out in the message: %v", err)
+	}
+
 	// The overriding-rows case rides the same rule: with no two enabled
 	// same-protocol rows able to overlap, no two connection overrides can
-	// either, which is what keeps the per-row figures unambiguous.
+	// either, which is what keeps the per-row figures unambiguous. The
+	// message is checked so this pins the overlap refusal specifically,
+	// not just any refusal of this config.
 	cfg = base()
 	cfg.Protect.Enabled = true
 	cfg.Services[0].NewConnsPerSec = 5
 	cfg.Services[1].NewConnsPerSec = 2
-	if err := validate(&cfg); err == nil {
-		t.Error("two overlapping rows with connection overrides were accepted")
+	if err := validate(&cfg); err == nil || !strings.Contains(err.Error(), "publish") {
+		t.Errorf("two overlapping rows with connection overrides were not refused as an overlap: %v", err)
 	}
 
 	cfg = base()

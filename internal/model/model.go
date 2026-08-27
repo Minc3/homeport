@@ -156,6 +156,14 @@ func QueryCachePorts(cfg Config) []QueryCacheSpan {
 		return nil
 	}
 	budget := MaxQueryCachePorts
+	// claimed keeps a port that appears on two rows from being enumerated
+	// twice, which would be two redirect spans for one port and a second
+	// bind of a socket already held. web.validate now refuses enabled
+	// same-protocol rows from overlapping at all, so like mergePorts and
+	// sharedConnPorts in sysx this dedupe is only reachable through a blob
+	// saved before that refusal - and must stay for exactly that blob,
+	// which keeps loading rather than failing the cache on the sites least
+	// able to notice.
 	claimed := map[int]bool{}
 	var out []QueryCacheSpan
 	for _, s := range cfg.Services {
