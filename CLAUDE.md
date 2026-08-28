@@ -1842,13 +1842,42 @@ sample buys nothing and costs process spawns forever.
 `Engine.Status` stamps `statusAt` and `sampleProtect` returns early once it is
 `protectSampleIdleAfter` (30s) stale. The portal polls status every second, so
 any live viewer holds it open with a wide margin, including a background tab
-whose timers the browser has throttled. What it costs is that the first status
-request after an idle spell renders counters up to one tick old, and that
-request is itself what opens the gate, so the view is live a tick later. The
-failed-read branch beside it is not weakened: its job is to drop the reload
-latch when the table has gone missing, and the only thing that consumes that
-is a save, which comes from an operator whose status polling is what holds the
-gate open.
+whose timers the browser has throttled.
+
+**Stopping the sampling is not on its own stopping the serving, and that is
+the half a gate like this forgets.** `protectStatus` hands back the last
+sample with no freshness test, so the first request after an idle spell used
+to render whatever the kernel said when the portal was last open - not one
+tick old, as old as the idle spell - and the portal states those as live
+facts: "N sources currently parked", "Releases in Ns", an engaged region lock
+that looks exactly like the service being down to everybody outside it. That
+is the reading `applyProtect` and `Revert` already blank all three samples to
+avoid, arrived at through a third door. `Status` takes the stamp with `Swap`
+so the gate opening is an edge and drops the samples across it, by the same
+means and for the same reason.
+
+**Dropping it is not enough on its own, because the gate stops the sampling
+too.** The card would then be empty until the tick, which is up to five
+seconds of blank protection panel on every load, so the same edge raises
+`sampleWake` and `Run` samples at once rather than on its next 5s tick. The
+edge is what triggers it, never the samples being empty: empty is also what a
+*failing* readback looks like, so a fetch keyed on absent data would fire on
+every poll of a broken table, at one `nft` per second on the request path,
+which is worse than the tick the gate was added to remove. The request that
+raises it still answers with nothing, since the sample runs on `Run`'s
+goroutine and is not waited for - reading the kernel on an HTTP handler is
+what the tick exists to avoid - so the panel fills on the next poll, a second
+later, rather than on the next tick.
+
+That wake is also what keeps the failed-read branch honest. Its job is to drop
+the reload latch when the table has gone missing, and the only thing that
+consumes that is a save, which comes from an operator whose status polling is
+what holds the gate open - but the polling opens the gate and `sampleProtect`
+is what acts on it, so waiting for the tick left a window where the latch had
+not been re-tested since the portal loaded. A save landing in it took the
+unchanged branch and skipped a reload the table needed, leaving protection
+absent while the portal said it was on. Raised on the same edge, the re-test
+happens as the portal opens.
 
 **The path samples are one transaction per tick, not one per path.** Same
 reasoning as `addUsageBatch`, reached on a loop that never stops: SQLite

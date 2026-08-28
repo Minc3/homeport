@@ -140,6 +140,18 @@ type Engine struct {
 	// and grant expiry.
 	wake chan struct{}
 
+	// sampleWake asks Run to read the protection counters now rather than on
+	// its next 5s tick. It is raised on one edge only: the status request that
+	// finds the idle gate shut, which is somebody opening the portal after it
+	// has been closed. Sampling stopped while they were away and the stale
+	// reading was dropped with it, so without this the card is blank until the
+	// tick - up to five seconds of an empty protection panel on every load.
+	// The same tick is what re-tests the reload latch, so waking it also
+	// closes the window in which a save skips a reload the table needed.
+	// Buffered one deep and written without blocking, like wake: the gate can
+	// only open once per idle spell, and nothing ever waits on it.
+	sampleWake chan struct{}
+
 	// beatenSince is when the active path started being out-scored by the
 	// margin, in quality selection mode. It is the hold-down for moving *down*
 	// to a less preferred path, and it is tracked against the active path
@@ -258,9 +270,11 @@ func New(log *slog.Logger, st *store.Store, notifier *notify.Notifier, cfg model
 		probers:  map[int]*Prober{},
 		quotaDec: map[int]quota.Decision{},
 		wake:     make(chan struct{}, 1),
-		blocks:   map[int]model.Block{},
-		linkers:  map[string]linkerConn{},
-		baseCtx:  context.Background(),
+
+		sampleWake: make(chan struct{}, 1),
+		blocks:     map[int]model.Block{},
+		linkers:    map[string]linkerConn{},
+		baseCtx:    context.Background(),
 
 		linkerSeen:  map[string]time.Time{},
 		linkerSaved: map[string]time.Time{},
@@ -365,6 +379,9 @@ func (e *Engine) Run(ctx context.Context) error {
 
 		case <-e.wake:
 			e.evaluate(ctx, time.Now())
+
+		case <-e.sampleWake:
+			e.sampleProtect(ctx)
 
 		case <-reconcile.C:
 			e.reconcileRouting(ctx)
@@ -540,6 +557,15 @@ func (e *Engine) onResult(ctx context.Context, r Result) {
 func (e *Engine) wakeDecision() {
 	select {
 	case e.wake <- struct{}{}:
+	default:
+	}
+}
+
+// wakeSample asks Run to read the protection counters now. Safe from any
+// goroutine and never blocks; see sampleWake for the one edge that raises it.
+func (e *Engine) wakeSample() {
+	select {
+	case e.sampleWake <- struct{}{}:
 	default:
 	}
 }
@@ -1288,13 +1314,20 @@ const protectSampleIdleAfter = 30 * time.Second
 // and the kernel keeps counting whether or not the agent looks - so nothing
 // is lost by not looking, and what is saved is the process spawns, every five
 // seconds, for the life of the process. The cost is that the first status
-// request after an idle spell renders counters up to one tick old; the
-// request itself opens the gate, so the view is live a tick later.
+// request after an idle spell renders an empty panel: the reading taken
+// before the gate shut is dropped rather than served, and the sample this
+// request wakes has not finished yet. The next poll a second later has it.
 //
-// The failed-read branch below is not weakened by the gate. Its job is to
-// notice the table went missing so the next save reloads it, and a save only
-// ever comes from an operator in the portal, whose status polling is exactly
-// what holds the gate open.
+// The failed-read branch below is not weakened by the gate, and it takes the
+// wake to say that honestly. Its job is to notice the table went missing so
+// the next save reloads it, and a save only ever comes from an operator in the
+// portal, whose status polling is what holds the gate open - but the polling
+// opens the gate and this function is what acts on it, so waiting for the tick
+// left a window where the latch had not been re-tested since the portal
+// loaded. A save landing in it took applyProtect's unchanged branch and
+// skipped a reload the table needed, leaving protection absent while the
+// portal said it was on. Engine.Status raises sampleWake on the same edge it
+// drops the stale samples, so the re-test happens as the portal opens.
 func (e *Engine) sampleProtect(ctx context.Context) {
 	e.mu.RLock()
 	on := e.protectOn
@@ -2299,7 +2332,30 @@ func (e *Engine) Status() model.Status {
 	// sampled; see sampleProtect. Stamped on every request rather than only
 	// on a change, because it is one atomic store against a poll that is
 	// already an HTTP round trip.
-	e.statusAt.Store(now.UnixNano())
+	//
+	// Swap rather than Store so the gate opening is an edge. Sampling stops
+	// while nobody is watching, and the last sample stays in memory: served
+	// unexamined, the first request after an idle spell renders whatever the
+	// kernel said when the portal was last open, which is not one tick old
+	// but as old as the idle spell. The portal states those as live facts -
+	// "N sources currently parked", "Releases in Ns", an engaged region lock
+	// that looks exactly like the service being down to everybody outside it.
+	// So a reading taken outside the window is dropped here for the same
+	// reason applyProtect and Revert drop theirs, and by the same means.
+	//
+	// Dropping it alone would leave the card blank until the tick, which is up
+	// to five seconds of empty protection panel on every load, so the same
+	// edge wakes the sampler. This request still answers with nothing - the
+	// sample runs on Run's goroutine and is not waited for, because reading
+	// the kernel on an HTTP handler is what the tick exists to avoid - but the
+	// portal polls every second, so the panel fills on the next poll rather
+	// than on the next tick.
+	if prev := e.statusAt.Swap(now.UnixNano()); time.Since(time.Unix(0, prev)) > protectSampleIdleAfter {
+		e.mu.Lock()
+		e.protectCounters, e.protectBlocked, e.protectGeoLocked = nil, nil, nil
+		e.mu.Unlock()
+		e.wakeSample()
+	}
 
 	// The interface read is kernel I/O, so it happens before the state lock is
 	// taken rather than under it.

@@ -365,3 +365,96 @@ func TestProtectionOffSamplesNothingEvenWithThePortalOpen(t *testing.T) {
 		t.Errorf("ran %d nft commands on a site with protection off", n)
 	}
 }
+
+// A sample taken while the portal was open is not served after it has been
+// closed, which is the same rule applyProtect and Revert already hold: the
+// portal states these as live facts - "N sources currently parked", "Releases
+// in Ns", an engaged region lock that reads as the service being down to
+// everybody outside the region - and the gate stops the sampling without
+// stopping the serving, so the reading offered on the first request back is as
+// old as the idle spell rather than one tick old.
+func TestStaleProtectSamplesAreNotServedAfterAnIdleSpell(t *testing.T) {
+	e, _ := engineForReconcile(t, healthyKernel())
+	e.protectOn = true
+	e.protectCounters = []model.ProtectCounter{{Name: "geo:src", Packets: 4}}
+	e.protectBlocked = []model.BlockedSource{{Address: "198.51.100.7"}}
+	e.protectGeoLocked = []model.GeoLockedPort{{Proto: "udp", Port: 27015, ExpiresSec: 47}}
+
+	// Nobody has looked since well before the idle window, so nothing has been
+	// sampled in that time either.
+	e.statusAt.Store(time.Now().Add(-2 * protectSampleIdleAfter).UnixNano())
+
+	st := e.Status()
+	if st.Protect == nil {
+		t.Fatal("the protection card vanished; protection is still on")
+	}
+	if len(st.Protect.GeoLocked) != 0 {
+		t.Errorf("served a region lock measured before the idle spell: %+v", st.Protect.GeoLocked)
+	}
+	if len(st.Protect.Blocked) != 0 {
+		t.Errorf("served parked sources measured before the idle spell: %+v", st.Protect.Blocked)
+	}
+	if len(st.Protect.Counters) != 0 {
+		t.Errorf("served counters measured before the idle spell: %+v", st.Protect.Counters)
+	}
+}
+
+// And a portal that is being watched keeps its numbers. The gate is on the
+// idle spell, not on every request: dropping the sample each time would leave
+// the card blank between ticks for somebody polling every second.
+func TestProtectSamplesSurviveWhileThePortalIsWatched(t *testing.T) {
+	e, _ := engineForReconcile(t, healthyKernel())
+	e.protectOn = true
+	e.protectGeoLocked = []model.GeoLockedPort{{Proto: "udp", Port: 27015}}
+
+	_ = e.Status() // opens the gate, and drops the sample taken before it
+	e.protectGeoLocked = []model.GeoLockedPort{{Proto: "udp", Port: 27015}}
+
+	st := e.Status()
+	if st.Protect == nil || len(st.Protect.GeoLocked) != 1 {
+		t.Errorf("a live sample was dropped from a portal that is being polled: %+v", st.Protect)
+	}
+}
+
+// Dropping the stale sample leaves the card empty, so the same edge has to ask
+// for a fresh one. Without it the panel is blank until the 5s tick on every
+// load, and the reload latch goes untested for that long too - a save landing
+// in the window skips a reload the table needed.
+func TestOpeningThePortalWakesTheProtectionSample(t *testing.T) {
+	e, _ := engineForReconcile(t, healthyKernel())
+	e.protectOn = true
+	e.statusAt.Store(time.Now().Add(-2 * protectSampleIdleAfter).UnixNano())
+
+	_ = e.Status()
+
+	select {
+	case <-e.sampleWake:
+	default:
+		t.Error("opening the portal did not wake the sampler; the card stays blank until the tick")
+	}
+}
+
+// And only on that edge. The gate opens once per idle spell: a portal polling
+// every second must not have every request spawning nft, which is the cost the
+// gate was added to remove.
+func TestPollingDoesNotWakeTheProtectionSampleEveryRequest(t *testing.T) {
+	e, _ := engineForReconcile(t, healthyKernel())
+	e.protectOn = true
+	e.statusAt.Store(time.Now().Add(-2 * protectSampleIdleAfter).UnixNano())
+
+	_ = e.Status() // the edge
+	select {
+	case <-e.sampleWake:
+	default:
+		t.Fatal("the edge did not wake the sampler")
+	}
+
+	for i := 0; i < 5; i++ {
+		_ = e.Status()
+	}
+	select {
+	case <-e.sampleWake:
+		t.Error("a poll on an already-open gate woke the sampler")
+	default:
+	}
+}
