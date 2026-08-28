@@ -1819,6 +1819,49 @@ back by their two exact names, never by the `geo_lockdown_` prefix, because
 region sets share that namespace and an operator's `lockdown_eu` must not be
 scanned as engaged-lock state for a protocol called "eu".
 
+**That readback is narrowed twice over, because it runs every five seconds
+for the life of the process.** It listed the whole table, which meant the
+region allowlists came back with it - and those are the table's bulk by orders
+of magnitude, since ten fetched countries is tens of thousands of interval
+elements. Every sample had nft serialise megabytes of JSON and the frontend
+unmarshal all of it, on the engine's `Run` goroutine, in front of probe
+results and the decision loop, to read a few dozen counters and at most a
+handful of set elements. `ProtectState` now lists the table terse (`-t`, which
+omits set contents) for the counters and the set *names*, then lists only the
+state sets the table declared - `blocked` and the two lockdown sets, by exact
+name - for their elements. Region set elements never leave the kernel, and a
+site with no parking and no automatic locks is one small command. Elements are
+parsed only from the per-set listings and never from the table document, which
+is what makes the flag safe to lean on: an nft old enough to ignore `-t` under
+`-j` costs the saving and never a double-counted blocklist.
+
+**And it is skipped entirely when nobody has the portal open.** The counters
+feed `Status` and nothing else - no decision, no alert, nothing written down -
+and the kernel keeps counting whether or not the agent looks, so an unread
+sample buys nothing and costs process spawns forever.
+`Engine.Status` stamps `statusAt` and `sampleProtect` returns early once it is
+`protectSampleIdleAfter` (30s) stale. The portal polls status every second, so
+any live viewer holds it open with a wide margin, including a background tab
+whose timers the browser has throttled. What it costs is that the first status
+request after an idle spell renders counters up to one tick old, and that
+request is itself what opens the gate, so the view is live a tick later. The
+failed-read branch beside it is not weakened: its job is to drop the reload
+latch when the table has gone missing, and the only thing that consumes that
+is a save, which comes from an operator whose status polling is what holds the
+gate open.
+
+**The path samples are one transaction per tick, not one per path.** Same
+reasoning as `addUsageBatch`, reached on a loop that never stops: SQLite
+defaults to `synchronous=FULL` so every commit fsyncs the WAL, and
+`Store.Open` holds `MaxOpenConns` at 1, so three paths was three fsyncs every
+five seconds with every other reader in the process queued behind them - the
+portal's own API calls included. `store.AddPathSamples` takes the tick's rows
+together under one timestamp, which is also the honest record: they are one
+view of the system, and half of one is not a sample. There is no
+single-sample wrapper beside it, for the reason `Store.AddUsage` records: a
+method nothing in production calls is where the tests go and the coverage
+claim stops being true.
+
 **WireGuard handshake age never influences a decision.** It is collected and
 displayed for context only. A WireGuard interface stays up long after the link
 beneath it has died - catching that is the entire reason the probes are
@@ -3002,6 +3045,22 @@ where a subtle regression would be invisible in production until an outage:
   counted; the blocklist set is dynamic and bounded; two services on one port
   still produce a set nftables will accept; and the counters and blocklist
   parse back out of `nft -j`.
+
+  The readback's shape is pinned there too, because its cost is the whole
+  reason for it: the table is listed terse and only the state sets the table
+  declared are then listed by name, so no region set's elements are ever
+  fetched, a site with none of them is one command, and a listing that carries
+  elements anyway - an nft ignoring `-t` under `-j` - does not double-count the
+  blocklist against the per-set listing beside it. Both new command shapes join
+  `TestDryRunnerSuppressesMutationsButRunsQueries` as reads, per invariant 7:
+  the flags sit ahead of the verb, which is the shape `args[0]` misread.
+  `engine/protect_test.go` holds the idle gate: with nobody watching no `nft`
+  runs at all, a `Status` call resumes it on the next tick, and protection
+  being off still samples nothing whether or not the portal is open.
+  `store/path_samples_test.go` holds that batching the tick's rows into one
+  transaction did not cost the graph - every path's sample lands under the one
+  timestamp and reads back per path - and that a tick with no paths writes
+  nothing rather than committing an empty transaction.
 
   The per-service connection overrides are pinned in the same file: an
   override splits the shared rules rather than stacking on them - the row gets

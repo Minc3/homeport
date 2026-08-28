@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/quinlan102/homeport/internal/model"
 )
@@ -311,5 +312,56 @@ func TestRevertClearsTheEngagedLockSample(t *testing.T) {
 	}
 	if e.protectApplied != "" {
 		t.Error("the reload latch survived the revert")
+	}
+}
+
+// The counters feed the portal's protection card and nothing else: no
+// decision, no alert, nothing written down. So with nobody watching, reading
+// them out of the kernel is process spawns every five seconds for the life of
+// the process, and the kernel goes on counting regardless - nothing is lost
+// by not looking.
+func TestProtectCountersAreNotSampledWithNobodyWatching(t *testing.T) {
+	e, q := engineForReconcile(t, healthyKernel())
+	e.protectOn = true
+	// Nobody has asked for status since well before the idle window.
+	e.statusAt.Store(time.Now().Add(-2 * protectSampleIdleAfter).UnixNano())
+
+	e.sampleProtect(context.Background())
+
+	if n := q.count("nft -j"); n != 0 {
+		t.Errorf("ran %d nft listings for a portal nobody has open", n)
+	}
+}
+
+// And it must come straight back, or the card is dead rather than idle. The
+// status request is what opens the gate, so the tick after somebody loads the
+// portal samples again.
+func TestProtectCountersResumeWhenThePortalIsOpened(t *testing.T) {
+	e, q := engineForReconcile(t, healthyKernel())
+	e.protectOn = true
+	e.statusAt.Store(time.Now().Add(-2 * protectSampleIdleAfter).UnixNano())
+
+	// The portal loads. Status is what stamps the clock, so this is the real
+	// path rather than a store of our own.
+	_ = e.Status()
+	e.sampleProtect(context.Background())
+
+	if n := q.count("nft -j -t list table ip failover_protect"); n != 1 {
+		t.Errorf("the counters were sampled %d times after the portal was opened, want 1", n)
+	}
+}
+
+// The gate is on the portal being open, never on the feature being on: a site
+// with protection off must still run no nft at all, which is the older
+// promise and the one every ordinary site relies on.
+func TestProtectionOffSamplesNothingEvenWithThePortalOpen(t *testing.T) {
+	e, q := engineForReconcile(t, healthyKernel())
+	e.protectOn = false
+
+	_ = e.Status()
+	e.sampleProtect(context.Background())
+
+	if n := q.count("nft"); n != 0 {
+		t.Errorf("ran %d nft commands on a site with protection off", n)
 	}
 }

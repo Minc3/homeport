@@ -193,6 +193,10 @@ type Engine struct {
 	protectCounters  []model.ProtectCounter
 	protectBlocked   []model.BlockedSource
 	protectGeoLocked []model.GeoLockedPort
+	// statusAt is when the portal last asked for status, in unix nanoseconds.
+	// Atomic rather than under e.mu because Status reads that lock and would
+	// have to take it for writing to record this. See protectSampleIdleAfter.
+	statusAt atomic.Int64
 	// protectApplied is the ruleset text last really loaded, so a save that
 	// leaves protection untouched can skip the reload. A reload is not free:
 	// it resets every counter, unparks every blocked source and releases
@@ -1263,16 +1267,42 @@ func (e *Engine) samplePeerEndpoints(ctx context.Context) {
 		"tunnels are on the same WAN (%s): one internet service under both, so a failover between them has nowhere to go", signature)
 }
 
+// protectSampleIdleAfter is how long after the portal's last status request
+// the protection counters stop being sampled.
+//
+// The portal polls status every second, so any live viewer holds the sample
+// open with a wide margin, and a browser throttling a background tab's timers
+// does not close it. Thirty seconds is six sample ticks: long enough that the
+// gate is never the reason a number looks wrong, short enough that an idle
+// frontend is not running nft forever for nobody.
+const protectSampleIdleAfter = 30 * time.Second
+
 // sampleProtect reads the counters and the blocklist back out of the kernel.
 //
 // Read on a timer rather than accumulated, because the numbers live in the
 // rules and a reload resets them. Skipped entirely when nothing is installed,
 // so an ordinary site never runs `nft` for this.
+//
+// Skipped too when nobody has the portal open, because that is the only thing
+// this feeds: the counters go nowhere near a decision, no alert and no table,
+// and the kernel keeps counting whether or not the agent looks - so nothing
+// is lost by not looking, and what is saved is the process spawns, every five
+// seconds, for the life of the process. The cost is that the first status
+// request after an idle spell renders counters up to one tick old; the
+// request itself opens the gate, so the view is live a tick later.
+//
+// The failed-read branch below is not weakened by the gate. Its job is to
+// notice the table went missing so the next save reloads it, and a save only
+// ever comes from an operator in the portal, whose status polling is exactly
+// what holds the gate open.
 func (e *Engine) sampleProtect(ctx context.Context) {
 	e.mu.RLock()
 	on := e.protectOn
 	e.mu.RUnlock()
 	if !on {
+		return
+	}
+	if last := e.statusAt.Load(); time.Since(time.Unix(0, last)) > protectSampleIdleAfter {
 		return
 	}
 	counters, blocked, locked, err := sysx.ProtectState(ctx, e.realRunner())
@@ -1981,10 +2011,20 @@ func (e *Engine) persistSamples(now time.Time) {
 		snaps = append(snaps, tr.Snapshot(now))
 	}
 	e.mu.RUnlock()
+
+	// One transaction for the whole tick. Written per path, this was an fsync
+	// each with every other reader in the process queued behind them, five
+	// seconds apart for the life of the process. They share one timestamp
+	// because they are one tick's view.
+	rows := make([]store.PathSample, 0, len(snaps))
 	for _, s := range snaps {
-		if err := e.st.AddPathSample(s.ID, now, s.RTTms, s.LossPct, s.JitterMs, s.Health); err != nil {
-			e.log.Debug("cannot record path sample", "path", s.Name, "err", err)
-		}
+		rows = append(rows, store.PathSample{
+			PathID: s.ID, RTT: s.RTTms, Loss: s.LossPct,
+			Jitter: s.JitterMs, Health: s.Health,
+		})
+	}
+	if err := e.st.AddPathSamples(now, rows); err != nil {
+		e.log.Debug("cannot record path samples", "err", err)
 	}
 }
 
@@ -2254,6 +2294,12 @@ func (e *Engine) cachedPublicAddress(publicIP, publicIface string) string {
 
 func (e *Engine) Status() model.Status {
 	now := time.Now()
+
+	// Somebody is watching. This is what keeps the protection counters being
+	// sampled; see sampleProtect. Stamped on every request rather than only
+	// on a change, because it is one atomic store against a poll that is
+	// already an HTTP round trip.
+	e.statusAt.Store(now.UnixNano())
 
 	// The interface read is kernel I/O, so it happens before the state lock is
 	// taken rather than under it.

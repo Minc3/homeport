@@ -494,12 +494,49 @@ func (s *Store) UsageHistory(pathID int, since time.Time, bucketSec int) ([]Usag
 // Path history
 // ---------------------------------------------------------------------------
 
-// AddPathSample records one quality measurement.
-func (s *Store) AddPathSample(pathID int, at time.Time, rtt, loss, jitter float64, health model.Health) error {
-	_, err := s.db.Exec(
-		`INSERT INTO path_samples (ts, path_id, rtt_ms, loss, jitter, health) VALUES (?, ?, ?, ?, ?, ?)`,
-		at.Unix(), pathID, rtt, loss, jitter, string(health))
-	return err
+// PathSample is one path's quality at one instant.
+type PathSample struct {
+	PathID int
+	RTT    float64
+	Loss   float64
+	Jitter float64
+	Health model.Health
+}
+
+// AddPathSamples records one tick's quality measurements, for every path, in a
+// single transaction.
+//
+// One transaction rather than one per path, for the reason addUsageBatch
+// carries: SQLite defaults to synchronous=FULL, so every commit fsyncs the
+// WAL, and Store.Open holds MaxOpenConns at 1. The sample tick writes one row
+// per path every five seconds, so three paths was three fsyncs with every
+// other reader in the process - the portal's own API calls included - queued
+// behind them, forever, on a loop that never stops. The rows are written
+// together or not at all, which is also the honest record: they are one
+// tick's view of the system, and half of it is not a sample.
+func (s *Store) AddPathSamples(at time.Time, samples []PathSample) error {
+	if len(samples) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(
+		`INSERT INTO path_samples (ts, path_id, rtt_ms, loss, jitter, health) VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for _, p := range samples {
+		if _, err := stmt.Exec(at.Unix(), p.PathID, p.RTT, p.Loss, p.Jitter, string(p.Health)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // PathPoint is one bucket of path history.
