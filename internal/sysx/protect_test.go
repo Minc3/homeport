@@ -1,6 +1,7 @@
 package sysx
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -299,16 +300,24 @@ func TestEveryDropIsCounted(t *testing.T) {
 }
 
 // The counters and the blocklist are read back out of the kernel, because the
-// kernel is the only thing that knows: reloading the table resets them.
+// kernel is the only thing that knows: reloading the table resets them. The
+// table is listed terse and the state sets are then listed by name, because
+// the region allowlists live in the same table and are its bulk by orders of
+// magnitude - ten fetched countries is tens of thousands of interval
+// elements, serialised into megabytes of JSON every five seconds for
+// elements this readback never consults.
 func TestProtectStateIsReadFromTheKernel(t *testing.T) {
-	const out = `{"nftables": [
+	// What a terse listing carries: rules with their counters, and set
+	// declarations with no elements. geo_lockdown_eu is what a region named
+	// "lockdown_eu" folds to - an operator's set in the lockdown namespace -
+	// and geo_oceania is an ordinary region allowlist; neither may be
+	// fetched, let alone read as state.
+	const table = `{"nftables": [
 		{"metainfo": {"version": "1.0.6"}},
-		{"set": {"name": "blocked", "table": "failover_protect",
-			"elem": [{"elem": {"val": "198.51.100.7", "expires": 421}}, "203.0.113.9"]}},
-		{"set": {"name": "geo_lockdown_udp", "table": "failover_protect",
-			"elem": [{"elem": {"val": 27015, "expires": 42}}]}},
-		{"set": {"name": "geo_lockdown_eu", "table": "failover_protect",
-			"elem": [25565]}},
+		{"set": {"name": "blocked", "table": "failover_protect"}},
+		{"set": {"name": "geo_lockdown_udp", "table": "failover_protect"}},
+		{"set": {"name": "geo_lockdown_eu", "table": "failover_protect"}},
+		{"set": {"name": "geo_oceania", "table": "failover_protect"}},
 		{"rule": {"chain": "filter", "comment": "packet-rate",
 			"expr": [{"match": {}}, {"counter": {"packets": 1200, "bytes": 96000}}, {"drop": null}]}},
 		{"rule": {"chain": "raw", "comment": "bogus-tcp",
@@ -320,10 +329,38 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 		{"rule": {"chain": "raw", "comment": "blocked",
 			"expr": [{"counter": {"packets": 4, "bytes": 240}}, {"drop": null}]}}
 	]}`
+	const blockedSet = `{"nftables": [
+		{"metainfo": {"version": "1.0.6"}},
+		{"set": {"name": "blocked", "table": "failover_protect",
+			"elem": [{"elem": {"val": "198.51.100.7", "expires": 421}}, "203.0.113.9"]}}
+	]}`
+	const lockSet = `{"nftables": [
+		{"metainfo": {"version": "1.0.6"}},
+		{"set": {"name": "geo_lockdown_udp", "table": "failover_protect",
+			"elem": [{"elem": {"val": 27015, "expires": 42}}]}}
+	]}`
+	f := &fakeRunner{replies: map[string]string{
+		"nft -j -t list table ip failover_protect":             table,
+		"nft -j list set ip failover_protect blocked":          blockedSet,
+		"nft -j list set ip failover_protect geo_lockdown_udp": lockSet,
+	}}
 
-	counters, blocked, locked, err := parseProtectState(out)
+	counters, blocked, locked, err := ProtectState(context.Background(), f)
 	if err != nil {
-		t.Fatalf("parse: %v", err)
+		t.Fatalf("read: %v", err)
+	}
+	// The listings that left: the terse table, and the two state sets the
+	// table declared - never geo_lockdown_tcp, which does not exist here, and
+	// never a region set, whose elements are the load this readback exists
+	// not to carry.
+	if len(f.calls) != 3 {
+		t.Fatalf("ran %d commands, want 3 (terse table + two state sets): %v", len(f.calls), f.calls)
+	}
+	if f.ran("geo_lockdown_eu") || f.ran("geo_oceania") {
+		t.Errorf("a region set was listed individually: %v", f.calls)
+	}
+	if f.ran("geo_lockdown_tcp") {
+		t.Errorf("a state set the table does not declare was listed: %v", f.calls)
 	}
 	// An engaged region lock looks exactly like the service being down to
 	// everyone outside the region, so it has to read back out of the kernel
@@ -367,6 +404,67 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 	// lists the freshest block first.
 	if blocked[0].Address != "198.51.100.7" || blocked[0].ExpiresSec != 421 {
 		t.Errorf("first blocked source read as %+v", blocked[0])
+	}
+}
+
+// Elements are read only from the per-set listings, never from the table
+// document. That is what makes the terse flag safe to lean on: an nft old
+// enough to ignore -t under -j hands back the full table, elements included,
+// and reading them there beside the per-set listing would count every parked
+// source twice. The cost on such a host is only the perf saving, never a
+// wrong number.
+func TestProtectStateReadsElementsOnlyFromTheSetListings(t *testing.T) {
+	const table = `{"nftables": [
+		{"metainfo": {"version": "1.0.6"}},
+		{"set": {"name": "blocked", "table": "failover_protect",
+			"elem": [{"elem": {"val": "198.51.100.7", "expires": 421}}]}}
+	]}`
+	const blockedSet = `{"nftables": [
+		{"metainfo": {"version": "1.0.6"}},
+		{"set": {"name": "blocked", "table": "failover_protect",
+			"elem": [{"elem": {"val": "198.51.100.7", "expires": 421}}]}}
+	]}`
+	f := &fakeRunner{replies: map[string]string{
+		"nft -j -t list table ip failover_protect":    table,
+		"nft -j list set ip failover_protect blocked": blockedSet,
+	}}
+
+	_, blocked, _, err := ProtectState(context.Background(), f)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(blocked) != 1 {
+		t.Errorf("one parked source in both listings read back as %d entries: %+v", len(blocked), blocked)
+	}
+}
+
+// A site with limits but no parking and no automatic locks declares none of
+// the state sets, and the whole readback is one terse listing - this runs
+// every five seconds, and on the ordinary site it should cost what one small
+// nft invocation costs.
+func TestProtectStateWithNoStateSetsIsOneCommand(t *testing.T) {
+	const table = `{"nftables": [
+		{"metainfo": {"version": "1.0.6"}},
+		{"set": {"name": "geo_oceania", "table": "failover_protect"}},
+		{"rule": {"chain": "raw", "comment": "packet-rate",
+			"expr": [{"counter": {"packets": 9, "bytes": 540}}, {"drop": null}]}}
+	]}`
+	f := &fakeRunner{replies: map[string]string{
+		"nft -j -t list table ip failover_protect": table,
+	}}
+
+	counters, blocked, locked, err := ProtectState(context.Background(), f)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(f.calls) != 1 {
+		t.Errorf("ran %d commands, want just the terse table listing: %v", len(f.calls), f.calls)
+	}
+	if len(counters) != 1 || counters[0].Packets != 9 {
+		t.Errorf("counters read as %+v", counters)
+	}
+	if len(blocked) != 0 || len(locked) != 0 {
+		t.Errorf("state read from sets that do not exist: %+v %+v", blocked, locked)
 	}
 }
 
@@ -831,7 +929,7 @@ func TestCounterDropsIsTheRuleVerdictNotTheName(t *testing.T) {
 			"expr": [{"counter": {"packets": 2, "bytes": 120}}, {"drop": null}]}}
 	]}`
 
-	counters, _, _, err := parseProtectState(out)
+	counters, _, err := parseProtectCounters(out)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}

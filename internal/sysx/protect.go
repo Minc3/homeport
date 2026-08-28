@@ -969,15 +969,64 @@ func RemoveProtectRuleset(ctx context.Context, r Runner) {
 // resets them. A limiter nobody can see the effect of is worse than none at
 // all - "some players cannot connect" and "this threshold is too tight" look
 // identical from the outside, and only these numbers separate them.
+//
+// The table is listed terse (-t, which omits set contents) and the state sets
+// are then listed by name, because this runs every five seconds and the
+// region allowlists are the bulk of the table by orders of magnitude: ten
+// fetched countries is tens of thousands of interval elements, which a plain
+// listing serialised into megabytes of JSON per sample - built by nft and
+// unmarshalled again here - for elements nothing in this readback consults.
+// Elements are read only from the per-set listings, never from the table
+// document, so an nft old enough to ignore -t under -j costs the saving
+// without double-counting the blocklist. Only sets the table listing declares
+// are fetched: on a site with no parking and no automatic locks this stays
+// one command, and a set that is never fetched cannot error for being absent.
 func ProtectState(ctx context.Context, r Runner) ([]model.ProtectCounter, []model.BlockedSource, []model.GeoLockedPort, error) {
-	out, err := r.Run(ctx, "nft", "-j", "list", "table", "ip", NFTProtectTable)
+	out, err := r.Run(ctx, "nft", "-j", "-t", "list", "table", "ip", NFTProtectTable)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return parseProtectState(out)
+	counters, present, err := parseProtectCounters(out)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var blocked []model.BlockedSource
+	var locked []model.GeoLockedPort
+	// The three sets whose elements are state, by their exact names - the
+	// same rule the parser has always applied. Region sets share the geo_
+	// namespace, so a region named "lockdown_eu" folds to geo_lockdown_eu and
+	// must not be fetched, let alone read as lock state for a protocol called
+	// "eu".
+	for _, name := range []string{"blocked", geoLockSetName("tcp"), geoLockSetName("udp")} {
+		if !present[name] {
+			continue
+		}
+		setOut, err := r.Run(ctx, "nft", "-j", "list", "set", "ip", NFTProtectTable, name)
+		if err != nil {
+			// The table can vanish between the listings - flushed by hand,
+			// or reloaded underneath the agent. Half a readback is not a
+			// readback, and the caller's answer to any error here (drop the
+			// reload latch, sample again next tick) is the right one.
+			return nil, nil, nil, err
+		}
+		b, l, err := parseProtectSetElems(setOut)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		blocked = append(blocked, b...)
+		locked = append(locked, l...)
+	}
+	sort.Slice(blocked, func(i, j int) bool { return blocked[i].ExpiresSec > blocked[j].ExpiresSec })
+	sort.Slice(locked, func(i, j int) bool { return locked[i].Port < locked[j].Port })
+	return counters, blocked, locked, nil
 }
 
-func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.BlockedSource, []model.GeoLockedPort, error) {
+// parseProtectCounters reads the rules' counters out of a table listing, and
+// reports which sets the table declares so ProtectState knows what to fetch.
+// Set elements are deliberately not read here - the terse listing should not
+// carry any, and one that does (an nft that ignores -t under -j) must not
+// have its elements counted beside the per-set listing's.
+func parseProtectCounters(jsonText string) ([]model.ProtectCounter, map[string]bool, error) {
 	var doc struct {
 		Nftables []struct {
 			Rule *struct {
@@ -985,13 +1034,12 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 				Expr    []map[string]json.RawMessage `json:"expr"`
 			} `json:"rule"`
 			Set *struct {
-				Name string            `json:"name"`
-				Elem []json.RawMessage `json:"elem"`
+				Name string `json:"name"`
 			} `json:"set"`
 		} `json:"nftables"`
 	}
 	if err := json.Unmarshal([]byte(jsonText), &doc); err != nil {
-		return nil, nil, nil, fmt.Errorf("read protection state: %w", err)
+		return nil, nil, fmt.Errorf("read protection state: %w", err)
 	}
 
 	var counters []model.ProtectCounter
@@ -1002,9 +1050,11 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 	// The comment is the limit's identity; the split into rules is a kernel
 	// detail nothing upstream should see.
 	counterIdx := map[string]int{}
-	var blocked []model.BlockedSource
-	var locked []model.GeoLockedPort
+	present := map[string]bool{}
 	for _, item := range doc.Nftables {
+		if set := item.Set; set != nil {
+			present[set.Name] = true
+		}
 		if rule := item.Rule; rule != nil && rule.Comment != "" {
 			var c struct {
 				Packets int64 `json:"packets"`
@@ -1042,34 +1092,56 @@ func parseProtectState(jsonText string) ([]model.ProtectCounter, []model.Blocked
 				Drops: drops,
 			})
 		}
-		if set := item.Set; set != nil {
-			if set.Name == "blocked" {
-				for _, raw := range set.Elem {
-					if b, ok := parseBlockedElem(raw); ok {
-						blocked = append(blocked, b)
-					}
+	}
+	return counters, present, nil
+}
+
+// parseProtectSetElems reads the elements out of one per-set listing. Which
+// sets are state is ProtectState's decision - it only ever lists the three by
+// name - so this matches on the same exact names rather than trusting that:
+// a region named "lockdown_eu" folds to geo_lockdown_eu in the same
+// namespace, and prefix-matching it here would read an operator's set as
+// engaged-lock state for a protocol called "eu".
+func parseProtectSetElems(jsonText string) ([]model.BlockedSource, []model.GeoLockedPort, error) {
+	var doc struct {
+		Nftables []struct {
+			Set *struct {
+				Name string            `json:"name"`
+				Elem []json.RawMessage `json:"elem"`
+			} `json:"set"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal([]byte(jsonText), &doc); err != nil {
+		return nil, nil, fmt.Errorf("read protection state: %w", err)
+	}
+
+	var blocked []model.BlockedSource
+	var locked []model.GeoLockedPort
+	for _, item := range doc.Nftables {
+		set := item.Set
+		if set == nil {
+			continue
+		}
+		if set.Name == "blocked" {
+			for _, raw := range set.Elem {
+				if b, ok := parseBlockedElem(raw); ok {
+					blocked = append(blocked, b)
 				}
 			}
-			// Matched on the two exact names the generator emits, never on the
-			// prefix: region sets share the geo_ namespace, so a region named
-			// "lockdown_eu" would otherwise be scanned as lock state for a
-			// protocol called "eu".
-			for _, proto := range []string{"tcp", "udp"} {
-				if set.Name != geoLockSetName(proto) {
-					continue
-				}
-				for _, raw := range set.Elem {
-					if p, ok := parseLockedElem(raw); ok {
-						p.Proto = proto
-						locked = append(locked, p)
-					}
+		}
+		for _, proto := range []string{"tcp", "udp"} {
+			if set.Name != geoLockSetName(proto) {
+				continue
+			}
+			for _, raw := range set.Elem {
+				if p, ok := parseLockedElem(raw); ok {
+					p.Proto = proto
+					locked = append(locked, p)
 				}
 			}
 		}
 	}
-	sort.Slice(blocked, func(i, j int) bool { return blocked[i].ExpiresSec > blocked[j].ExpiresSec })
-	sort.Slice(locked, func(i, j int) bool { return locked[i].Port < locked[j].Port })
-	return counters, blocked, locked, nil
+	return blocked, locked, nil
 }
 
 // parseSetElem reads one dynamic-set element in either shape nft -j emits: a

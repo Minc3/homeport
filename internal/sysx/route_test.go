@@ -152,6 +152,11 @@ func TestDryRunnerSuppressesMutationsButRunsQueries(t *testing.T) {
 		// the option comes before the verb, so testing args[0] read the flag.
 		{"nft", "-a", "list", "chain", "ip", "filter", "DOCKER-USER"},
 		{"nft", "-j", "list", "table", "ip", "failover_protect"},
+		// The protection readback: the terse table listing carries two flags
+		// before the verb, and the per-set listings one - each is a shape
+		// `args[0] == "list"` would have misread.
+		{"nft", "-j", "-t", "list", "table", "ip", "failover_protect"},
+		{"nft", "-j", "list", "set", "ip", "failover_protect", "blocked"},
 	}
 	for _, q := range queries {
 		if !isReadOnly(q[0], q[1:]) {
