@@ -446,7 +446,76 @@ async function refreshStatus() {
   for (const l of states) linkers.append(linkerCard(l));
 
   renderProtect(st.protect);
+  renderBlocklist(st.blocklist);
   renderQueryCache(st.query_cache);
+}
+
+// The blocklist is the one list here nobody in this deployment reviewed, and
+// every way it fails is quiet. A feed that stopped updating six weeks ago, a
+// list that never made it into the kernel, and a list working perfectly all
+// look identical from outside - the drops are indistinguishable from the
+// internet being calm - so the age, the load state and the last error are
+// stated rather than implied.
+function renderBlocklist(b) {
+  const section = document.getElementById('blocklist-section');
+  section.classList.toggle('hidden', !b);
+  if (!b) return;
+
+  const body = document.getElementById('blocklist-body');
+  body.textContent = '';
+
+  // Age first, because it is the number that goes wrong silently. Written as
+  // hours or days rather than a timestamp: what matters is how far behind the
+  // feed this list has fallen, not when a clock said so.
+  const stale = b.age_hours >= 48;
+  const age = !b.updated_at || b.age_hours <= 0 ? 'never'
+    : b.age_hours < 1 ? 'under an hour'
+    : b.age_hours < 48 ? `${Math.round(b.age_hours)}h`
+    : `${Math.round(b.age_hours / 24)} days`;
+
+  body.append(el('div', { class: 'metrics' },
+    el('div', { class: 'metric', title: 'Networks in the loaded set. Fewer than the feed publishes, because overlapping entries are merged and private, reserved and carrier-NAT space is dropped before anything reaches the kernel.' },
+      el('div', { class: 'k', text: 'networks' }),
+      el('div', { class: 'v', text: (b.networks || 0).toLocaleString() }),
+      el('div', { class: 'hint', text: b.exceptions ? `${b.exceptions} exception${b.exceptions === 1 ? '' : 's'}` : 'no exceptions' })),
+    el('div', { class: 'metric', title: 'How long since the feed last confirmed this list is current. A list that has stopped refreshing keeps working, so nothing else says this.' },
+      el('div', { class: 'k', text: 'list age' }),
+      el('div', { class: 'v', text: age })),
+    el('div', { class: 'metric', title: 'Packets dropped by the blocklist since its table was last loaded. Refreshing the list does not reset this; saving a change to the blocklist settings does.' },
+      el('div', { class: 'k', text: 'dropped' }),
+      el('div', { class: 'v', text: (b.packets || 0).toLocaleString() }),
+      el('div', { class: 'hint', text: bytes(b.bytes || 0) })),
+  ));
+
+  // On before loaded, because "the switch is on" and "the rules are in the
+  // kernel" are different facts and the gap between them is where this
+  // feature does nothing at all while the settings page says it is enabled.
+  if (!b.loaded) {
+    body.append(el('div', { class: 'alert warn' },
+      el('p', { text: 'The blocklist is switched on but its rules are not in the kernel, so nothing is being dropped. '
+        + 'In observe mode that is expected: this rule drops packets, so it is not installed until the system is armed. '
+        + 'Armed, it means the last apply failed - check the Activity tab.' })));
+  } else if (!b.networks) {
+    body.append(el('div', { class: 'alert warn' },
+      el('p', { text: 'The rules are loaded and the list is empty, so nothing is being dropped yet. '
+        + 'The first fetch happens within a minute of enabling this; if it stays empty, the error below says why.' })));
+  } else if (stale) {
+    body.append(el('div', { class: 'alert warn' },
+      el('p', { text: `This list was last confirmed current ${age} ago. It is still loaded and still dropping, which is `
+        + 'deliberate - an old blocklist beats none - but it is no longer picking up newly listed networks.' })));
+  }
+
+  if (b.last_error) {
+    body.append(el('div', { class: 'alert warn' },
+      el('p', { text: `The last refresh failed: ${b.last_error}` }),
+      el('p', { text: 'The previously loaded list is untouched and still dropping. This retries on its own; a refusal naming an '
+        + 'implausible shrink means the feed served a short list and was not believed, which needs somebody to look at the feed by hand.' })));
+  }
+
+  body.append(el('p', { class: 'hint', text: `Source: ${b.source || 'unset'}. Fetched by this frontend on a timer, checked whole, and loaded into a set of its `
+    + 'own so a refresh never touches a rule or resets a counter. TCP only, and only on the public interface, so a false positive can never drop a player '
+    + 'mid-match and nothing here can see a probe or the control channel. If a visitor cannot connect and you suspect this list, add their network to the '
+    + 'exceptions in Settings rather than turning the whole thing off.' }));
 }
 
 // The cache's freshness is the whole reason it is reported: a cache serving
@@ -2030,6 +2099,50 @@ function renderSettings() {
       refreshBox.querySelector('input').addEventListener('change', holdStaleFloor);
       staleBox.querySelector('input').addEventListener('change', holdStaleFloor);
       return el('div', { class: 'grid' }, refreshBox, staleBox);
+    })(),
+  ));
+
+  if (!c.blocklist) c.blocklist = {};
+  form.append(section('Blocklist',
+    el('p', { class: 'hint', text: 'Drops traffic from a threat feed this frontend downloads and refreshes on a timer, in front of every published TCP port. '
+      + 'The feed is FireHOL level1: the conservative aggregate of DShield, abuse.ch Feodo, the Spamhaus DROP list and the bogon list, a few thousand '
+      + 'networks, republished daily. It is the only list here that is not something you typed, so everything about it is arranged around a bad fetch '
+      + 'being harmless.' }),
+    el('p', { class: 'hint', text: 'TCP only, deliberately: a false positive on a UDP game port would drop a player mid-match, where on TCP it is a '
+      + 'connection that does not open. Scoped to the public interface like the protection rules, so it can never see a probe or the control channel. It '
+      + 'cannot lock you out of this portal either - the portal is on the admin WireGuard tunnel, over UDP, and no rule here is consulted for it.' }),
+    el('p', { class: 'hint', text: 'It works with everything above switched off. Its rules live in a table of their own, so refreshing the list never '
+      + 'resets a protection counter, unparks a blocked source or releases an engaged region lock.' }),
+    el('div', {}, checkbox('Enabled', c.blocklist.enabled, (v) => (c.blocklist.enabled = v),
+      'Takes effect when armed: this rule drops packets, so observe mode installs nothing. Needs the public interface set above, for the same reason '
+      + 'protection does. The first fetch happens within a minute of saving; until it lands the rules are loaded and drop nothing. The last good list is '
+      + 'kept on disk, so a restart while the feed is unreachable still comes up protected.')),
+    el('div', { class: 'grid' },
+      num('Refresh interval (hours)', c.blocklist.refresh_hours || '', (v) => (c.blocklist.refresh_hours = v || 0), {
+        min: 1, max: 168, placeholder: 'empty = 4',
+        help: 'How often the feed is re-fetched. The request is conditional, so an unchanged feed costs almost nothing and this can be short. The feed '
+          + 'itself republishes about once a day. Between 1 and 168 hours; clear the box for the default 4. A failed fetch is retried sooner than this '
+          + 'on its own, and never empties the loaded list.',
+      }),
+    ),
+    (() => {
+      // One network per line, the same shape a region list takes, because
+      // the thing an operator does here is paste one address they have just
+      // found in the feed.
+      const ta = el('textarea', { rows: 3, placeholder: '203.0.113.7\n198.51.100.0/24' });
+      ta.value = (c.blocklist.exceptions || []).join('\n');
+      const parseTA = debounce(() => {
+        c.blocklist.exceptions = ta.value.split(/[\s,]+/).map((t) => t.trim()).filter(Boolean);
+        updateDirty();
+      }, 400);
+      ta.addEventListener('input', parseTA.run);
+      ta.addEventListener('change', parseTA.flush);
+      return el('div', {},
+        el('label', { class: 'field' }, caption('Exceptions', 'Networks that are never dropped, checked before the feed. A bare address is taken as a /32. '
+          + 'This is the override for the failure this feature produces, which is silent: a listed source is a visitor who cannot connect, with nothing on '
+          + 'the box saying why. If you find yourself adding more than a handful, the feed disagrees with your traffic and the switch above is the answer '
+          + 'rather than this box.'), ta),
+        el('p', { class: 'hint', text: 'One network per line. Changing these reloads the blocklist table, which resets its drop counter and reloads the list into it.' }));
     })(),
   ));
 

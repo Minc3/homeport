@@ -206,6 +206,11 @@ tunnel** regardless of which one is active.
   than what the agent believes it installed.
 - `sysx/nft.go` - DNAT ruleset generation, plus the separate `failover_egress`
   source NAT and the Docker forward exceptions both of them need.
+- `engine/blocklist.go` and `sysx/blocklist.go` - the feed-driven drop list.
+  The engine half fetches, parses whole-or-nothing, refuses an implausible
+  shrink and keeps the last good copy on disk; the sysx half renders a table
+  of its own and, separately, the set contents. The separation is the feature:
+  a refresh loads elements and never a rule.
 
 ### Backend files
 
@@ -1721,6 +1726,128 @@ cache; the portal warns, without refusing, when the cache is on with
 protection off entirely, because that is supported but leaves nothing else
 in front of the published ports.
 
+**The feed-driven blocklist is a table of its own, and that is the decision
+the whole feature is arranged around rather than a filing choice.**
+`BuildProtectRuleset` renders `delete table` followed by the whole table, so
+every change to protection rebuilds it - which is why `Engine.protectApplied`
+exists at all, to keep a save that touched nothing from resetting every
+counter, unparking every blocked source and releasing every engaged region
+lock. A list that refreshes several times a day cannot live inside a table
+with that property: it would hand a flood a clean slate on its own schedule,
+with nothing connecting the two. In `failover_blocklist` the refresh is one
+`nft -f` carrying a `flush set` and an `add element`, which is a single kernel
+transaction touching no rule, so the counters and everything the protection
+table holds are untouched by it. It also means the list works with protection
+switched off entirely, which is the ordinary case for a site that wants a
+blocklist and no rate limiting, and it keeps `nft_test`'s assertion about the
+published table literally true.
+
+`applyBlocklist` reloads the table and then refills the set in the same
+breath, and that pairing is not tidiness: a rebuild empties the feed set
+whatever was in it a moment ago, so a save that changed an exception would
+otherwise switch the list off silently for up to a refresh interval, with the
+portal reporting it as on.
+
+**It is the one thing here that acts on data nobody in this deployment
+reviewed, so every rule around it is about bounding a bad fetch.** Everything
+else a packet is matched against was typed or pasted by an operator and saved
+through `validate`. This arrives from a third party on a timer.
+
+The geo fetch's design note refuses a schedule outright, and that argument
+does not simply transfer, which is worth stating because reading it as though
+it did would kill the feature. Whole-or-nothing exists there because a
+truncated *allowlist* silently bars real players: the closed direction, and
+unrecoverable without somebody noticing. A truncated *blocklist* drops less
+than it should, which is open. A country list going stale costs a handful of
+newly allocated networks, while a blocklist's entire value is freshness, so a
+click-only one is a feature that quietly stops working the week after it is
+set up. So the schedule is defensible here and what has to be defended instead
+is every way this list could become wrong in the closed direction:
+
+- **Whole or nothing**, exactly as `fetchCountry` is. The danger is not a file
+  that fails to parse, it is one that parses into something plausible: an
+  error page, a redirect body or half a list, every one of which yields a
+  shorter perfectly valid list if bad lines are skipped.
+- **A shrink guard**, for the failure the parse cannot catch: a short but
+  syntactically perfect list, which is what a half-generated or partly
+  migrated feed looks like. Nothing here can tell that from a genuine mass
+  delisting, so the tie is broken towards keeping what works. The floor is
+  measured against the *loaded* list, which does not move on a refusal, so a
+  real collapse is refused every time until somebody looks rather than
+  ratcheting the list down one refusal at a time - which is what measuring
+  against the previous fetch would have given.
+- **Carrier-grade NAT and private space stripped before anything is loaded**
+  (`sysx.dropNonInternet`). This is the one filter that protects people rather
+  than the ruleset: a feed that ever listed a slice of `100.64/10` would drop
+  a large number of real mobile players at once, every one of whom sees the
+  service as down. Private and reserved space is dropped beside it because a
+  source in it arriving on the public interface is already what
+  `Protect.DropSpoofed` exists for, and a second rule dropping it would make
+  one counter mean two things. Overlap rather than containment, because the
+  damage is done by any entry reaching into one of those ranges.
+- **The last good list on disk**, so a restart with the feed unreachable still
+  installs protection and boot never waits on somebody else's host.
+- **A failure never empties anything.** An old blocklist beats none, which is
+  the opposite of the query cache's rule about stale data and right for the
+  same reason: there, stale means advertising a server that may be gone; here,
+  stale means blocking a network that may since have been cleaned up. The
+  portal says the age out loud, because a list that stopped refreshing six
+  weeks ago keeps working and keeps dropping, and nothing else would say so.
+
+**The list never enters the configuration blob.** It would bloat every export,
+bump `cfgVersion` on each refresh - which is what pushes configuration to the
+backend - and ride the `PUT` body cap. It is agent state, like the backend's
+meter baselines, and it lives in a file beside the generated rulesets.
+
+**TCP only, and that is a choice about which false positive you can live
+with.** A source this list gets wrong is a visitor who cannot connect, with
+nothing on the box saying why. On a UDP game port that is a player dropped
+mid-match; on TCP it is a connection that does not open, which is the
+recoverable direction. The rule is stateless and matches every packet rather
+than only a SYN, for the region locks' reason: the set answer is fixed per
+address, so a source the list admits can never be newly caught, a listed flood
+costs no conntrack entry, and a source appearing in the feed also ends flows
+already in progress.
+
+The chain sits at priority -310, ahead of the protection table's raw chain at
+-300, so a listed source costs one set lookup and nothing else: no conntrack
+entry, no limiter state, no region set walk. It is scoped to the public
+interface for the same safety property the protection table carries, and
+`web.validate` refuses to enable it without one - a third party's list able to
+match a probe could condemn a healthy link and move traffic to a metered one.
+One thing it structurally cannot do is lock the operator out of the portal,
+which is worth knowing before enabling it: the portal binds an admin WireGuard
+interface over UDP, so no rule here is even consulted for it.
+
+**The feed is a built-in constant rather than a configurable URL, and that is
+a security property.** The value would otherwise be an operator field naming a
+host this root process fetches from on a timer and loads into nftables, which
+is a far larger thing to get wrong than a country code - and `handleGeoFetch`
+already refuses anything that is not a country code rather than escaping it,
+for the same reason. FireHOL level1 specifically, and not one of the larger
+lists beside it: it is the conservative aggregate, and the aggressive and
+proxy lists will eventually name a carrier NAT, which this deployment's own
+per-source presets are already sized around (16 to 64 subscribers behind one
+address).
+
+**It ships present and disabled, which is what "included" has to mean here.**
+`model/defaults_test.go` pins that nothing in the shipped configuration is
+live, and this needs the rule more than the example service rows do: shipped
+on, a fresh install would start dropping traffic on the strength of a list
+nobody has looked at, and would make the running frontend depend on an
+outbound fetch on a timer - the dependency `geofetch.go` says out loud it
+never takes.
+
+**The refresher re-reads its configuration each pass rather than capturing
+it.** A minute ticker asks whether anything is due; the interval, the enabled
+switch and the revert latch are read on every pass. That is what lets a
+changed interval or the feature being switched on take effect without the
+goroutine being torn down and restarted from a settings save, which is
+invariant 9's whole family of bugs avoided rather than guarded against. It
+runs on `baseCtx`, and `installBlocklistElements` takes `applyMu` like every
+other writer, while `applyBlocklist` calls `loadBlocklistElements` directly
+because its caller already holds it.
+
 **Region locks are operator-declared network lists, not a GeoIP database.**
 `Protect.Regions` is named lists of CIDRs; `Service.GeoRegions` locks a port to
 their union, dropping everything else in the raw chain. A GeoIP database would
@@ -2203,6 +2330,13 @@ Breaking any of these is a correctness bug even if the tests pass.
    rate limiter plainly does; observe mode's promise is that nothing the agent
    has done can be felt by a player. See `Engine.applySystemConfig` and
    `Agent.ApplyConfig`; `realRunner()` is the escape hatch.
+
+   The blocklist is on that list too, and needs no exception: its rule drops
+   packets, so `applyBlocklist` goes through the gated runner, and
+   `loadBlocklistElements` gates on the table really being loaded rather than
+   on the mode - which is the same thing here and says the more useful of the
+   two, because with no table there is no set to fill. Observe therefore
+   writes no feed file and loads nothing.
 
    **It also loads no nftables table, on either host.** The backend's
    connection-marking table (`failover_return`) was installed as plumbing on
@@ -2891,6 +3025,18 @@ written only when `Frontend.BackendEgress` is on), `protect.nft` (the rate
 limiting and edge filtering, written only when protection is on and something in
 it is configured) and `ctl.sock` (the failoverctl socket, mode 0600).
 
+The blocklist is three more, and they are three rather than one deliberately.
+`blocklist.nft` is the table and `blocklist-feed.nft` is the set contents, kept
+apart so what is on disk stays a readable record of what is in the kernel and a
+reader can tell the rules, which change when the operator saves, from the list,
+which changes on a timer. `blocklist-cache.json` is the last good list with the
+time it was confirmed current and the feed's ETag: agent state, not
+configuration, which is why it is here rather than in the database - it is what
+the frontend fetched, not what the operator decided, and putting it in the
+config blob would bump `cfgVersion` on every refresh. All three are removed by
+`uninstall.sh`, which deletes by name rather than emptying the directory, so a
+new state file has to be added there or it is left behind.
+
 **Backend** - no database. `backend-config.json` (cached pushed config, so a
 frontend outage does not leave it unable to route replies after a restart),
 `usage-buffer.jsonl` (undelivered deltas), `meter-state.json` (counter
@@ -2976,6 +3122,7 @@ because zero is already the right answer.
 | `Protect.Regions`, `Service.GeoRegions` | no region locks; reachable from anywhere | portal |
 | `Service.GeoAutoPPS` | a lock with regions set is unconditional | portal |
 | `Config.QueryCache` | no query cache; A2S queries reach the real server | portal |
+| `Config.Blocklist` | no feed, no table, and nothing is fetched | portal |
 
 `Config.Linkers` is the topology the backend cannot work out for itself. An
 overlay address says nothing about which machine holds it, so each row pairs one
@@ -3387,6 +3534,58 @@ where a subtle regression would be invisible in production until an outage:
   line in the journal said why. `TestConnCountSetCarriesNoTimeout` pins the
   shape. Generated nftables is worth reading by eye before
   trusting: the tests can only assert what somebody thought to assert.
+- `sysx/blocklist_test.go` - the table: off generates nothing, no public
+  interface generates nothing, the chain's first rule is the interface guard,
+  it never translates and never mentions the system's own ports or overlay
+  addresses, the drop is TCP-only and counted, the exceptions are consulted
+  ahead of the feed while a site with none declares no allow set and no rule
+  consulting one, the feed set is a plain interval set (nothing writes to it
+  from the packet path, so a `dynamic` flag or a `size` would be a ceiling on
+  somebody else's list), and the chain's priority really is ahead of the
+  protection raw chain rather than only claimed to be.
+
+  The element file is pinned harder than the table, because it is what runs on
+  a timer: one flush and one add and nothing that rebuilds a rule, the flush
+  ahead of the add, nested and duplicate networks merged (nft rejects a whole
+  set literal over one contained duplicate, which an ordinary day's feed
+  produces), carrier-NAT and private space dropped including a network that
+  merely *overlaps* one, an entry carrying nftables syntax and a newline never
+  reaching the file while the usable entry beside it still does, and - the one
+  that guards against the silent failure - nothing usable rendering nothing at
+  all rather than a transaction that would flush the set empty. Plus that
+  `CountBlocklistElements` agrees with what the file actually holds, since the
+  portal reports that figure and `len()` is not it.
+- `engine/blocklist_test.go` - the feed: a netset parses with comments, blanks
+  and bare addresses widened to /32; one bad line fails the whole file with
+  the line named, and so do IPv6 and an empty feed. Then the four ways a bad
+  fetch must not become a bad list: a failure keeps the loaded list and
+  records the error, an implausible shrink is refused and does not become the
+  list, five refusals in a row still leave the original loaded (the guard
+  measures against the loaded list, so it cannot ratchet down), and an
+  ordinary 20% shrink still goes through - a guard that refused normal churn
+  would be a second way for the list to stop updating. A 304 keeps the list
+  and moves its age forward, because the feed answering "unchanged" is as good
+  a confirmation as re-sending the bytes and treating it as no answer would
+  have a working list read as going stale. An oversized response is a loud
+  failure rather than a shorter list.
+
+  The scheduling: the feature off and a reverted engine both fetch nothing, a
+  site with no list fetches at once rather than waiting out an interval, a
+  fresh list is not refetched on the next minute tick, and a failure is
+  retried inside the refresh interval. And the applying: observe mode loads
+  neither table nor elements, disabling removes the table, arming loads both,
+  an unchanged table is not reloaded, changing an exception reloads *and*
+  refills (a rebuilt table has an empty set), and a refresh loads only the
+  elements - which is the property the separate table exists for. Revert
+  removes the table and drops the counter while keeping the list, since a
+  fetch should not be needed to re-arm.
+- `web/blocklist_validate_test.go` - the save side: enabled with no public
+  interface is refused with the reason in the message, the refresh interval is
+  bounded at both ends with zero still meaning the default, an exception that
+  nft could not load is refused (including an IPv4-mapped network, whose
+  stored form would fail to re-parse), a bare address is widened and a
+  host-part network masked, the count is capped, and the shipped configuration
+  still saves with the feature off.
 - `qcache/qcache_test.go` - the anti-spoofing property both ways: an
   unchallenged or wrongly challenged source gets a challenge never larger
   than its query (strictly smaller for INFO, equal for the 9-byte PLAYER and
@@ -3738,6 +3937,24 @@ next agent learns which behaviours are deliberate.
   rather than reading pfSense's WAN counters. It should land within a few
   percent, but the calibration exists because it might not.
 - No Prometheus endpoint. The portal owns observability.
+- **The blocklist is one built-in feed, IPv4 and TCP only, and each of those
+  is a decision rather than an unfinished edge.** The URL is a constant
+  because an operator field naming a host this root process fetches from and
+  loads into nftables is a much larger thing to get wrong than a country code;
+  adding a second source means deciding what happens when they disagree and
+  when one of them is the one that failed, which the single-list shrink guard
+  does not cover. TCP only keeps a false positive off the UDP game ports,
+  where it would drop a player mid-match. IPv4 because the table is `ip`, like
+  everything else here.
+
+  What is genuinely open is that nothing bounds how far the list can drift
+  *upward*: the shrink guard catches a feed that collapses and nothing catches
+  one that grows tenfold, which is the same shape of accident and would drop
+  far more. It has not been built because the only sane response is the same
+  one - keep the previous list - and a growth bound picked from one
+  deployment's numbers would refuse the legitimate day a feed absorbs another
+  source. A sequence-style anchor is the wrong tool here, since the list has
+  no monotonic quantity to anchor to.
 - **A linker's control channel is minimal on purpose.** It reports liveness,
   hostname and build, and receives the egress networks for its own address. It
   reports no usage - a linker meters nothing, because the tunnels it would be

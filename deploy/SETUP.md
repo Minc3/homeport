@@ -645,6 +645,60 @@ generates (the negated interval-set match and the dynamic port set), without
 touching the kernel. The file is written in observe mode too, so this works
 before arming.
 
+### Blocklist
+
+A threat feed in front of every published TCP port, refreshed on a timer. It
+is independent of everything above: it works with protection switched off
+entirely, and it lives in an nftables table of its own.
+
+**Settings, Blocklist**, tick **Enabled** and save. It needs the public
+interface set, for the same reason protection does, and it takes effect when
+armed. That is the whole of the setup: the feed, FireHOL level1, is built in.
+
+| Setting | Notes |
+|---|---|
+| Refresh interval (hours) | empty means 4; the feed republishes daily and the request is conditional |
+| Exceptions | networks never dropped, one per line; a bare address is taken as a /32 |
+
+What it does and deliberately does not do:
+
+- TCP only. A false positive on a UDP game port would drop a player
+  mid-match; on TCP it is a connection that does not open.
+- Public interface only, like the protection chains, so it can never see a
+  probe or the control channel.
+- It cannot lock you out of the portal. The portal is on the admin WireGuard
+  tunnel, over UDP, so no rule here is consulted for it.
+- Private, reserved and carrier-grade NAT space is stripped from the feed
+  before anything is loaded. A feed listing a slice of `100.64/10` would drop
+  a large number of real mobile players at once.
+- A failed or implausibly short fetch keeps the list that is already loaded.
+  The last good copy is on disk, so a restart while the feed is unreachable
+  still comes up protected.
+
+The dashboard card shows the list size, its age, and what it has dropped. The
+age is the number worth watching: a list that has stopped refreshing keeps
+working and keeps dropping, so nothing else says it has gone stale.
+
+If somebody cannot reach a service and you suspect this list, check the card
+first, then add their network to **Exceptions** rather than switching the
+feature off. To see whether an address is listed:
+
+```sh
+grep -w 203.0.113.7 /var/lib/failover/blocklist-feed.nft
+```
+
+Refreshing the list never touches a rule, so it resets no counter and releases
+nothing the protection table is holding. Saving a change to the blocklist
+settings does rebuild its table, which resets its own drop counter.
+
+After the first save with it enabled, parse-check the generated files once:
+
+```sh
+nft -c -f /var/lib/failover/blocklist.nft
+```
+
+Silence is a pass, in the same way as for the protection file above.
+
 ---
 
 ## 14. Optional: publishing from more than one host

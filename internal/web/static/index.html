@@ -92,6 +92,15 @@
       <div class="card" id="protect-body"></div>
     </div>
 
+    <!-- Absent unless the blocklist is switched on. Every way this feature
+         fails is quiet - a feed that stopped updating, a list that never
+         loaded, and a list working perfectly all look identical from
+         outside - so its age and its last error have to be on screen. -->
+    <div id="blocklist-section" class="hidden">
+      <h2 class="section-head">Blocklist</h2>
+      <div class="card" id="blocklist-body"></div>
+    </div>
+
     <!-- Absent unless the query cache is running. A cache serving stale data
          looks exactly like a healthy server with the wrong map name, so its
          freshness has to be somewhere a person can see it. -->

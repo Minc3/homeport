@@ -760,6 +760,52 @@ func validate(cfg *model.Config) error {
 			"trim a list, or fetch fewer countries into one region", regionsBytes>>20, maxRegionsBytes>>20)
 	}
 
+	// The feed-driven blocklist. It fails closed on the public interface for
+	// exactly the reason protection does: without one to scope to, its drop
+	// rule would also match traffic arriving on a tunnel, which is the probes
+	// and the control channel - and a third party's list would then be able
+	// to condemn a healthy link and move traffic to a metered one.
+	bl := &cfg.Blocklist
+	if bl.Enabled && trimmed(cfg.Frontend.PublicIface) == "" {
+		return errors.New("the blocklist needs the frontend's public interface set: " +
+			"the rule must be scoped to it, or it would also match probes arriving on a tunnel")
+	}
+	// One check for the floor rather than a negative check beside it: the
+	// floor is 1, so "negative" and "under the floor" are the same set of
+	// values and two branches would mean one that can never fire.
+	if bl.RefreshHours != 0 && bl.RefreshHours < model.MinBlocklistRefreshHours {
+		return fmt.Errorf("blocklist: a refresh of %dh is under the least this will poll a third party's host; "+
+			"the least is %d, and 0 means the default %d",
+			bl.RefreshHours, model.MinBlocklistRefreshHours, model.DefaultBlocklistRefreshHours)
+	}
+	if bl.RefreshHours > model.MaxBlocklistRefreshHours {
+		return fmt.Errorf("blocklist: a refresh of %dh leaves the list older than the freshness it exists for; "+
+			"the most is %d, and 0 means the default %d",
+			bl.RefreshHours, model.MaxBlocklistRefreshHours, model.DefaultBlocklistRefreshHours)
+	}
+	if len(bl.Exceptions) > maxBlocklistExceptions {
+		return fmt.Errorf("blocklist: %d exceptions; the most is %d - these are meant to be the handful of "+
+			"networks the feed gets wrong, not a second list", len(bl.Exceptions), maxBlocklistExceptions)
+	}
+	cleanedEx := make([]string, 0, len(bl.Exceptions))
+	for _, c := range bl.Exceptions {
+		c = trimmed(c)
+		if c == "" {
+			continue
+		}
+		// A bare address is a /32, matching the regions: an exception is
+		// usually one address somebody has just found in the list.
+		if !strings.Contains(c, "/") {
+			c += "/32"
+		}
+		netw, err := parseIPv4Network(c)
+		if err != nil {
+			return fmt.Errorf("blocklist exception: %v", err)
+		}
+		cleanedEx = append(cleanedEx, netw)
+	}
+	bl.Exceptions = cleanedEx
+
 	if cfg.Probe.ActiveIntervalMs < 50 {
 		return errors.New("active probe interval must be at least 50ms")
 	}
@@ -1015,6 +1061,13 @@ func parseIPv4Address(a string) (string, error) {
 // name (geo_<name>) and part of a set comment, and nft bounds identifiers too;
 // 32 is far under either limit and long enough for any part of the world.
 const maxRegionName = 32
+
+// maxBlocklistExceptions bounds the operator's allow list. It sits apart from
+// the three caps below because it is a count rather than a size and belongs to
+// no ordering: an exception exists because somebody found a network the feed
+// gets wrong, and a deployment with hundreds of them wants the feature
+// switched off rather than overridden.
+const maxBlocklistExceptions = 256
 
 // The three size caps are one story and must stay in this order:
 // geoFetchMaxTotal < maxRegionsBytes < maxConfigBytes. A fetch fills one

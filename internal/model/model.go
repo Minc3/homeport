@@ -71,7 +71,68 @@ type Config struct {
 	// the frontend itself. Off on every site until somebody turns it on, and
 	// an older config unmarshals to exactly this.
 	QueryCache QueryCacheConfig `json:"query_cache,omitempty"`
+
+	// Blocklist drops traffic from a threat feed the frontend refreshes on a
+	// timer. Off on every site until somebody turns it on, and an older
+	// config unmarshals to exactly this.
+	Blocklist BlocklistConfig `json:"blocklist,omitempty"`
 }
+
+// BlocklistConfig is the feed-driven drop list in front of every TCP port.
+//
+// It is the one part of this system that acts on data nobody here reviewed.
+// Every other list a packet is matched against was typed or pasted by the
+// operator and saved through validate; this one arrives from a third party on
+// a timer, so the whole design is about bounding what a bad fetch can do. The
+// list never enters the configuration blob, a fetch that fails or comes back
+// implausibly short keeps the previous list, and the last good copy is on
+// disk so a restart with the feed unreachable still installs protection.
+//
+// It is deliberately narrow in three ways. TCP only, so a false positive can
+// never drop a player mid-match on a UDP game port. Scoped to the public
+// interface, like the protection table, so it can never see a probe or the
+// control channel. And its rules live in a table of their own rather than in
+// failover_protect, because that table is deleted and rebuilt whenever
+// anything in it changes: a feed refreshing inside it would reset every
+// limiter counter, unpark every blocked source and release every engaged
+// region lock, several times a day.
+//
+// One thing it cannot do is lock the operator out of the portal, which is
+// worth knowing before enabling it: the portal binds an admin WireGuard
+// interface over UDP, so no rule here is even consulted for it.
+type BlocklistConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+
+	// RefreshHours is how often the feed is re-fetched. Zero takes the
+	// shipped default, so an older config unmarshals to exactly the
+	// behaviour it had. The feed itself publishes about once a day, and
+	// conditional requests make an unchanged one nearly free, so this is
+	// bounded well away from both a poll of somebody else's server and a
+	// list old enough to be worthless.
+	RefreshHours int `json:"refresh_hours,omitempty"`
+
+	// Exceptions are networks that are never dropped, checked before the
+	// feed. They exist because the failure this feature can produce is
+	// silent: a listed source is a visitor who cannot connect, with nothing
+	// on the box saying why, and an operator who has found one needs a way
+	// to override it that does not mean turning the whole list off.
+	Exceptions []string `json:"exceptions,omitempty"`
+}
+
+// DefaultBlocklistRefreshHours is the refresh cadence a zero RefreshHours
+// takes. The feed lands in its repository about once a day and the fetch is
+// conditional, so four hours costs a handful of 304s and bounds how long a
+// newly listed network goes unblocked.
+const DefaultBlocklistRefreshHours = 4
+
+// MinBlocklistRefreshHours and MaxBlocklistRefreshHours bound it. The floor is
+// politeness to a host serving a static file to everybody; the ceiling is the
+// point past which the list is old enough that its freshness, which is the
+// whole reason for a feed rather than a paste, has stopped being true.
+const (
+	MinBlocklistRefreshHours = 1
+	MaxBlocklistRefreshHours = 168
+)
 
 // QueryCacheConfig is the frontend's Source query cache: one switch, off by
 // default.
@@ -1047,6 +1108,14 @@ type Status struct {
 	// wrong map name, and only this says which is happening.
 	QueryCache []QueryCacheState `json:"query_cache,omitempty"`
 
+	// Blocklist is the state of the feed-driven drop list. Absent unless it
+	// is switched on. Reported in full rather than as a health tick because
+	// every way this feature fails is quiet: a feed that stopped updating, a
+	// list that failed to load into the kernel, and a list working perfectly
+	// all look identical from outside, and the drops it is responsible for
+	// are otherwise indistinguishable from the internet being calm.
+	Blocklist *BlocklistStatus `json:"blocklist,omitempty"`
+
 	// SharedEndpoints lists tunnels seen arriving from one public address,
 	// which means they are riding the same internet service. Empty is healthy
 	// and the normal case.
@@ -1104,6 +1173,46 @@ type ProtectCounter struct {
 type BlockedSource struct {
 	Address    string `json:"address"`
 	ExpiresSec int    `json:"expires_sec"`
+}
+
+// BlocklistStatus is what the feed-driven drop list is currently doing.
+//
+// Networks and UpdatedAt describe the list actually loaded into the kernel,
+// not the last thing fetched: a refusal by the shrink guard or by nft leaves
+// both where they were, which is the point of them. LastError and LastTry
+// describe the most recent attempt, so a feed that has been failing for a
+// week reads as a working list going stale rather than as either alone.
+type BlocklistStatus struct {
+	// Networks is how many the loaded set holds, and Exceptions how many the
+	// operator's allow set does.
+	Networks   int `json:"networks"`
+	Exceptions int `json:"exceptions"`
+
+	// Source is the feed the list came from, said out loud because it is the
+	// one list here nobody in this deployment wrote.
+	Source string `json:"source,omitempty"`
+
+	// UpdatedAt is when the loaded list was fetched, and AgeHours how old it
+	// is now. A list that has stopped being refreshed keeps working and keeps
+	// being reported, because an old blocklist beats none; the age is what
+	// says to go and look.
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	AgeHours  float64   `json:"age_hours"`
+
+	// LastTry and LastError are the most recent attempt. LastError empty
+	// means it succeeded.
+	LastTry   time.Time `json:"last_try,omitempty"`
+	LastError string    `json:"last_error,omitempty"`
+
+	// Loaded reports that the rules are really in the kernel. False with the
+	// feature enabled is observe mode, or an apply that failed.
+	Loaded bool `json:"loaded"`
+
+	// Packets and Bytes are what the drop rule has counted since it was last
+	// loaded. A refresh updates the set without touching the rule, so these
+	// survive every refresh and reset only when the table is rebuilt.
+	Packets int64 `json:"packets"`
+	Bytes   int64 `json:"bytes"`
 }
 
 // QueryCacheState is the running state of one cached port.

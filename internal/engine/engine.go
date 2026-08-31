@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -250,6 +251,38 @@ type Engine struct {
 	// only binary able to remove them being deleted.
 	reverted bool
 
+	// The feed-driven blocklist. blNetworks is the list as fetched, before
+	// the generator's parse and merge.
+	//
+	// blUpdated is when it was last confirmed current with the feed, which a
+	// 304 counts for; blLastTry and blLastErr describe the most recent
+	// attempt, so a feed that has been failing for a week reads as a working
+	// list going stale rather than as either alone. blApplied is the table
+	// text last really loaded, carrying applyProtect's latch for the same
+	// reason plus one of its own: a rebuild empties the feed set.
+	blNetworks []string
+	// blCount is how many of them will really be loaded, kept beside the list
+	// rather than derived on demand: Status is polled once a second and holds
+	// the state lock while it renders, and the two figures differ because the
+	// feed aggregates sources whose networks nest.
+	blCount   int
+	blUpdated time.Time
+	blEtag    string
+	blLastTry time.Time
+	blLastErr string
+	blOn      bool
+	blApplied string
+	blCounter model.ProtectCounter
+	// blWake asks the refresher to reconsider now. Buffered one deep and
+	// written without blocking, like wake.
+	blWake chan struct{}
+	// blURL and blClient are the feed and the transport, fields rather than
+	// constants only so the tests can point them at a local server. Nothing
+	// outside this package can reach them, so the URL is not operator input
+	// by another name.
+	blURL    string
+	blClient *http.Client
+
 	// cfgVersion increments on every configuration change. The control server
 	// watches it to know when to push a fresh config down to the backend.
 	cfgVersion uint64
@@ -301,6 +334,13 @@ func New(log *slog.Logger, st *store.Store, notifier *notify.Notifier, cfg model
 	e.runner = runnerFor(cfg.Mode, log)
 	reportQuotaSubstitutions(log, cfg)
 	e.loadLinkerSeen()
+	// The last good blocklist, read before anything is installed, so the
+	// startup apply has something to fill the set with rather than arming an
+	// empty one and waiting out a refresh interval.
+	e.blWake = make(chan struct{}, 1)
+	e.blURL = blocklistFeedURL
+	e.blClient = &http.Client{Timeout: blocklistHTTPTimeout}
+	e.loadBlocklistCache()
 	// A latch left by a previous process. See the field: without this,
 	// Restart=always turned every crash after a revert into a full reinstall.
 	if st.Meta(revertedMetaKey) != "" {
@@ -349,6 +389,14 @@ func (e *Engine) Run(ctx context.Context) error {
 	e.reconfMu.Unlock()
 	defer e.stopProbers()
 	defer e.stopQueryCache()
+
+	// The blocklist refresher. On the base context, never a request's
+	// (invariant 9), and it re-reads the configuration each pass rather than
+	// capturing it, so a changed interval or the feature being switched on
+	// takes effect without this goroutine being torn down and restarted -
+	// which is the whole family of bugs invariant 9 describes, avoided rather
+	// than guarded against. It gates itself on the revert latch too.
+	go e.runBlocklist(ctx)
 
 	decide := time.NewTicker(500 * time.Millisecond)
 	defer decide.Stop()
@@ -1133,6 +1181,7 @@ func (e *Engine) applySystemConfig(ctx context.Context) {
 
 	e.applyEgress(ctx, cfg, gated, real)
 	e.applyProtect(ctx, cfg, gated, real)
+	e.applyBlocklist(ctx, cfg, gated, real)
 	e.applyShaping(ctx, cfg, gated)
 }
 
@@ -1330,12 +1379,21 @@ const protectSampleIdleAfter = 30 * time.Second
 // drops the stale samples, so the re-test happens as the portal opens.
 func (e *Engine) sampleProtect(ctx context.Context) {
 	e.mu.RLock()
-	on := e.protectOn
+	on, blOn := e.protectOn, e.blOn
 	e.mu.RUnlock()
-	if !on {
+	if !on && !blOn {
 		return
 	}
 	if last := e.statusAt.Load(); time.Since(time.Unix(0, last)) > protectSampleIdleAfter {
+		return
+	}
+	// The blocklist's counter rides the same gate for the same reason: it
+	// feeds the portal and nothing else, and its table is separate, so a site
+	// running one feature and not the other reads only the table it has.
+	if blOn {
+		e.sampleBlocklistCounter(ctx)
+	}
+	if !on {
 		return
 	}
 	counters, blocked, locked, err := sysx.ProtectState(ctx, e.realRunner())
@@ -2353,6 +2411,11 @@ func (e *Engine) Status() model.Status {
 	if prev := e.statusAt.Swap(now.UnixNano()); time.Since(time.Unix(0, prev)) > protectSampleIdleAfter {
 		e.mu.Lock()
 		e.protectCounters, e.protectBlocked, e.protectGeoLocked = nil, nil, nil
+		// The blocklist counter is dropped on the same edge and for the same
+		// reason. It reads as a rate in the portal - what the list has
+		// stopped - so serving one taken before an idle spell attributes an
+		// old afternoon's drops to this minute.
+		e.blCounter = model.ProtectCounter{}
 		e.mu.Unlock()
 		e.wakeSample()
 	}
@@ -2380,6 +2443,7 @@ func (e *Engine) Status() model.Status {
 		Reverted:    e.reverted,
 
 		Protect:         e.protectStatus(),
+		Blocklist:       e.blocklistStatus(),
 		SharedEndpoints: e.sharedEndpoints,
 		QueryCache:      e.queryCacheStates(),
 		LinkerStates:    e.linkerStates(),
@@ -2482,6 +2546,7 @@ func (e *Engine) Revert(ctx context.Context) {
 	}
 	sysx.RemoveEgressRuleset(ctx, runner)
 	sysx.RemoveProtectRuleset(ctx, runner)
+	sysx.RemoveBlocklistRuleset(ctx, runner)
 	// Only tunnels this system shapes. An interface it never touched keeps
 	// whatever queue discipline its owner gave it - revert takes down what the
 	// agent installed and nothing else.
@@ -2520,6 +2585,14 @@ func (e *Engine) Revert(ctx context.Context) {
 	// All three samples, not two: a stale engaged-lock reading served after a
 	// later re-arm is an attack alert for a lock that is not in the kernel.
 	e.protectCounters, e.protectBlocked, e.protectGeoLocked = nil, nil, nil
+	// The blocklist table went with the rest. The list itself is kept - it is
+	// agent state like the meter baselines, not something this installed -
+	// so re-arming reloads it without another fetch, but the counter
+	// describes a rule that no longer exists and the latch must not let the
+	// next save skip a reload.
+	e.blOn = false
+	e.blApplied = ""
+	e.blCounter = model.ProtectCounter{}
 	e.mu.Unlock()
 
 	_ = e.st.AddEvent(store.EventSystem, 0,

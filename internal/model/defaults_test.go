@@ -26,6 +26,13 @@ func TestNothingInTheShippedConfigurationIsLive(t *testing.T) {
 	if cfg.QueryCache.Enabled {
 		t.Error("the query cache ships on, which would bind service ports and answer for servers nobody opted in")
 	}
+	// The blocklist needs this more than the rows above, not less: shipped on,
+	// a fresh install would start dropping traffic on the strength of a list
+	// downloaded from a third party that nobody has looked at, and would make
+	// the running frontend depend on an outbound fetch on a timer.
+	if cfg.Blocklist.Enabled {
+		t.Error("the blocklist ships on, which would drop traffic from a feed nobody has reviewed")
+	}
 	for _, s := range cfg.Egress.Sources {
 		if s.Enabled {
 			t.Errorf("egress source %s (%s) ships enabled", s.Name, s.CIDR)

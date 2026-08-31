@@ -119,6 +119,13 @@ func TestDryRunnerSuppressesMutationsButRunsQueries(t *testing.T) {
 		{"ip", "rule", "add", "fwmark", "0x101", "lookup", "101"},
 		{"ip", "link", "add", "dummy0", "type", "dummy"},
 		{"nft", "-f", "/var/lib/failover/ruleset.nft"},
+		// The blocklist's two loads. The second is a flush-and-add of set
+		// elements rather than a table, which is still a mutation and still
+		// reaches nft the same way: it must not run in observe mode, where
+		// no blocklist table exists to hold them.
+		{"nft", "-f", "/var/lib/failover/blocklist.nft"},
+		{"nft", "-f", "/var/lib/failover/blocklist-feed.nft"},
+		{"nft", "delete", "table", "ip", "failover_blocklist"},
 		{"sysctl", "-w", "net.ipv4.ip_forward=1"},
 		// Nothing issues `wg set` today; this pins that the day something
 		// does, observe mode suppresses it rather than running it for real
@@ -157,6 +164,8 @@ func TestDryRunnerSuppressesMutationsButRunsQueries(t *testing.T) {
 		// `args[0] == "list"` would have misread.
 		{"nft", "-j", "-t", "list", "table", "ip", "failover_protect"},
 		{"nft", "-j", "list", "set", "ip", "failover_protect", "blocked"},
+		// The blocklist counter readback, the same terse shape.
+		{"nft", "-j", "-t", "list", "table", "ip", "failover_blocklist"},
 	}
 	for _, q := range queries {
 		if !isReadOnly(q[0], q[1:]) {
