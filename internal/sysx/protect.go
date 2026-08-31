@@ -584,19 +584,19 @@ const (
 // connRateRule and connCountRule are the one spelling of the two connection
 // rules, written by the shared rules and the per-service overrides alike. One
 // spelling because everything load-bearing is in it: the `ct state new`
-// qualifier, the burst-is-twice-the-rate convention, and blockStmt's position
-// ahead of the counter. Written out twice, a change to any of those lands in
-// the copy an operator tunes and silently not in the copy a row overrides
-// with, and "the override behaves differently from the shared limit at the
-// same number" is exactly what nobody would suspect.
-func connRateRule(b *strings.Builder, ports, set string, rate int, blockStmt, comment string) {
-	fmt.Fprintf(b, "\t\tct state new tcp dport %s add @%s { ip saddr limit rate over %d/second burst %d packets } %scounter drop comment %q\n",
-		ports, set, rate, rate*2, blockStmt, comment)
+// qualifier, the burst-is-twice-the-rate convention, and the tail that decides
+// what becomes of a packet which tripped. Written out twice, a change to any
+// of those lands in the copy an operator tunes and silently not in the copy a
+// row overrides with, and "the override behaves differently from the shared
+// limit at the same number" is exactly what nobody would suspect.
+func connRateRule(b *strings.Builder, ports, set string, rate int, tail string) {
+	fmt.Fprintf(b, "\t\tct state new tcp dport %s add @%s { ip saddr limit rate over %d/second burst %d packets } %s\n",
+		ports, set, rate, rate*2, tail)
 }
 
-func connCountRule(b *strings.Builder, ports, set string, most int, blockStmt, comment string) {
-	fmt.Fprintf(b, "\t\tct state new tcp dport %s add @%s { ip saddr ct count over %d } %scounter drop comment %q\n",
-		ports, set, most, blockStmt, comment)
+func connCountRule(b *strings.Builder, ports, set string, most int, tail string) {
+	fmt.Fprintf(b, "\t\tct state new tcp dport %s add @%s { ip saddr ct count over %d } %s\n",
+		ports, set, most, tail)
 }
 
 // connectionlessMatch is the Source engine's connectionless header: every
@@ -607,6 +607,139 @@ func connCountRule(b *strings.Builder, ports, set string, most int, blockStmt, c
 // they disagreed about would be dropped by one and answered by another, so
 // there is exactly one spelling.
 const connectionlessMatch = "@th,64,32 0xffffffff"
+
+// sourceSetSize bounds every per-source set in this table, and the number is
+// load-bearing rather than a round one. A dynamic set that has reached its
+// size refuses the add, and the kernel's answer to a refused add is NFT_BREAK:
+// the rest of the rule is abandoned. Every limiter here is a rule shaped
+// `add @<limit> {...} jump <park>`, so a full limit set skips the jump and the
+// drop behind it, which is fail-open while the portal reads zero drops at
+// exactly the moment the limit stopped being enforced. The blocklist add used
+// to sit in that same rule and is now a rule of its own inside the park chain,
+// so a full blocklist no longer does this to every limiter at once: see
+// parkChains. Nothing can take a limit set's own add out of its rule, because
+// that add is the condition the rule tests, so there headroom is the whole of
+// the defence and this is the number that provides it.
+//
+// The blocklist is the expensive one to fill, because a source has to exceed
+// burst - twice the limit - to earn an entry. The rate sets are not: they take
+// an element per source *seen*, so occupancy is new sources per second times
+// rateSetTimeout, and a source-randomised flood fills them at a packet rate
+// that costs the sender nothing. Both carry this bound. The lockdown sets do
+// not, and the 65535 there is not this number rounded down: their key is a
+// port and validate refuses port 0, so that is every value that can reach one.
+//
+// What this buys is time rather than immunity, and the arithmetic wants
+// reading that way. 262144 over rateSetTimeout is about 26k new sources a
+// second sustained before a rate set fills, which is roughly 13 Mbit/s of
+// small packets: within reach of one cheap booter, and a source-randomised
+// flood is exactly the case per-source limits cannot answer, which is the
+// reason the query cache exists. Against the 65535 and 60s this started at it
+// is about a 24x rise. It does not close the hole.
+//
+// It is not free at either end. Empty, a hash set sizes its bucket table from
+// this at load - nelem_hint, rounded up to a power of two at 4/3 of it, one
+// pointer per bucket - so each set holds 4 MiB from the moment the table is
+// loaded and before a single element exists, against 1 MiB at 65535. Six sets
+// on a busy site is about 24 MiB. Full, the elements dominate instead: an ipv4
+// key with a timeout, an expiration and a token bucket is on the order of 150
+// bytes of slab, so a filled set is tens of megabytes and this constant moved
+// that ceiling with it. The second figure is the attacker-driven one and is
+// the larger half of what has to be weighed if this is ever raised again.
+// `nft list ruleset` shows neither; read the slab.
+const sourceSetSize = 262144
+
+// rateSetTimeout is how long a source's token bucket lives from when it was
+// created. From created, not from its last packet: the generator emits `add`,
+// and `add` does not refresh an existing element's expiration - only `update`
+// does, and nft_dynset_eval refreshes it only under NFT_DYNSET_OP_UPDATE. That
+// is what makes the occupancy arithmetic above hold, because an element is
+// then held for a fixed span per source seen rather than for as long as a
+// source keeps sending. Expiry and reclaim are not the same instant - a set
+// with no gc-interval of its own is swept at HZ, so an element is counted
+// against the size for about a second longer than it lived - which is inside
+// the slack in that arithmetic rather than a correction to it.
+//
+// The same property means a source that keeps flooding is handed a fresh full
+// bucket every time its element expires, at any value this could take, so a
+// shorter timeout leaks faster: burst is twice the rate everywhere this
+// generator emits, so the leak is 2N packets per timeout and the effective
+// sustained ceiling is about 1.2N here against 1.03N at the 60s this was first
+// written with. What makes that survivable is parking rather than this number.
+// The trip puts the source in @blocked and the raw chain drops it there on its
+// next packet, so it never reaches the limiter to collect the fresh bucket,
+// which leaves the leak reachable only with Protect.BlockSeconds at 0, where
+// nothing is parking anything. Weigh that before lowering it further, and do
+// not weigh the token bucket's refill: expiry hands out a clean bucket
+// whatever the refill is, so the refill is not the floor it looks like.
+//
+// It is not the parking time, which is Protect.BlockSeconds on the blocklist.
+const rateSetTimeout = 10
+
+// parkChains collects the tails of the limiter rules. With parking on a
+// limiter does not drop in its own rule: it jumps to a chain of two rules, the
+// blocklist add and then the counter and the drop.
+//
+// The indirection is the whole of the point. A full dynamic set refuses the
+// add and the kernel answers NFT_BREAK, which abandons the rest of the rule -
+// so with `add @blocked { ip saddr } counter drop` all in one rule, a full
+// blocklist silently took the drop and its counter with it, and did so to
+// every limiter at once because the blocklist is shared by all of them.
+// NFT_BREAK ends a rule and not a chain, so with the add in a rule of its own
+// the drop is simply the next rule and still runs. A full blocklist then costs
+// the parking and nothing else. It has to be a jump rather than statements
+// appended to the limiter's rule: a jump resumes at the next rule of the
+// calling chain, never at the rest of the calling rule.
+//
+// One chain per limiter rather than one shared: the counter and the drop must
+// stay in the same rule as the comment naming them, because that is what
+// ProtectState reads back and what the portal attributes drops by. One shared
+// chain would give every limiter a single counter and no attribution.
+//
+// It does nothing for a full limit set, which is the other half of the same
+// hazard and is not fixable this way; sourceSetSize carries that.
+type parkChains struct {
+	chains []parkChain
+	used   map[string]bool
+}
+
+type parkChain struct {
+	name    string
+	comment string
+}
+
+// target registers a chain for one limiter and hands back its name. The name
+// folds from the counter comment the way the per-service set names fold from
+// the service name, with the same numeric suffix on a collision, because two
+// service names the fold collapses are legal and must not define one chain
+// twice - nft refuses the whole table over that, and every limit with it.
+func (p *parkChains) target(comment string) string {
+	if p.used == nil {
+		p.used = map[string]bool{}
+	}
+	base := foldSetName("park_", comment)
+	name := base
+	for i := 2; p.used[name]; i++ {
+		name = fmt.Sprintf("%s%d", base, i)
+	}
+	p.used[name] = true
+	p.chains = append(p.chains, parkChain{name: name, comment: comment})
+	return name
+}
+
+// write emits the registered chains. Nothing is emitted when none was
+// registered, which is every site with parking off, so the table such a site
+// generates is what it always was.
+func (p *parkChains) write(b *strings.Builder) {
+	for _, c := range p.chains {
+		fmt.Fprintf(b, "\tchain %s {\n", c.name)
+		// A rule of its own, deliberately: a full blocklist breaks this one
+		// and leaves the drop below to run. See parkChains.
+		b.WriteString("\t\tadd @blocked { ip saddr }\n")
+		fmt.Fprintf(b, "\t\tcounter drop comment %q\n", c.comment)
+		b.WriteString("\t}\n\n")
+	}
+}
 
 // BuildProtectRuleset renders the edge filtering table, or "" when there is
 // nothing switched on.
@@ -639,7 +772,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	if park {
 		b.WriteString("\tset blocked {\n")
 		b.WriteString("\t\ttype ipv4_addr\n")
-		b.WriteString("\t\tsize 65535\n")
+		fmt.Fprintf(&b, "\t\tsize %d\n", sourceSetSize)
 		// `dynamic` is not optional, and its absence is not a small mistake:
 		// without it the kernel refuses every `add @blocked` from the packet
 		// path and the whole table fails to load - so the rate limits would be
@@ -661,7 +794,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	dynSet := func(name string, timeout int) {
 		fmt.Fprintf(&b, "\tset %s {\n", name)
 		b.WriteString("\t\ttype ipv4_addr\n")
-		b.WriteString("\t\tsize 65535\n")
+		fmt.Fprintf(&b, "\t\tsize %d\n", sourceSetSize)
 		if timeout > 0 {
 			b.WriteString("\t\tflags dynamic,timeout\n")
 			fmt.Fprintf(&b, "\t\ttimeout %ds\n", timeout)
@@ -676,16 +809,16 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	// has to hold - and a reader of `nft list ruleset` cannot trust the set
 	// list to mean the rule list.
 	if spec.NewConnsPerSec > 0 && len(sharedRatePorts) > 0 {
-		dynSet("conn_rate", 60)
+		dynSet("conn_rate", rateSetTimeout)
 	}
 	if spec.MaxConnsPerSource > 0 && len(sharedCountPorts) > 0 {
 		dynSet("conn_count", 0)
 	}
 	if spec.PacketsPerSec > 0 {
-		dynSet("packet_rate", 60)
+		dynSet("packet_rate", rateSetTimeout)
 	}
 	if spec.QueriesPerSec > 0 && len(sePorts) > 0 {
-		dynSet("query_rate", 60)
+		dynSet("query_rate", rateSetTimeout)
 	}
 	// The per-service override sets, one per overridden limit rather than the
 	// shared set beside them: see connOverride for why the threshold cannot
@@ -693,7 +826,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	// for the reason conn_count does not.
 	for _, o := range overrides {
 		if o.rateSet != "" {
-			dynSet(o.rateSet, 60)
+			dynSet(o.rateSet, rateSetTimeout)
 		}
 		if o.countSet != "" {
 			dynSet(o.countSet, 0)
@@ -748,6 +881,11 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 			lockSets[sv.Proto] = true
 			fmt.Fprintf(&b, "\tset %s {\n", geoLockSetName(sv.Proto))
 			b.WriteString("\t\ttype inet_service\n")
+			// 65535 rather than sourceSetSize, and not that number rounded
+			// down: the key is a port, the trigger only ever adds a port a
+			// service published, and validate refuses port 0 - so 65535 is
+			// every value that can reach this set and its add can never be
+			// the one that is refused.
 			b.WriteString("\t\tsize 65535\n")
 			b.WriteString("\t\tflags dynamic,timeout\n")
 			fmt.Fprintf(&b, "\t\ttimeout %ds\n", spec.geoLockSeconds())
@@ -756,50 +894,62 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 		}
 	}
 
-	// The parking statement, appended to whichever limit tripped. Written the
-	// same way everywhere so the blocklist cannot end up populated by one limit
-	// and not another.
-	blockStmt := ""
-	if park {
-		blockStmt = "add @blocked { ip saddr } "
+	// What becomes of a packet that tripped a limit. With parking off there is
+	// no blocklist add that can fail, so the counter and the drop stay in the
+	// limiter's own rule exactly as they always did, and the table is byte for
+	// byte what it was; with parking on they move into a park chain and the
+	// limiter jumps to it. parkChains carries why.
+	var parks parkChains
+	tail := func(comment string) string {
+		if !park {
+			return fmt.Sprintf("counter drop comment %q", comment)
+		}
+		return "jump " + parks.target(comment)
 	}
 
+	// The chains are built apart from b because the park chains have to be
+	// declared ahead of the rules that jump to them - nft resolves a jump
+	// target against what its batch has already created, so a chain declared
+	// further down the file does not yet exist - and which of them exist is
+	// only known once the rules needing them have been written.
+	var rules strings.Builder
+
 	// --- raw: before conntrack -------------------------------------------
-	b.WriteString("\tchain raw {\n")
-	b.WriteString("\t\ttype filter hook prerouting priority raw; policy accept;\n")
-	fmt.Fprintf(&b, "\t\tiifname != %q accept\n", iface)
+	rules.WriteString("\tchain raw {\n")
+	rules.WriteString("\t\ttype filter hook prerouting priority raw; policy accept;\n")
+	fmt.Fprintf(&rules, "\t\tiifname != %q accept\n", iface)
 	if park {
-		b.WriteString("\t\t# Parked sources cost one set lookup and nothing else.\n")
-		fmt.Fprintf(&b, "\t\tip saddr @blocked counter drop comment %q\n", CounterBlocked)
+		rules.WriteString("\t\t# Parked sources cost one set lookup and nothing else.\n")
+		fmt.Fprintf(&rules, "\t\tip saddr @blocked counter drop comment %q\n", CounterBlocked)
 	}
 	if spec.DropBogusTCP {
-		b.WriteString("\t\t# Flag combinations no stack produces: scans and crafted floods.\n")
+		rules.WriteString("\t\t# Flag combinations no stack produces: scans and crafted floods.\n")
 		for _, m := range bogusTCPMatches() {
-			fmt.Fprintf(&b, "\t\t%s counter drop comment %q\n", m, CounterBogusTCP)
+			fmt.Fprintf(&rules, "\t\t%s counter drop comment %q\n", m, CounterBogusTCP)
 		}
 	}
 	if spec.DropSpoofed {
-		b.WriteString("\t\t# Source addresses that cannot legitimately arrive from the internet.\n")
-		fmt.Fprintf(&b, "\t\tip saddr %s counter drop comment %q\n", martianSet(), CounterSpoofed)
+		rules.WriteString("\t\t# Source addresses that cannot legitimately arrive from the internet.\n")
+		fmt.Fprintf(&rules, "\t\tip saddr %s counter drop comment %q\n", martianSet(), CounterSpoofed)
 	}
 	if spec.DropLegacyQueries && len(sePorts) > 0 {
-		b.WriteString("\t\t# The two deprecated Source connectionless queries, dropped before\n")
-		b.WriteString("\t\t# conntrack: GETCHALLENGE (0x57) and A2A_PING (0x69). No client has\n")
-		b.WriteString("\t\t# sent either in over a decade, and both are reflector shapes. The\n")
-		b.WriteString("\t\t# match is the connectionless header then the type byte, exactly as\n")
-		b.WriteString("\t\t# the query rate limiter reads it, so the live queries (0x54-0x56)\n")
-		b.WriteString("\t\t# and in-game traffic are untouched.\n")
-		fmt.Fprintf(&b, "\t\tudp dport %s %s @th,96,8 { 0x57, 0x69 } counter drop comment %q\n",
+		rules.WriteString("\t\t# The two deprecated Source connectionless queries, dropped before\n")
+		rules.WriteString("\t\t# conntrack: GETCHALLENGE (0x57) and A2A_PING (0x69). No client has\n")
+		rules.WriteString("\t\t# sent either in over a decade, and both are reflector shapes. The\n")
+		rules.WriteString("\t\t# match is the connectionless header then the type byte, exactly as\n")
+		rules.WriteString("\t\t# the query rate limiter reads it, so the live queries (0x54-0x56)\n")
+		rules.WriteString("\t\t# and in-game traffic are untouched.\n")
+		fmt.Fprintf(&rules, "\t\tudp dport %s %s @th,96,8 { 0x57, 0x69 } counter drop comment %q\n",
 			portSet(sePorts), connectionlessMatch, CounterLegacyQ)
 	}
 	if len(geoSvcs) > 0 {
-		b.WriteString("\t\t# Region locks: an allow lock drops everything outside its regions,\n")
-		b.WriteString("\t\t# a block lock drops exactly what is inside them. Before conntrack\n")
-		b.WriteString("\t\t# and on every packet, not just new connections: the set answer is\n")
-		b.WriteString("\t\t# fixed per address, so a player the lock admits can never be newly\n")
-		b.WriteString("\t\t# caught by it, while matching statelessly means a barred flood costs\n")
-		b.WriteString("\t\t# no conntrack entry and a lock engaging also ends flows already in\n")
-		b.WriteString("\t\t# progress.\n")
+		rules.WriteString("\t\t# Region locks: an allow lock drops everything outside its regions,\n")
+		rules.WriteString("\t\t# a block lock drops exactly what is inside them. Before conntrack\n")
+		rules.WriteString("\t\t# and on every packet, not just new connections: the set answer is\n")
+		rules.WriteString("\t\t# fixed per address, so a player the lock admits can never be newly\n")
+		rules.WriteString("\t\t# caught by it, while matching statelessly means a barred flood costs\n")
+		rules.WriteString("\t\t# no conntrack entry and a lock engaging also ends flows already in\n")
+		rules.WriteString("\t\t# progress.\n")
 		for _, sv := range geoSvcs {
 			// The conditional lock, engaged and released entirely in the
 			// kernel. The trigger runs first and takes no verdict, so it sees
@@ -811,7 +961,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 			// lockdown set.
 			lockCond := ""
 			if sv.GeoAutoPPS > 0 {
-				fmt.Fprintf(&b, "\t\t%s dport %s limit rate over %d/second update @%s { th dport timeout %ds } counter comment %q\n",
+				fmt.Fprintf(&rules, "\t\t%s dport %s limit rate over %d/second update @%s { th dport timeout %ds } counter comment %q\n",
 					sv.Proto, portSpec(sv.Port, sv.PortEnd), sv.GeoAutoPPS,
 					geoLockSetName(sv.Proto), spec.geoLockSeconds(),
 					CounterGeoTrip+":"+sv.Name)
@@ -825,7 +975,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 					if len(geoElems[name]) == 0 {
 						continue
 					}
-					fmt.Fprintf(&b, "\t\t%s dport %s %sip saddr @%s counter drop comment %q\n",
+					fmt.Fprintf(&rules, "\t\t%s dport %s %sip saddr @%s counter drop comment %q\n",
 						sv.Proto, portSpec(sv.Port, sv.PortEnd), lockCond,
 						GeoSetName(name), CounterGeo+":"+sv.Name)
 				}
@@ -839,21 +989,21 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 					fmt.Fprintf(&matches, "ip saddr != @%s ", GeoSetName(name))
 				}
 			}
-			fmt.Fprintf(&b, "\t\t%s dport %s %s%scounter drop comment %q\n",
+			fmt.Fprintf(&rules, "\t\t%s dport %s %s%scounter drop comment %q\n",
 				sv.Proto, portSpec(sv.Port, sv.PortEnd), lockCond, matches.String(),
 				CounterGeo+":"+sv.Name)
 		}
 	}
-	b.WriteString("\t}\n\n")
+	rules.WriteString("\t}\n\n")
 
 	// --- filter: after conntrack, before dstnat ---------------------------
-	b.WriteString("\tchain filter {\n")
-	b.WriteString("\t\ttype filter hook prerouting priority mangle; policy accept;\n")
-	fmt.Fprintf(&b, "\t\tiifname != %q accept\n", iface)
+	rules.WriteString("\tchain filter {\n")
+	rules.WriteString("\t\ttype filter hook prerouting priority mangle; policy accept;\n")
+	fmt.Fprintf(&rules, "\t\tiifname != %q accept\n", iface)
 
 	if spec.DropInvalid {
-		b.WriteString("\t\t# Packets conntrack cannot place in any connection.\n")
-		fmt.Fprintf(&b, "\t\tct state invalid counter drop comment %q\n", CounterInvalid)
+		rules.WriteString("\t\t# Packets conntrack cannot place in any connection.\n")
+		fmt.Fprintf(&rules, "\t\tct state invalid counter drop comment %q\n", CounterInvalid)
 	}
 
 	// The shared connection rules cover every TCP port no override claims;
@@ -863,29 +1013,29 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	// of nothing renders "{  }", which nft refuses along with the whole
 	// table. Their sets above are gated on the same condition.
 	if spec.NewConnsPerSec > 0 && len(sharedRatePorts) > 0 {
-		b.WriteString("\t\t# Connection attempts per source. Established connections are untouched.\n")
-		connRateRule(&b, portSet(sharedRatePorts), "conn_rate", spec.NewConnsPerSec, blockStmt, CounterConnRate)
+		rules.WriteString("\t\t# Connection attempts per source. Established connections are untouched.\n")
+		connRateRule(&rules, portSet(sharedRatePorts), "conn_rate", spec.NewConnsPerSec, tail(CounterConnRate))
 	}
 	if spec.MaxConnsPerSource > 0 && len(sharedCountPorts) > 0 {
-		b.WriteString("\t\t# Concurrent connections held by one source.\n")
-		connCountRule(&b, portSet(sharedCountPorts), "conn_count", spec.MaxConnsPerSource, blockStmt, CounterConnCount)
+		rules.WriteString("\t\t# Concurrent connections held by one source.\n")
+		connCountRule(&rules, portSet(sharedCountPorts), "conn_count", spec.MaxConnsPerSource, tail(CounterConnCount))
 	}
 
 	if udp := spec.ports("udp"); len(udp) > 0 && spec.PacketsPerSec > 0 {
-		b.WriteString("\t\t# Packets per second from one source. A player in a game sends\n")
-		b.WriteString("\t\t# tens of packets a second, so this wants to be generous.\n")
-		fmt.Fprintf(&b, "\t\tudp dport %s add @packet_rate { ip saddr limit rate over %d/second burst %d packets } %scounter drop comment %q\n",
-			portSet(udp), spec.PacketsPerSec, spec.PacketsPerSec*2, blockStmt, CounterPacketRate)
+		rules.WriteString("\t\t# Packets per second from one source. A player in a game sends\n")
+		rules.WriteString("\t\t# tens of packets a second, so this wants to be generous.\n")
+		fmt.Fprintf(&rules, "\t\tudp dport %s add @packet_rate { ip saddr limit rate over %d/second burst %d packets } %s\n",
+			portSet(udp), spec.PacketsPerSec, spec.PacketsPerSec*2, tail(CounterPacketRate))
 	}
 
 	if len(sePorts) > 0 && spec.QueriesPerSec > 0 {
-		b.WriteString("\t\t# Source-engine connectionless packets: the queries and connection\n")
-		b.WriteString("\t\t# attempts, which start 0xFFFFFFFF. A player already in the game\n")
-		b.WriteString("\t\t# sends sequence-numbered packets and never matches this, which is\n")
-		b.WriteString("\t\t# what makes a tight limit safe here. @th,64,32 is the first four\n")
-		b.WriteString("\t\t# bytes after the 8-byte UDP header.\n")
-		fmt.Fprintf(&b, "\t\tudp dport %s %s add @query_rate { ip saddr limit rate over %d/second burst %d packets } %scounter drop comment %q\n",
-			portSet(sePorts), connectionlessMatch, spec.QueriesPerSec, spec.QueriesPerSec*2, blockStmt, CounterQueryRate)
+		rules.WriteString("\t\t# Source-engine connectionless packets: the queries and connection\n")
+		rules.WriteString("\t\t# attempts, which start 0xFFFFFFFF. A player already in the game\n")
+		rules.WriteString("\t\t# sends sequence-numbered packets and never matches this, which is\n")
+		rules.WriteString("\t\t# what makes a tight limit safe here. @th,64,32 is the first four\n")
+		rules.WriteString("\t\t# bytes after the 8-byte UDP header.\n")
+		fmt.Fprintf(&rules, "\t\tudp dport %s %s add @query_rate { ip saddr limit rate over %d/second burst %d packets } %s\n",
+			portSet(sePorts), connectionlessMatch, spec.QueriesPerSec, spec.QueriesPerSec*2, tail(CounterQueryRate))
 	}
 
 	// The per-service overrides, one rule per overridden limit with the row's
@@ -900,16 +1050,16 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	// through this chain is a UDP flood, which should not walk one TCP-only
 	// rule per override before reaching its own limiter.
 	if len(overrides) > 0 {
-		b.WriteString("\t\t# Per-service overrides of the connection limits; these rows' ports\n")
-		b.WriteString("\t\t# are excluded from the shared rules above.\n")
+		rules.WriteString("\t\t# Per-service overrides of the connection limits; these rows' ports\n")
+		rules.WriteString("\t\t# are excluded from the shared rules above.\n")
 	}
 	for _, o := range overrides {
 		sv := o.svc
 		if o.rateSet != "" {
-			connRateRule(&b, portSpec(sv.Port, sv.PortEnd), o.rateSet, sv.NewConnsPerSec, blockStmt, CounterConnRate+":"+sv.Name)
+			connRateRule(&rules, portSpec(sv.Port, sv.PortEnd), o.rateSet, sv.NewConnsPerSec, tail(CounterConnRate+":"+sv.Name))
 		}
 		if o.countSet != "" {
-			connCountRule(&b, portSpec(sv.Port, sv.PortEnd), o.countSet, sv.MaxConnsPerSource, blockStmt, CounterConnCount+":"+sv.Name)
+			connCountRule(&rules, portSpec(sv.Port, sv.PortEnd), o.countSet, sv.MaxConnsPerSource, tail(CounterConnCount+":"+sv.Name))
 		}
 	}
 
@@ -920,12 +1070,16 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 		if sv.CeilingPPS <= 0 {
 			continue
 		}
-		fmt.Fprintf(&b, "\t\t%s dport %s limit rate over %d/second burst %d packets counter drop comment %q\n",
+		fmt.Fprintf(&rules, "\t\t%s dport %s limit rate over %d/second burst %d packets counter drop comment %q\n",
 			sv.Proto, portSpec(sv.Port, sv.PortEnd), sv.CeilingPPS, sv.CeilingPPS,
 			CounterCeiling+":"+sv.Name)
 	}
 
-	b.WriteString("\t}\n")
+	rules.WriteString("\t}\n")
+	// Ahead of the chains that jump to them, and only ever non-empty when
+	// parking is on. See parkChains.
+	parks.write(&b)
+	b.WriteString(rules.String())
 	b.WriteString("}\n")
 	return b.String()
 }

@@ -1801,6 +1801,56 @@ The engaged locks are read back out of the kernel with the counters
 (`ProtectState`) and said loudly in the portal, because an engaged lock looks
 exactly like the service being down to everybody outside the region.
 
+**A dynamic set that is full fails open, so nothing that can fail is allowed
+to sit ahead of a verdict in the same rule.** A set at its `size` refuses the
+add and the kernel answers NFT_BREAK, which abandons the rest of the rule and
+moves to the next one. Every limiter here was a single rule shaped `add
+@<limit> {...} add @blocked { ip saddr } counter drop`, so a full set skipped
+the drop *and the counter behind it*: fail-open, with the portal reading zero
+drops on that limit at exactly the moment it stopped being enforced, which is
+also what a threshold nothing is tripping looks like. One blocklist is shared
+by every limiter, so a full one did that to all of them at once.
+
+NFT_BREAK ends a rule and not a chain, which is the whole of the fix. With
+parking on, the limiter's rule now ends in `jump park_<counter>`, and that
+chain is two rules: `add @blocked { ip saddr }`, then `counter drop comment
+"<counter>"`. A full blocklist breaks the first and the second still runs, so
+it costs the parking and nothing else. It has to be a jump rather than
+statements appended to the limiter's rule, because a jump resumes at the *next
+rule* of the calling chain and never at the rest of the calling rule. One chain
+per limiter rather than one shared, because the counter and the drop must stay
+in the same rule as the comment naming them: that is what `ProtectState` reads
+back and what the portal attributes drops by, and one shared chain would give
+every limiter a single counter and no attribution. With parking off there is no
+add that can fail, so the counter and the drop stay inline and such a site
+generates the table it always did, byte for byte.
+
+The limiter's own add cannot be moved out, because it *is* the condition the
+rule tests. There, headroom is the only defence: `sourceSetSize` (262144) and
+`rateSetTimeout` (10s) are what provide it, and both are pinned by tests
+because reverting either is silent. The rate sets take an element per source
+*seen* rather than per source tripping, so occupancy is new sources a second
+times the timeout, and the 65535/60s these started at filled in about 1100 new
+sources a second. Read the arithmetic as time bought rather than a hole closed:
+26k new sources a second is roughly 13 Mbit/s of small packets, and a
+source-randomised flood is exactly what per-source limits cannot answer, which
+is why the query cache exists. The cost is paid at both ends and the comment on
+`sourceSetSize` carries both, because only one of them is obvious: a hash set
+sizes its bucket table from `size` at load, so each set is 4 MiB before it holds
+anything, and a *full* set is tens of megabytes of slab, which is the
+attacker-driven figure.
+
+`rateSetTimeout` is a timeout from element creation, not from the last packet:
+the generator emits `add`, and `add` does not refresh an existing element's
+expiration - only `update` does. That is what makes the occupancy arithmetic
+hold, and it also means a flooding source is handed a fresh full token bucket
+every time its element expires, at any value the constant could take. What
+makes that survivable is parking rather than the number, since the trip puts the
+source in `@blocked` and the raw chain drops it there on its next packet. The
+leak is reachable only with `Protect.BlockSeconds` at 0. The lockdown sets keep
+65535 and are not this number rounded down: their key is a port and `validate`
+refuses port 0, so that is every value which can reach one.
+
 **Counters exist because a limiter nobody can see is worse than none.** "Some
 players cannot connect" and "that threshold is too tight" look identical from
 outside. Every drop rule carries a `counter` and a comment; `sysx.ProtectState`
@@ -3074,6 +3124,23 @@ where a subtle regression would be invisible in production until an outage:
   counted; the blocklist set is dynamic and bounded; two services on one port
   still produce a set nftables will accept; and the counters and blocklist
   parse back out of `nft -j`.
+
+  The fail-open shape is pinned there too, because none of it is observable
+  without a kernel: every per-source set carries `sourceSetSize` and every rate
+  set the short element timeout, so reverting either has to be a decision
+  rather than a silent regression; the lockdown sets keep 65535 against a later
+  pass at making these consistent; a limiter rule ends in its jump and carries
+  neither the blocklist add nor the drop, and its park chain is exactly the add
+  then the counted drop, in that order; and with parking off no park chain, no
+  jump and no blocklist exist at all, which is what holds the promise that a
+  site which never asked for parking generates the table it always did. The
+  chain scoping test covers the new chains from the other side: a chain with a
+  hook must exclude non-public traffic first, and a chain without one must be a
+  park chain, since what keeps those safe is that nothing reaches them but a
+  jump from a chain that has already run the guard. `ProtectState`'s fixture
+  carries a counter in a park chain, because the portal reads drops from the
+  rule's own verdict and moving that rule into a jumped chain must not turn a
+  limit doing all the dropping into a card reading zero.
 
   The readback's shape is pinned there too, because its cost is the whole
   reason for it: the table is listed terse and only the state sets the table

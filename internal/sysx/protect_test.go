@@ -37,14 +37,32 @@ func TestProtectionWithNoThresholdsGeneratesNothing(t *testing.T) {
 // chain must exclude anything that did not arrive from the internet: a limiter
 // that could drop a probe would have the frontend condemn a healthy tunnel
 // because of its own firewall, and move traffic to a metered link over it.
+//
+// A packet enters a chain two ways and only one of them is a hook of its own.
+// The park chains have none, so nothing reaches them but the jump ending a
+// limiter rule in a chain that has already run the guard - which is why they
+// carry no guard and why "carries no hook" is asserted here rather than
+// assumed. A park chain that grew a hook would be a drop rule running on
+// tunnel traffic, which is the failure this whole test exists for.
 func TestEveryChainIsScopedToThePublicInterface(t *testing.T) {
 	cfg := protectCfg()
 	cfg.Protect.PacketsPerSec = 400
 	cfg.Protect.DropInvalid = true
+	// Parking on, so there are park chains to check at all: without it this
+	// test generated none and passed on the hooked chains alone.
+	cfg.Protect.BlockSeconds = 600
 	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
 
-	chains := 0
+	chains, jumped := 0, 0
 	for _, block := range strings.Split(ruleset, "chain ")[1:] {
+		name := strings.SplitN(block, " ", 2)[0]
+		if !strings.Contains(block, " hook ") {
+			jumped++
+			if !strings.HasPrefix(name, "park_") {
+				t.Errorf("chain %q has no hook and is no park chain, so nothing here says how a packet reaches it", name)
+			}
+			continue
+		}
 		chains++
 		first := ""
 		for _, line := range strings.Split(block, "\n") {
@@ -59,11 +77,14 @@ func TestEveryChainIsScopedToThePublicInterface(t *testing.T) {
 			break
 		}
 		if !strings.HasPrefix(first, `iifname != "eth0" accept`) {
-			t.Errorf("a chain does not exclude non-public traffic first; its first rule is %q", first)
+			t.Errorf("chain %q does not exclude non-public traffic first; its first rule is %q", name, first)
 		}
 	}
 	if chains == 0 {
-		t.Fatal("no chains were generated at all")
+		t.Fatal("no hooked chains were generated at all")
+	}
+	if jumped == 0 {
+		t.Fatal("no park chains were generated, so the unhooked half went unchecked")
 	}
 }
 
@@ -320,6 +341,8 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 		{"set": {"name": "geo_oceania", "table": "failover_protect"}},
 		{"rule": {"chain": "filter", "comment": "packet-rate",
 			"expr": [{"match": {}}, {"counter": {"packets": 1200, "bytes": 96000}}, {"drop": null}]}},
+		{"rule": {"chain": "park_conn_rate", "comment": "conn-rate",
+			"expr": [{"counter": {"packets": 9, "bytes": 540}}, {"drop": null}]}},
 		{"rule": {"chain": "raw", "comment": "bogus-tcp",
 			"expr": [{"counter": {"packets": 3, "bytes": 180}}, {"drop": null}]}},
 		{"rule": {"chain": "raw", "comment": "bogus-tcp",
@@ -375,8 +398,8 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 	// One limit is often several rules - the bogus-TCP filter alone is seven -
 	// and they must come back as one figure per limit, not a card per rule:
 	// seven identical zero tiles is what this looked like before.
-	if len(counters) != 4 {
-		t.Fatalf("read %d counters, want 4 (one per distinct comment): %+v", len(counters), counters)
+	if len(counters) != 5 {
+		t.Fatalf("read %d counters, want 5 (one per distinct comment): %+v", len(counters), counters)
 	}
 	byName := map[string]model.ProtectCounter{}
 	for _, c := range counters {
@@ -387,6 +410,14 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 	}
 	if byName["bogus-tcp"].Packets != 8 {
 		t.Errorf("two bogus-tcp rules summed to %d packets, want 8", byName["bogus-tcp"].Packets)
+	}
+	// A limiter's counter and drop live in the chain it jumps to, not in the
+	// rule that jumps; the chain a rule sits in is a kernel detail this
+	// readback must not care about. Read any other way, taking the blocklist
+	// add out of the limiter's rule would have traded a silent fail-open for
+	// a portal card that reads zero for a limit doing all the dropping.
+	if byName["conn-rate"].Packets != 9 || !byName["conn-rate"].Drops {
+		t.Errorf("a counter living in a park chain read as %+v", byName["conn-rate"])
 	}
 	// The trip counter observes the auto-lock threshold and drops nothing;
 	// the portal's "packets dropped" total reads this flag rather than
@@ -1026,6 +1057,36 @@ func linesWithComment(ruleset, comment string) []string {
 	return out
 }
 
+// linesWithSetAdd returns the trimmed rule lines that update this dynamic set,
+// which is how a limiter rule is found once parking has moved its counter and
+// its comment into a park chain. The trailing " {" is part of the match so
+// "conn_rate" cannot answer for "conn_rate_minecraft".
+func linesWithSetAdd(ruleset, set string) []string {
+	var out []string
+	for _, line := range strings.Split(ruleset, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "add @"+set+" {") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// chainBlock returns one chain's body, opening line included and closing brace
+// excluded. setBlock's counterpart, and split out for the same reason.
+func chainBlock(t *testing.T, ruleset, name string) string {
+	t.Helper()
+	start := strings.Index(ruleset, "chain "+name+" {")
+	if start < 0 {
+		t.Fatalf("no %s chain in the ruleset:\n%s", name, ruleset)
+	}
+	end := strings.Index(ruleset[start:], "\n\t}")
+	if end < 0 {
+		t.Fatalf("the %s chain is never closed:\n%s", name, ruleset)
+	}
+	return ruleset[start : start+end]
+}
+
 // An override replaces the shared limit for that row's ports; it does not
 // stack on top of it. The row gets rules of its own, with its own figures,
 // its own sets and a named counter, and its ports leave the shared rules -
@@ -1037,8 +1098,8 @@ func TestPerServiceConnLimitsSplitTheSharedRules(t *testing.T) {
 	cfg.Protect.BlockSeconds = 600
 	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
 
-	wantRate := `ct state new tcp dport 25565 add @conn_rate_minecraft { ip saddr limit rate over 2/second burst 4 packets } add @blocked { ip saddr } counter drop comment "conn-rate:minecraft"`
-	wantCount := `ct state new tcp dport 25565 add @conn_count_minecraft { ip saddr ct count over 6 } add @blocked { ip saddr } counter drop comment "conn-count:minecraft"`
+	wantRate := `ct state new tcp dport 25565 add @conn_rate_minecraft { ip saddr limit rate over 2/second burst 4 packets } jump park_conn_rate_minecraft`
+	wantCount := `ct state new tcp dport 25565 add @conn_count_minecraft { ip saddr ct count over 6 } jump park_conn_count_minecraft`
 	for _, want := range []string{wantRate, wantCount} {
 		if !strings.Contains(ruleset, want) {
 			t.Errorf("missing the override rule %q in:\n%s", want, ruleset)
@@ -1049,13 +1110,22 @@ func TestPerServiceConnLimitsSplitTheSharedRules(t *testing.T) {
 			t.Errorf("the override rule feeds %s but the set is never declared:\n%s", name, ruleset)
 		}
 	}
-	for _, shared := range []string{CounterConnRate, CounterConnCount} {
-		lines := linesWithComment(ruleset, shared)
+	// Found by the set it feeds rather than by the comment naming it: parking
+	// is on here, so the comment is on the drop in the park chain and the
+	// limiter rule is a different line. Matched on the comment, this loop
+	// would have gone on passing while asserting nothing about the ports.
+	for _, shared := range []struct{ set, comment string }{
+		{"conn_rate", CounterConnRate}, {"conn_count", CounterConnCount},
+	} {
+		lines := linesWithSetAdd(ruleset, shared.set)
 		if len(lines) != 1 {
-			t.Fatalf("expected exactly one shared %s rule, got %d:\n%s", shared, len(lines), ruleset)
+			t.Fatalf("expected exactly one shared @%s rule, got %d:\n%s", shared.set, len(lines), ruleset)
 		}
 		if strings.Contains(lines[0], "25565") {
-			t.Errorf("the shared %s rule still covers the overriding row's port: %q", shared, lines[0])
+			t.Errorf("the shared @%s rule still covers the overriding row's port: %q", shared.set, lines[0])
+		}
+		if n := len(linesWithComment(ruleset, shared.comment)); n != 1 {
+			t.Errorf("the shared %s limit is named by %d counters, want 1:\n%s", shared.comment, n, ruleset)
 		}
 	}
 }
@@ -1226,5 +1296,196 @@ func TestConnOverridesOnAUDPServiceRenderNothing(t *testing.T) {
 	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
 	if strings.Contains(ruleset, "conn_rate_") || strings.Contains(ruleset, "conn_count_") {
 		t.Errorf("a udp row's connection overrides reached the ruleset:\n%s", ruleset)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The per-source set bounds, and the rule shape that keeps a full one cheap
+// ---------------------------------------------------------------------------
+
+// limiterCfg turns on every per-source limit at once, with the minecraft row
+// overriding both connection limits, so the set and rule shapes below are
+// checked on every set this generator can emit rather than on one of them.
+func limiterCfg(blockSeconds int) model.Config {
+	cfg := protectCfg()
+	cfg.Protect.BlockSeconds = blockSeconds
+	cfg.Protect.NewConnsPerSec = 20
+	cfg.Protect.MaxConnsPerSource = 100
+	cfg.Protect.PacketsPerSec = 400
+	cfg.Protect.QueriesPerSec = 15
+	for i := range cfg.Services {
+		if cfg.Services[i].Proto == "udp" {
+			cfg.Services[i].SourceEngine = true
+		}
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].NewConnsPerSec = 5
+			cfg.Services[i].MaxConnsPerSource = 6
+		}
+	}
+	return cfg
+}
+
+// allSets is every per-source set limiterCfg produces.
+func allSets() []string {
+	return []string{
+		"blocked", "conn_rate", "conn_count", "packet_rate", "query_rate",
+		"conn_rate_minecraft", "conn_count_minecraft",
+	}
+}
+
+// The size on every per-source set, pinned because nothing else holds it and
+// the failure it prevents is silent in both directions. A full dynamic set
+// refuses the add, the kernel answers NFT_BREAK, and the rest of the rule -
+// the drop and the counter beside it - is abandoned: the limit stops being
+// enforced while the portal reads zero drops on it, which is what a threshold
+// nothing is tripping also looks like. Back at the 65535 this started from, a
+// source-randomised flood at about 1100 new sources a second did that, and the
+// suite stayed green. Raising it again is a fine thing to want and has to be a
+// decision, which is exactly what editing this line costs. sourceSetSize
+// carries what the number is weighed against, at both ends.
+func TestEveryPerSourceSetCarriesTheHeadroomSize(t *testing.T) {
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(limiterCfg(600)))
+	for _, name := range allSets() {
+		if body := setBlock(t, ruleset, name); !strings.Contains(body, "size 262144\n") {
+			t.Errorf("set %s does not carry the headroom size:\n%s", name, body)
+		}
+	}
+}
+
+// The element timeout on the rate sets, pinned for the reason the size is:
+// these take an element per source *seen* rather than per source tripping, so
+// occupancy is new sources a second times this number, and the 60s it started
+// at filled a set six times faster. It cannot be lowered freely either - the
+// generator emits `add`, which does not refresh an existing element, so every
+// expiry hands a flooding source a fresh full token bucket. rateSetTimeout
+// carries both halves.
+//
+// The count set is exempt and must stay exempt, because the kernel refuses a
+// connlimit expression in a timeout-flagged set and takes the whole table with
+// it; TestConnCountSetCarriesNoTimeout holds that from the other side.
+func TestTheRateSetsCarryTheShortElementTimeout(t *testing.T) {
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(limiterCfg(600)))
+	for _, name := range []string{"conn_rate", "packet_rate", "query_rate", "conn_rate_minecraft"} {
+		if body := setBlock(t, ruleset, name); !strings.Contains(body, "timeout 10s\n") {
+			t.Errorf("rate set %s does not carry the short element timeout:\n%s", name, body)
+		}
+	}
+	// The blocklist ages on the operator's parking time and nothing else. A
+	// pass at making these consistent would park every tripping source for
+	// ten seconds instead of the minute the presets choose.
+	if body := setBlock(t, ruleset, "blocked"); !strings.Contains(body, "timeout 600s\n") {
+		t.Errorf("the blocklist no longer ages on Protect.BlockSeconds:\n%s", body)
+	}
+}
+
+// The lockdown sets keep 65535, and that is not sourceSetSize rounded down: an
+// element there is a port, the trigger only ever adds a port some service
+// published, and validate refuses port 0 - so 65535 is every value that can
+// reach one and the add can never be the refused one. Swept up by a later pass
+// at making these consistent, the only thing bought is the bucket table the
+// number sizes, on two sets per site that hold a handful of ports.
+func TestTheLockdownSetsKeepThePortKeySpace(t *testing.T) {
+	cfg := geoCfg()
+	for i := range cfg.Services {
+		if cfg.Services[i].Name == "minecraft" {
+			cfg.Services[i].GeoAutoPPS = 50000
+		}
+	}
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(cfg))
+	body := setBlock(t, ruleset, "geo_lockdown_tcp")
+	if !strings.Contains(body, "size 65535\n") {
+		t.Errorf("the lockdown set no longer carries the port key space:\n%s", body)
+	}
+}
+
+// A full blocklist must cost the parking and nothing else.
+//
+// The kernel answers a refused add with NFT_BREAK, which abandons the rest of
+// the rule. With `add @blocked { ip saddr } counter drop` all in one rule, a
+// full blocklist therefore took the drop and its counter with it - and did so
+// to every limiter at once, because one blocklist is shared by all of them.
+// NFT_BREAK ends a rule and not a chain, so the fix is for the add to be a
+// rule of its own with the drop as the next rule, which is what a park chain
+// is. It has to be reached by a jump rather than by statements appended to the
+// limiter's rule: a jump resumes at the next rule of the calling chain, never
+// at the rest of the calling rule.
+//
+// None of that is observable without a kernel, so what is pinned here is the
+// shape that makes it true: nothing that can fail sits ahead of a verdict in
+// the same rule.
+func TestAFullBlocklistCannotDisableALimitersDrop(t *testing.T) {
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(limiterCfg(600)))
+
+	for _, l := range []struct{ set, chain, comment string }{
+		{"conn_rate", "park_conn_rate", CounterConnRate},
+		{"conn_count", "park_conn_count", CounterConnCount},
+		{"packet_rate", "park_packet_rate", CounterPacketRate},
+		{"query_rate", "park_query_rate", CounterQueryRate},
+		{"conn_rate_minecraft", "park_conn_rate_minecraft", CounterConnRate + ":minecraft"},
+		{"conn_count_minecraft", "park_conn_count_minecraft", CounterConnCount + ":minecraft"},
+	} {
+		lines := linesWithSetAdd(ruleset, l.set)
+		if len(lines) != 1 {
+			t.Fatalf("expected one rule feeding @%s, got %d:\n%s", l.set, len(lines), ruleset)
+		}
+		rule := lines[0]
+		if !strings.HasSuffix(rule, "jump "+l.chain) {
+			t.Errorf("the @%s limiter does not hand off to a park chain: %q", l.set, rule)
+		}
+		// The limiter's own add can still fail and still costs the rule, and
+		// nothing can be done about that - it is the condition the rule
+		// tests. What must not be behind it is anything else that can fail.
+		if strings.Contains(rule, "add @blocked") || strings.Contains(rule, "drop") {
+			t.Errorf("the @%s limiter still carries the blocklist add or the drop in its own rule: %q", l.set, rule)
+		}
+
+		var got []string
+		for _, line := range strings.Split(chainBlock(t, ruleset, l.chain), "\n")[1:] {
+			if line = strings.TrimSpace(line); line != "" {
+				got = append(got, line)
+			}
+		}
+		want := []string{
+			"add @blocked { ip saddr }",
+			`counter drop comment "` + l.comment + `"`,
+		}
+		if len(got) != len(want) {
+			t.Errorf("park chain %s holds %d rules (%q), want the add then the drop", l.chain, len(got), got)
+			continue
+		}
+		if got[0] != want[0] || got[1] != want[1] {
+			t.Errorf("park chain %s is %q, want %q", l.chain, got, want)
+		}
+	}
+}
+
+// With parking off there is no blocklist add to fail, so there is nothing to
+// decouple: the counter and the drop stay in the limiter's own rule and the
+// table is byte for byte the one such a site always generated. Pinned because
+// the park chains are the whole of what this shape adds, and a site that never
+// asked for parking must not grow a chain, a jump or a set for it.
+func TestParkingOffKeepsTheLimiterRulesInline(t *testing.T) {
+	ruleset := BuildProtectRuleset(ProtectSpecFrom(limiterCfg(0)))
+
+	for _, banned := range []string{"chain park_", "add @blocked", "set blocked {", "jump "} {
+		if strings.Contains(ruleset, banned) {
+			t.Errorf("a site with no parking generated %q:\n%s", banned, ruleset)
+		}
+	}
+	for _, l := range []struct{ set, comment string }{
+		{"conn_rate", CounterConnRate},
+		{"conn_count", CounterConnCount},
+		{"packet_rate", CounterPacketRate},
+		{"query_rate", CounterQueryRate},
+		{"conn_rate_minecraft", CounterConnRate + ":minecraft"},
+		{"conn_count_minecraft", CounterConnCount + ":minecraft"},
+	} {
+		lines := linesWithSetAdd(ruleset, l.set)
+		if len(lines) != 1 {
+			t.Fatalf("expected one rule feeding @%s, got %d:\n%s", l.set, len(lines), ruleset)
+		}
+		if want := `counter drop comment "` + l.comment + `"`; !strings.HasSuffix(lines[0], want) {
+			t.Errorf("the @%s limiter does not end in %q: %q", l.set, want, lines[0])
+		}
 	}
 }
