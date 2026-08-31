@@ -720,7 +720,7 @@ func (p *parkChains) target(comment string) string {
 	base := foldSetName("park_", comment)
 	name := base
 	for i := 2; p.used[name]; i++ {
-		name = fmt.Sprintf("%s%d", base, i)
+		name = fmt.Sprintf("%s_%d", base, i)
 	}
 	p.used[name] = true
 	p.chains = append(p.chains, parkChain{name: name, comment: comment})

@@ -3171,8 +3171,9 @@ where a subtle regression would be invisible in production until an outage:
   override sets keep the shared sets' shapes (the rate set ages, the count set
   carries no timeout, which is the connlimit refusal the shared test learned
   live, both sliced by one `setBlock` helper so the slicing cannot drift);
-  colliding folded service names get distinct sets rather than one set
-  declared twice; and a udp row's overrides render nothing and activate
+  colliding folded service names get distinct sets and distinct park
+  chains, rather than one of either declared twice, and both suffix the
+  collision the same way; and a udp row's overrides render nothing and activate
   nothing, because meeting one means a hand-edited blob.
   `web/protect_validate_test.go` holds the save side: the overrides save on a
   TCP row, are refused on a udp one with the reason in the message, and a

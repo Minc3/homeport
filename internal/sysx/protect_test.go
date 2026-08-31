@@ -1257,8 +1257,17 @@ func TestPerServiceConnSetsMatchTheSharedSetShapes(t *testing.T) {
 // refuses along with the whole table. Unlike regions there is no validate
 // collision check to lean on (two services may legitimately share a name a
 // fold collapses), so the generator suffixes the second instead.
-func TestCollidingServiceNamesGetDistinctConnSets(t *testing.T) {
+//
+// The park chains fold from the same names and need the same treatment, and
+// with parking off - which is how this was first written - none of them
+// exists to be checked. That is how the two suffixes came to be spelled
+// differently, "_2" on the sets and "2" on the chains, while the comment on
+// parkChains.target claimed they matched. Neither could collide, so nothing
+// broke; what was wrong was a comment saying two things agreed when they did
+// not, which is the kind of thing the next change leans on.
+func TestCollidingServiceNamesGetDistinctConnSetsAndParkChains(t *testing.T) {
 	cfg := protectCfg()
+	cfg.Protect.BlockSeconds = 600
 	cfg.Services = append(cfg.Services,
 		model.Service{Name: "mc one", Proto: "tcp", Port: 25566, Enabled: true, NewConnsPerSec: 2},
 		model.Service{Name: "mc-one", Proto: "tcp", Port: 25567, Enabled: true, NewConnsPerSec: 4},
@@ -1272,6 +1281,20 @@ func TestCollidingServiceNamesGetDistinctConnSets(t *testing.T) {
 	}
 	if !strings.Contains(ruleset, "dport 25567 add @conn_rate_mc_one_2 { ip saddr limit rate over 4/second") {
 		t.Errorf("the suffixed set is not the one the second service's rule feeds:\n%s", ruleset)
+	}
+	for _, name := range []string{"park_conn_rate_mc_one", "park_conn_rate_mc_one_2"} {
+		if strings.Count(ruleset, "chain "+name+" {") != 1 {
+			t.Errorf("expected exactly one declaration of chain %s:\n%s", name, ruleset)
+		}
+	}
+	// The suffix is spelled the way the sets beside it spell theirs. Nothing
+	// collides either way, so what this holds is that the two conventions stay
+	// one convention: a reader who has just read conn_rate_mc_one_2 must not
+	// have to check whether the chain for it is named differently.
+	if !strings.HasSuffix(strings.TrimSpace(strings.Split(
+		strings.SplitN(ruleset, "dport 25567 add @conn_rate_mc_one_2", 2)[1], "\n")[0]),
+		"jump park_conn_rate_mc_one_2") {
+		t.Errorf("the second service's rule does not jump to the matching park chain:\n%s", ruleset)
 	}
 }
 
