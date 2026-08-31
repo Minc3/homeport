@@ -608,3 +608,155 @@ func TestRevertRemovesTheBlocklist(t *testing.T) {
 		t.Error("the list itself was discarded; it is agent state, so re-arming should not need another fetch")
 	}
 }
+
+// An element load the kernel refused has to be retried, and nothing else in
+// here would. blApplied describes the table rather than the set, so a later
+// save with nothing changed takes the unchanged branch and skips the refill
+// with the reload; and the feed republishes about daily against a four hour
+// interval, so nearly every refresh is a 304, which loads no elements by
+// design. Left alone, the table sits there dropping nothing while the portal
+// reports the list loaded.
+func TestARefusedElementLoadIsRetried(t *testing.T) {
+	dir := t.TempDir()
+	e, q := blocklistEngine(t, dir)
+	feed := "nft -f " + filepath.Join(dir, "blocklist-feed.nft")
+	q.fails = map[string]string{feed: "Error: Could not process rule"}
+	e.rememberBlocklist([]string{"203.0.113.0/24"})
+
+	e.applyBlocklist(context.Background(), e.cfg, e.runner, e.real)
+	if got := q.count(feed); got != 1 {
+		t.Fatalf("setup attempted the element load %d times, want 1", got)
+	}
+	if e.blLoadFailed.IsZero() {
+		t.Fatal("a refused element load left nothing to retry from")
+	}
+
+	// Nothing is due: the list is fresh and no fetch has failed, so the retry
+	// is the only thing that can bring the load back.
+	e.blUpdated, e.blLastTry = time.Now(), time.Now()
+	e.maybeRefreshBlocklist(context.Background())
+	if got := q.count(feed); got != 1 {
+		t.Fatalf("the retry ran inside its own window: %d loads, want 1", got)
+	}
+
+	e.blLoadFailed = time.Now().Add(-blocklistRetryEvery - time.Second)
+	delete(q.fails, feed)
+	e.maybeRefreshBlocklist(context.Background())
+
+	if got := q.count(feed); got != 2 {
+		t.Fatalf("the refused load was not retried: %d loads, want 2", got)
+	}
+	if !e.blLoadFailed.IsZero() {
+		t.Error("a load that succeeded left the failure outstanding, so it will be retried forever")
+	}
+}
+
+// Invariant 13: disarming is not a teardown, so a table loaded while armed is
+// still in the kernel and still dropping. Recorded as unloaded, the portal
+// said nothing was being dropped and that this was expected in observe mode,
+// which is false in the one direction that matters, and the drop counter
+// froze with it.
+func TestDisarmingLeavesTheBlocklistRecordedAsLoaded(t *testing.T) {
+	e, q := blocklistEngine(t, t.TempDir())
+	e.rememberBlocklist([]string{"203.0.113.0/24"})
+	e.applyBlocklist(context.Background(), e.cfg, e.runner, e.real)
+	if !e.blOn {
+		t.Fatal("the armed apply did not record the table as loaded")
+	}
+
+	cfg := e.cfg
+	cfg.Mode = model.ModeObserve
+	e.applyBlocklist(context.Background(), cfg, &dryRunner{q}, e.real)
+
+	if !e.blOn {
+		t.Error("a disarm recorded the blocklist as unloaded while its table is still in the kernel and still dropping")
+	}
+	if e.blApplied != "" {
+		t.Error("the reload latch survived a disarm; what is loaded is no longer this ruleset")
+	}
+	if n := q.count("nft delete table ip failover_blocklist"); n != 0 {
+		t.Errorf("a disarm removed the table %d times; disarming is not a teardown", n)
+	}
+}
+
+// The other half of that, and the reason the mode is now checked separately
+// from the table being loaded: a disarmed refresh must still fill nothing.
+// Loading a fresh list changes what a live rule drops, which is the one thing
+// observe mode may not do, and it would leave a feed file on disk describing
+// a set the kernel does not have.
+func TestADisarmedRefreshLoadsNoElements(t *testing.T) {
+	dir := t.TempDir()
+	e, q := blocklistEngine(t, dir)
+	e.rememberBlocklist([]string{"203.0.113.0/24"})
+	e.applyBlocklist(context.Background(), e.cfg, e.runner, e.real)
+
+	feed := filepath.Join(dir, "blocklist-feed.nft")
+	before := q.count("nft -f " + feed)
+	if err := os.Remove(feed); err != nil {
+		t.Fatalf("remove the feed file the armed apply wrote: %v", err)
+	}
+
+	e.runner = &dryRunner{q}
+	e.installBlocklistElements(context.Background())
+
+	if got := q.count("nft -f " + feed); got != before {
+		t.Errorf("a disarmed refresh loaded the elements: %d loads, was %d", got, before)
+	}
+	if _, err := os.Stat(feed); !os.IsNotExist(err) {
+		t.Error("a disarmed refresh wrote a feed file describing a set the kernel does not have")
+	}
+}
+
+// The readback is the only thing here that reports the kernel rather than this
+// agent's belief about it, so it is what corrects the belief, and both
+// directions matter. A table that has gone must stop being reported as loaded,
+// or the portal claims the rules are there immediately after the read proved
+// they are not and every refresh loads elements into nothing. A table that
+// really is there has to be found again, which is what makes clearing the
+// record on one failed read safe - and it is also the only thing that notices
+// one left behind by an armed process this one has replaced.
+func TestTheBlocklistReadbackCorrectsTheLoadedRecord(t *testing.T) {
+	e, q := blocklistEngine(t, t.TempDir())
+	const list = "nft -j -t list table ip failover_blocklist"
+	q.replies[list] = `{"nftables":[]}`
+	q.fails = map[string]string{list: "Error: No such file or directory"}
+	e.blOn, e.blApplied = true, "table ip failover_blocklist {}"
+
+	e.sampleBlocklistCounter(context.Background())
+	if e.blOn {
+		t.Error("a table the kernel cannot answer for is still reported as loaded")
+	}
+	if e.blApplied != "" {
+		t.Error("the reload latch survived a table that has gone, so the next save would skip the reload")
+	}
+
+	delete(q.fails, list)
+	e.sampleBlocklistCounter(context.Background())
+
+	if !e.blOn {
+		t.Error("a table the kernel answered for was not recorded as loaded again")
+	}
+}
+
+// The portal says a list is old past one threshold, and that threshold is this
+// constant. Decided here rather than in the browser because it was written out
+// in both places, and the two could drift with nothing failing.
+func TestBlocklistStalenessIsDecidedByTheAgent(t *testing.T) {
+	e, _ := blocklistEngine(t, t.TempDir())
+	e.rememberBlocklist([]string{"203.0.113.0/24"})
+
+	e.blUpdated = time.Now().Add(-blocklistStaleAfter + time.Hour)
+	if st := e.blocklistStatus(); st.Stale {
+		t.Errorf("a list %.0fh old was reported stale", st.AgeHours)
+	}
+	e.blUpdated = time.Now().Add(-blocklistStaleAfter - time.Hour)
+	if st := e.blocklistStatus(); !st.Stale {
+		t.Errorf("a list %.0fh old was not reported stale", st.AgeHours)
+	}
+	// Never fetched is not stale: there is no age for it to be past, and the
+	// card says "never" rather than a number.
+	e.blUpdated = time.Time{}
+	if st := e.blocklistStatus(); st.Stale {
+		t.Error("a list that has never been fetched was reported stale")
+	}
+}

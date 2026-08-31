@@ -1199,13 +1199,22 @@ type BlocklistStatus struct {
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 	AgeHours  float64   `json:"age_hours"`
 
+	// Stale is whether that age has passed the point where the portal starts
+	// saying the list is old. Decided here rather than in the browser so the
+	// threshold has one definition: written down in both places, the two can
+	// drift with nothing failing. It never stops the list being used.
+	Stale bool `json:"stale"`
+
 	// LastTry and LastError are the most recent attempt. LastError empty
 	// means it succeeded.
 	LastTry   time.Time `json:"last_try,omitempty"`
 	LastError string    `json:"last_error,omitempty"`
 
-	// Loaded reports that the rules are really in the kernel. False with the
-	// feature enabled is observe mode, or an apply that failed.
+	// Loaded reports that the rules are really in the kernel, which is not the
+	// same as this process having armed them: disarming is not a teardown
+	// (invariant 13), so a table loaded while armed stays loaded and stays
+	// dropping, and this stays true across one. False with the feature enabled
+	// means observe mode with nothing ever armed, or an apply that failed.
 	Loaded bool `json:"loaded"`
 
 	// Packets and Bytes are what the drop rule has counted since it was last

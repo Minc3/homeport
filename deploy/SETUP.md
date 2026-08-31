@@ -681,11 +681,18 @@ working and keeps dropping, so nothing else says it has gone stale.
 
 If somebody cannot reach a service and you suspect this list, check the card
 first, then add their network to **Exceptions** rather than switching the
-feature off. To see whether an address is listed:
+feature off. To see whether an address is listed, ask the kernel:
 
 ```sh
-grep -w 203.0.113.7 /var/lib/failover/blocklist-feed.nft
+nft get element ip failover_blocklist feed { 203.0.113.7 }
 ```
+
+It prints the network that covers the address, or fails with `No such file or
+directory` if nothing does. Ask the same question of the `allow` set to see
+whether an exception is already covering it. Do not grep
+`blocklist-feed.nft` for the address: almost every entry is a network rather
+than a bare address, so a grep answers "not listed" for a visitor the list is
+dropping. The file is a record of what was loaded, not an index.
 
 Refreshing the list never touches a rule, so it resets no counter and releases
 nothing the protection table is holding. Saving a change to the blocklist

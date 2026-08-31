@@ -221,6 +221,7 @@ func (e *Engine) maybeRefreshBlocklist(ctx context.Context) {
 	reverted := e.reverted
 	updated, lastTry, lastErr := e.blUpdated, e.blLastTry, e.blLastErr
 	have := len(e.blNetworks)
+	loadFailed := e.blLoadFailed
 	e.mu.RUnlock()
 
 	// A reverted engine installs and repairs nothing, and fetching a list it
@@ -231,6 +232,19 @@ func (e *Engine) maybeRefreshBlocklist(ctx context.Context) {
 	}
 
 	now := time.Now()
+
+	// An element load the kernel refused is retried here, and this is the only
+	// thing that retries it. applyBlocklist's latch describes the table rather
+	// than the set, so a later save with nothing changed takes the unchanged
+	// branch and skips the refill along with the reload; and the feed
+	// republishes about daily against a four hour interval, so nearly every
+	// refresh is a 304, which loads no elements by design. Without this the
+	// table sits there dropping nothing while the portal reports the list
+	// loaded, for as long as it takes somebody to change a blocklist setting.
+	if !loadFailed.IsZero() && !now.Before(loadFailed.Add(blocklistRetryEvery)) {
+		e.installBlocklistElements(ctx)
+	}
+
 	due := updated.Add(blocklistRefreshInterval(cfg.Blocklist))
 	if lastErr != "" || have == 0 {
 		due = lastTry.Add(blocklistRetryEvery)
@@ -475,13 +489,24 @@ func (e *Engine) applyBlocklist(ctx context.Context, cfg model.Config, gated, re
 		return
 	}
 	e.mu.Lock()
-	e.blOn = armed
 	if armed {
+		e.blOn = true
 		e.blApplied = ruleset
+		// The rebuild zeroed the rule, so the sample describing the old one
+		// goes with it.
+		e.blCounter = model.ProtectCounter{}
 	} else {
+		// Observe mode ran no nft, so blOn is left exactly where it was, and
+		// that is invariant 13 rather than an oversight: disarming is not a
+		// teardown, so a table loaded while armed is still in the kernel and
+		// still dropping. Recorded as unloaded, the portal said nothing was
+		// being dropped and that this was expected in observe mode, which is
+		// false in the one direction that matters - and the counter froze
+		// with it, because sampleProtect used to read the same field. The
+		// latch still goes, because whatever is loaded is no longer this
+		// ruleset.
 		e.blApplied = ""
 	}
-	e.blCounter = model.ProtectCounter{}
 	nets := e.blCount
 	e.mu.Unlock()
 
@@ -516,12 +541,14 @@ func (e *Engine) installBlocklistElements(ctx context.Context) {
 
 // loadBlocklistElements writes the set contents in one nft transaction.
 //
-// Gated on the table really being loaded rather than on the mode alone, which
-// is the same thing here and says the more useful of the two: with the table
-// absent - observe mode, a failed apply, the feature off - there is no set to
-// fill and the nft call would be an error every refresh. Observe therefore
-// neither loads nor writes a feed file, which is the invariant: this rule
-// drops packets, so nothing about it may be felt in observe mode.
+// Two conditions rather than one, because blOn survives a disarm. The table
+// being in the kernel is what makes a set exist to fill: absent - never armed,
+// a failed apply, the feature off - the nft call would be an error every
+// refresh. The runner applying is what keeps observe mode's promise, and it is
+// the load-bearing half now that the two can differ: a load past it would
+// change what a live table drops, which is the one thing this rule may never
+// do unarmed, and would leave a feed file on disk describing a set the kernel
+// does not have.
 //
 // The caller holds applyMu.
 func (e *Engine) loadBlocklistElements(ctx context.Context, gated sysx.Runner) {
@@ -529,7 +556,8 @@ func (e *Engine) loadBlocklistElements(ctx context.Context, gated sysx.Runner) {
 	on := e.blOn
 	nets := e.blNetworks
 	e.mu.RUnlock()
-	if !on || len(nets) == 0 {
+	if !on || !gated.Applying() || len(nets) == 0 {
+		e.forgetBlocklistLoadFailure()
 		return
 	}
 	elements := sysx.BuildBlocklistElements(nets)
@@ -538,13 +566,35 @@ func (e *Engine) loadBlocklistElements(ctx context.Context, gated sysx.Runner) {
 		// instruction: the set keeps whatever it holds. The list came
 		// through parseBlocklistBody, so reaching this means every entry
 		// was private or reserved space, which no real feed produces.
+		//
+		// Not retried either, for the reason the linker's refused egress push
+		// carries: the parse of a fixed list is deterministic, so the next
+		// attempt fails identically. Only the kernel refusing a load is worth
+		// coming back for.
+		e.forgetBlocklistLoadFailure()
 		e.log.Error("the blocklist has no usable networks; the loaded set is left alone", "fetched", len(nets))
 		return
 	}
 	if _, err := sysx.ApplyBlocklistElements(ctx, gated, e.stateDir, elements); err != nil {
-		e.log.Error("failed to load the blocklist networks", "err", err)
+		e.log.Error("failed to load the blocklist networks; it will be retried", "err", err,
+			"retry", blocklistRetryEvery.String())
 		_ = e.st.AddEvent(store.EventSystem, 0, "blocklist networks not loaded: %v", err)
+		e.mu.Lock()
+		e.blLoadFailed = time.Now()
+		e.mu.Unlock()
+		return
 	}
+	e.forgetBlocklistLoadFailure()
+}
+
+// forgetBlocklistLoadFailure drops any outstanding retry. Called from every
+// exit of loadBlocklistElements that is not a refused load, including the ones
+// that install nothing: with no table to fill there is nothing to come back
+// for, and the apply that puts one there loads the list itself.
+func (e *Engine) forgetBlocklistLoadFailure() {
+	e.mu.Lock()
+	e.blLoadFailed = time.Time{}
+	e.mu.Unlock()
 }
 
 // sampleBlocklistCounter reads the drop rule's tally back out of the kernel.
@@ -553,16 +603,28 @@ func (e *Engine) sampleBlocklistCounter(ctx context.Context) {
 	c, err := sysx.BlocklistState(ctx, e.realRunner())
 	if err != nil {
 		e.log.Debug("cannot read blocklist state", "err", err)
-		// The table may be gone underneath the agent. Dropping the latch
-		// makes the next save load it again rather than skipping it as
-		// unchanged, exactly as sampleProtect does.
+		// The table may be gone underneath the agent. Dropping the latch makes
+		// the next save load it again rather than skipping it as unchanged,
+		// exactly as sampleProtect does - and the record of it being loaded
+		// goes with it, because this readback is the only thing here that
+		// reports the kernel rather than this agent's belief about it.
+		// Leaving it set had the portal claim the rules were in the kernel
+		// immediately after the read proved they were not, and had every
+		// refresh load elements into a table that is not there.
 		e.mu.Lock()
+		e.blOn = false
 		e.blApplied = ""
 		e.blCounter = model.ProtectCounter{}
 		e.mu.Unlock()
 		return
 	}
 	e.mu.Lock()
+	// And upward, which is what makes clearing it above safe on a read that
+	// merely failed once: a table that really is there is found again on the
+	// next tick. It is also the only thing that notices one left behind by an
+	// armed process this one has replaced, since the unit runs under
+	// Restart=always and a restart into observe mode installs nothing.
+	e.blOn = true
 	e.blCounter = c
 	e.mu.Unlock()
 }
@@ -591,6 +653,9 @@ func (e *Engine) blocklistStatus() *model.BlocklistStatus {
 	}
 	if !e.blUpdated.IsZero() {
 		st.AgeHours = time.Since(e.blUpdated).Hours()
+		// Decided here rather than in the browser, because the threshold was
+		// written down in both places and only one of them was this constant.
+		st.Stale = st.AgeHours >= blocklistStaleAfter.Hours()
 	}
 	return st
 }

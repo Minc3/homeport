@@ -446,7 +446,7 @@ async function refreshStatus() {
   for (const l of states) linkers.append(linkerCard(l));
 
   renderProtect(st.protect);
-  renderBlocklist(st.blocklist);
+  renderBlocklist(st.blocklist, st.mode === 'armed');
   renderQueryCache(st.query_cache);
 }
 
@@ -456,7 +456,7 @@ async function refreshStatus() {
 // look identical from outside - the drops are indistinguishable from the
 // internet being calm - so the age, the load state and the last error are
 // stated rather than implied.
-function renderBlocklist(b) {
+function renderBlocklist(b, armed) {
   const section = document.getElementById('blocklist-section');
   section.classList.toggle('hidden', !b);
   if (!b) return;
@@ -467,10 +467,13 @@ function renderBlocklist(b) {
   // Age first, because it is the number that goes wrong silently. Written as
   // hours or days rather than a timestamp: what matters is how far behind the
   // feed this list has fallen, not when a clock said so.
-  const stale = b.age_hours >= 48;
+  // The threshold is the agent's, sent down beside the age. Written out here
+  // as well, it was a second definition of a number the Go constant already
+  // owned, with nothing to fail when the two drifted.
+  const stale = !!b.stale;
   const age = !b.updated_at || b.age_hours <= 0 ? 'never'
     : b.age_hours < 1 ? 'under an hour'
-    : b.age_hours < 48 ? `${Math.round(b.age_hours)}h`
+    : !stale ? `${Math.round(b.age_hours)}h`
     : `${Math.round(b.age_hours / 24)} days`;
 
   body.append(el('div', { class: 'metrics' },
@@ -495,6 +498,15 @@ function renderBlocklist(b) {
       el('p', { text: 'The blocklist is switched on but its rules are not in the kernel, so nothing is being dropped. '
         + 'In observe mode that is expected: this rule drops packets, so it is not installed until the system is armed. '
         + 'Armed, it means the last apply failed - check the Activity tab.' })));
+  } else if (!armed) {
+    // Disarming is not a teardown, so the table loaded while armed is still
+    // there and still dropping. It is the list behind it that stops moving:
+    // loading a fresh one would change what a live rule drops, which is the
+    // one thing observe mode may not do.
+    body.append(el('div', { class: 'alert warn' },
+      el('p', { text: 'The system is not armed, but this table was loaded while it was and is still in the kernel and still dropping. '
+        + 'The list inside it is no longer being refreshed, so it will go stale where it stands. '
+        + 'Arming resumes the refresh; Revert takes the rules down.' })));
   } else if (!b.networks) {
     body.append(el('div', { class: 'alert warn' },
       el('p', { text: 'The rules are loaded and the list is empty, so nothing is being dropped yet. '

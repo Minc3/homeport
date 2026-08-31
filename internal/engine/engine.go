@@ -260,6 +260,12 @@ type Engine struct {
 	// list going stale rather than as either alone. blApplied is the table
 	// text last really loaded, carrying applyProtect's latch for the same
 	// reason plus one of its own: a rebuild empties the feed set.
+	//
+	// blOn is whether the table is in the kernel, not whether this process
+	// armed it. Disarming is not a teardown (invariant 13), so a table loaded
+	// while armed is still there and still dropping, and
+	// sampleBlocklistCounter is what corrects the record in both directions
+	// from the kernel itself.
 	blNetworks []string
 	// blCount is how many of them will really be loaded, kept beside the list
 	// rather than derived on demand: Status is polled once a second and holds
@@ -272,7 +278,14 @@ type Engine struct {
 	blLastErr string
 	blOn      bool
 	blApplied string
-	blCounter model.ProtectCounter
+	// blLoadFailed is when an element load the kernel refused was attempted,
+	// zero when nothing is outstanding. The refresher retries from it, and
+	// nothing else would: blApplied describes the table rather than the set,
+	// so the next save takes the unchanged branch and skips the refill with
+	// the reload, and the feed republishes about daily against a four hour
+	// interval, so nearly every refresh is a 304 that loads no elements.
+	blLoadFailed time.Time
+	blCounter    model.ProtectCounter
 	// blWake asks the refresher to reconsider now. Buffered one deep and
 	// written without blocking, like wake.
 	blWake chan struct{}
@@ -1379,9 +1392,15 @@ const protectSampleIdleAfter = 30 * time.Second
 // drops the stale samples, so the re-test happens as the portal opens.
 func (e *Engine) sampleProtect(ctx context.Context) {
 	e.mu.RLock()
-	on, blOn := e.protectOn, e.blOn
+	on := e.protectOn
+	// The blocklist's half is gated on the feature being enabled rather than
+	// on blOn, and that is not a widening for its own sake: the readback is
+	// what sets blOn, so gating the readback on it would make a cleared one
+	// permanent - and a table left loaded by an armed process this one has
+	// replaced would never be found at all.
+	blEnabled := e.cfg.Blocklist.Enabled
 	e.mu.RUnlock()
-	if !on && !blOn {
+	if !on && !blEnabled {
 		return
 	}
 	if last := e.statusAt.Load(); time.Since(time.Unix(0, last)) > protectSampleIdleAfter {
@@ -1390,7 +1409,7 @@ func (e *Engine) sampleProtect(ctx context.Context) {
 	// The blocklist's counter rides the same gate for the same reason: it
 	// feeds the portal and nothing else, and its table is separate, so a site
 	// running one feature and not the other reads only the table it has.
-	if blOn {
+	if blEnabled {
 		e.sampleBlocklistCounter(ctx)
 	}
 	if !on {

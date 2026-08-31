@@ -1748,6 +1748,40 @@ whatever was in it a moment ago, so a save that changed an exception would
 otherwise switch the list off silently for up to a refresh interval, with the
 portal reporting it as on.
 
+**And a refill the kernel refuses is retried by the refresher, because
+nothing else here would.** The latch describes the table, and it is set
+whether or not the elements went in - correctly, since the table is fine and
+rebuilding it is not the repair - so a later save with nothing changed takes
+the unchanged branch and skips the refill along with the reload. The refresh
+does not cover it either: the feed republishes about daily against a four
+hour interval, so nearly every attempt is a 304, which by design loads no
+elements. Between them the table sat with an empty set, dropping nothing,
+while the portal reported thousands of networks loaded, until somebody
+happened to change a blocklist setting. `Engine.blLoadFailed` is what
+`maybeRefreshBlocklist` comes back from, on `blocklistRetryEvery`. Only a
+refused *load* is remembered: nothing usable surviving the parse is left
+alone, because the parse of a fixed list is deterministic and the next
+attempt fails identically, which is the reasoning the linker's refused egress
+push already carries.
+
+**`blOn` is whether the table is in the kernel, not whether this process armed
+it, and the difference is a disarm.** Invariant 13 leaves the rules loaded, so
+the table goes on dropping - and recorded as unloaded, the portal said the
+rules were not in the kernel and that this was expected in observe mode, which
+is false in the one direction that matters, while the drop counter froze
+because the sampler read the same field. The counter is the only thing that
+would have said otherwise. So an unarmed apply leaves the record alone, and
+`sampleBlocklistCounter` is what corrects it in both directions from the
+kernel itself: an error means the table is not there to read, so the record
+goes with the latch, and a reading means it is, which is what makes clearing
+it on one failed read recoverable. That readback is also the only thing that
+finds a table left behind by an armed process this one has replaced, since the
+unit runs under `Restart=always` and a restart into observe mode installs
+nothing - the hole `qcache_applied` is persisted for, closed here by reading
+the kernel rather than by writing a record down. It is why the sampler's
+blocklist half is gated on the feature being enabled rather than on `blOn`:
+gated on what it sets, a cleared record would be permanent.
+
 **It is the one thing here that acts on data nobody in this deployment
 reviewed, so every rule around it is about bounding a bad fetch.** Everything
 else a packet is matched against was typed or pasted by an operator and saved
@@ -1793,6 +1827,11 @@ is every way this list could become wrong in the closed direction:
   stale means blocking a network that may since have been cleaned up. The
   portal says the age out loud, because a list that stopped refreshing six
   weeks ago keeps working and keeps dropping, and nothing else would say so.
+  When it starts saying so is `blocklistStaleAfter`, and the status carries
+  the verdict rather than the browser recomputing it: the threshold was
+  written down in Go and again in `app.js`, and two copies of a number with
+  nothing to fail between them is how the card starts disagreeing with the
+  constant that claims to own it.
 
 **The list never enters the configuration blob.** It would bloat every export,
 bump `cfgVersion` on each refresh - which is what pushes configuration to the
@@ -2333,10 +2372,12 @@ Breaking any of these is a correctness bug even if the tests pass.
 
    The blocklist is on that list too, and needs no exception: its rule drops
    packets, so `applyBlocklist` goes through the gated runner, and
-   `loadBlocklistElements` gates on the table really being loaded rather than
-   on the mode - which is the same thing here and says the more useful of the
-   two, because with no table there is no set to fill. Observe therefore
-   writes no feed file and loads nothing.
+   `loadBlocklistElements` tests the table being loaded *and* the runner
+   applying. Those read as one condition and are two, because the record of
+   the table survives a disarm exactly as the table does: with no table there
+   is no set to fill, and with a table loaded before the disarm a refresh
+   would change what a live rule drops. So the list stops moving where it
+   stands, and observe writes no feed file and loads nothing.
 
    **It also loads no nftables table, on either host.** The backend's
    connection-marking table (`failover_return`) was installed as plumbing on
@@ -3579,6 +3620,18 @@ where a subtle regression would be invisible in production until an outage:
   elements - which is the property the separate table exists for. Revert
   removes the table and drops the counter while keeping the list, since a
   fetch should not be needed to re-arm.
+
+  Then the three ways the record of what is loaded goes wrong, none of which
+  any of the above can see because every one of them leaves the portal
+  reporting a healthy list. A refill the kernel refused is retried by the
+  refresher with nothing else due and nothing fetched, and a retry that
+  succeeds stops being retried; a disarm leaves the table recorded as loaded
+  and does not remove it, while a disarmed refresh still fills nothing and
+  writes no feed file - the two halves that used to be one condition; and the
+  readback corrects the record in both directions, dropping it when the table
+  cannot be read and restoring it when it can, which is what makes the first
+  half safe. Beside them the staleness verdict, taken from the constant at
+  both edges of the window and withheld for a list never fetched.
 - `web/blocklist_validate_test.go` - the save side: enabled with no public
   interface is refused with the reason in the message, the refresh interval is
   bounded at both ends with zero still meaning the default, an exception that
