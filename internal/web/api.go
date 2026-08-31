@@ -48,20 +48,47 @@ func (s *Server) handleProtectPresets(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, model.ProtectPresets())
 }
 
+// handleCheckConfig runs a configuration through everything a save would check
+// and hands the normalised result back without applying any of it. It is what
+// the settings page posts an imported file to.
+//
+// Import fills the form and never the configuration, for the same reason the
+// geo fetch does: what came out of a file still goes through the operator's
+// eyes and then through PUT /api/config like anything typed. Doing the check
+// here rather than in the browser is what makes the result safe to render. A
+// file written by an older build is missing whatever fields have been added
+// since, exactly as a stored blob is, and the repair for that is
+// model.Normalise plus the defaulting in validate. Those live on this host, in
+// one copy; a second copy in app.js would have to be kept in step with them,
+// and the failure when it drifted would be a settings page that cannot bind an
+// input to a field that is not there.
+//
+// It writes nothing. The engine is untouched whatever the body says, so a file
+// that is refused leaves the running system exactly as it was.
+func (s *Server) handleCheckConfig(w http.ResponseWriter, r *http.Request) {
+	cfg, ok := s.decodeConfig(w, r)
+	if !ok {
+		return
+	}
+	// Pinned after the shared check rather than inside it, and that ordering
+	// is this endpoint's promise rather than housekeeping. These two are
+	// import-only, so a save validates whatever the form holds for them.
+	// Pinned ahead of validate, a blank public interface on *this* host
+	// replaced the file's own good value and validate then refused the file
+	// for it, naming a service the file publishes perfectly well - on a
+	// half-configured replacement box, which is exactly where a restore is
+	// being attempted. So validate sees what a save would see, and the form
+	// is filled with this host's own identity afterwards.
+	pinHostIdentity(&cfg, s.eng.Config())
+	writeJSON(w, http.StatusOK, cfg)
+}
+
 // handlePutConfig replaces the whole configuration. The portal is the single
 // source of truth, so this is the only way settings change; the backend picks
 // up its half over the control channel within a couple of seconds.
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
-	var cfg model.Config
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxConfigBytes)).Decode(&cfg); err != nil {
-		clientErr(w, fmt.Errorf("invalid configuration: %w", err))
-		return
-	}
-
-	pinServerOwnedFields(&cfg, s.eng.Config())
-
-	if err := validate(&cfg); err != nil {
-		clientErr(w, err)
+	cfg, ok := s.decodeConfig(w, r)
+	if !ok {
 		return
 	}
 	if err := s.eng.Reconfigure(cfg); err != nil {
@@ -69,6 +96,54 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// decodeConfig reads a configuration body and answers false once it has
+// written the refusal, so the two doors into the configuration are one
+// function rather than two hand-copied preambles.
+//
+// That is the whole promise of POST /api/config/check: a file it accepts is a
+// file a save accepts, and one it refuses carries the message the save would
+// have given. Written out twice, the next guard added to the save lands on
+// one of them and nothing fails - the check then either passes a file whose
+// Save is refused, blocking every unrelated edit in the form with a message
+// the operator was promised at import time, or quietly enforces something a
+// save does not.
+func (s *Server) decodeConfig(w http.ResponseWriter, r *http.Request) (model.Config, bool) {
+	var cfg model.Config
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxConfigBytes))
+	// A field this build has never heard of is a file written by a newer one,
+	// and the decoder's default is to drop it in silence. Rolling the frontend
+	// back is a documented flow, and restoring that morning's export into it
+	// dropped the query cache, the per-service connection overrides and every
+	// remembered country code, handed the result back as an unconfigured form,
+	// and wrote that to the database on Save with nothing anywhere reporting a
+	// byte of it - and upgrading again does not bring them back, because
+	// Normalise fills defaults rather than the operator's values. Refusing
+	// names the field, the way proto reports a version mismatch separately
+	// from a bad MAC. It costs the portal nothing: what the page sends is what
+	// this file marshalled.
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		clientErr(w, fmt.Errorf("invalid configuration: %w", err))
+		return cfg, false
+	}
+	// Decode stops at the end of the first value, so two exports concatenated,
+	// or a truncated file with anything after the cut, were accepted on the
+	// strength of their first half - by the endpoint whose whole job is to say
+	// whether a file is good, and which is the obvious thing to point a curl
+	// at from a shell, where there is no JSON.parse in front of it to catch
+	// what this did not.
+	if dec.More() {
+		clientErr(w, errors.New("invalid configuration: trailing content after the end of the configuration"))
+		return cfg, false
+	}
+	pinServerOwnedFields(&cfg, s.eng.Config())
+	if err := validate(&cfg); err != nil {
+		clientErr(w, err)
+		return cfg, false
+	}
+	return cfg, true
 }
 
 // pinServerOwnedFields overwrites the parts of a PUT body that the settings
@@ -91,6 +166,33 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 func pinServerOwnedFields(cfg *model.Config, current model.Config) {
 	cfg.Overlay = current.Overlay
 	cfg.Mode = current.Mode
+}
+
+// pinHostIdentity keeps the fields that describe the box being imported into
+// rather than the configuration being imported. Only the import path uses it:
+// the settings form is where these are set, so a save has to keep accepting
+// them, which is also why it runs after validate rather than inside
+// decodeConfig with the pin a save shares. See handleCheckConfig.
+//
+// The public interface and the address on it are the two. They are not policy,
+// they are what this particular machine's NIC is called, and a file carries
+// whichever the machine it was exported from had. Restoring a backup onto the
+// host it came from sees no difference at all, which is the case backups are
+// taken for; moving one between hosts is where it matters, and there it fails
+// in the direction that hides best. Published traffic is only translated when
+// it arrives on that interface, and the protection chains are scoped to it as
+// a safety property, so a name belonging to another box means an nftables
+// table that matches nothing: every published service dead, and the portal
+// showing a configuration that saved cleanly with three healthy paths behind
+// it. An address belonging to another box does the same through the dnat
+// rule's own match.
+//
+// BackendEgress travels with the file. It is a decision about how the
+// deployment routes rather than a fact about the hardware, and it is the one
+// thing in this group somebody would deliberately want restored.
+func pinHostIdentity(cfg *model.Config, current model.Config) {
+	cfg.Frontend.PublicIface = current.Frontend.PublicIface
+	cfg.Frontend.PublicIP = current.Frontend.PublicIP
 }
 
 // validate rejects configurations that would leave the system unable to make a
@@ -672,6 +774,15 @@ func validate(cfg *model.Config) error {
 	}
 	if cfg.Probe.WindowSize < 5 {
 		cfg.Probe.WindowSize = 5
+	}
+	// An absent services list marshals back as JSON null, and the settings
+	// form binds a row builder straight to it: null is what a hand-trimmed
+	// backup carries, and it took the page down from Published services
+	// downward - no Save button, no Discard, no Import - on the one endpoint
+	// written so the browser never meets a shape it cannot render. An empty
+	// list is what "no published services" means, so that is what is served.
+	if cfg.Services == nil {
+		cfg.Services = []model.Service{}
 	}
 	for i := range cfg.Services {
 		sv := &cfg.Services[i]

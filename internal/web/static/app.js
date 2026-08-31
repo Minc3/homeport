@@ -156,8 +156,10 @@ document.querySelectorAll('nav button').forEach((btn) => {
     if (btn.dataset.tab === 'events') refreshEvents();
     // Reload for freshness only when nothing is pending: loadSettings replaces
     // `config`, so coming back to the tab must not discard edits. The edited
-    // form is still in the DOM and stays as it was left.
-    if (btn.dataset.tab === 'settings' && !settingsDirty) loadSettings();
+    // form is still in the DOM and stays as it was left. An import in flight
+    // counts as pending too, or whichever of the two requests lands second
+    // wins the form, and the toast naming the file is on screen either way.
+    if (btn.dataset.tab === 'settings' && !settingsDirty && !importing) loadSettings();
   });
 });
 
@@ -682,6 +684,12 @@ let protectPresets = [];
 
 let savedConfig = null;
 let settingsDirty = false;
+// Set while an import is in flight. The dirty flag cannot stand in for it: it
+// is cleared by the debounced compare a quarter of a second after the file is
+// chosen, and the tab handler reloads the settings whenever it is false, so a
+// slow check request could be overtaken by a tab switch and leave the operator
+// reviewing the running configuration under a toast naming their file.
+let importing = false;
 
 // zeroish groups the values Go's omitempty treats as absent. A key the loaded
 // JSON never carried and one an input has set back to its default are the same
@@ -838,6 +846,16 @@ function updateQcacheWarn() {
   }
 }
 
+// The three banners as one call. The set of them is enumerated wherever the
+// form is rebuilt or reloaded, and a fourth added to two of the three sites is
+// a banner that stays silent for exactly the operator who did not type the
+// state it warns about, which on an import is all of them.
+function updateWarnings() {
+  updateGeoWarn();
+  updateQcacheWarn();
+  updatePortClashWarn();
+}
+
 // 'input' catches typing, 'change' the dropdowns and checkboxes, 'click' the
 // Add and Remove buttons. Typing is debounced: a fetched country list puts
 // tens of thousands of networks in the config, and sameConfig walks all of
@@ -861,9 +879,7 @@ function updateQcacheWarn() {
   });
   for (const evt of ['change', 'click']) {
     form.addEventListener(evt, updateDirty);
-    form.addEventListener(evt, updateGeoWarn);
-    form.addEventListener(evt, updateQcacheWarn);
-    form.addEventListener(evt, updatePortClashWarn);
+    form.addEventListener(evt, updateWarnings);
   }
 }
 
@@ -1431,6 +1447,12 @@ function renderSettings() {
   if (!c.egress) c.egress = { sources: [] };
   if (!c.egress.sources) c.egress.sources = [];
   if (!c.linkers) c.linkers = [];
+  // Guarded like its neighbours, and the frontend serves an empty list rather
+  // than null besides. A file with no services key is what a hand-trimmed
+  // backup looks like, and unguarded it threw here after the form had already
+  // been emptied: the page ended at Failover, with no Save, no Discard and no
+  // Import left on it to get back from.
+  if (!c.services) c.services = [];
 
   // A network configured while the master switch is off installs nothing at
   // all: the frontend only sends these to the backend once it is prepared to
@@ -2182,6 +2204,53 @@ function renderSettings() {
     el('p', { class: 'hint', text: 'Worth turning on. When every usable path is over quota the system parks and waits for you to approve one. Without an alert, that approval only happens when you next open this page.' }),
   ));
 
+  // The file input is hidden and driven by the button beside it: a bare
+  // <input type=file> cannot be styled to match anything else on this page,
+  // and the button is where the explanation of what an import does belongs.
+  const importInput = el('input', { type: 'file', accept: 'application/json,.json', class: 'hidden' });
+  importInput.addEventListener('change', () => {
+    const file = importInput.files && importInput.files[0];
+    // Cleared before the read rather than after it, so choosing the same file
+    // twice fires change the second time; the File is a handle of its own and
+    // stays readable once the input has let go of it.
+    importInput.value = '';
+    if (file) importConfig(file);
+  });
+  // Its events stop here rather than bubbling into the form. Choosing a file
+  // fires a bubbling `input` before `change`, and the form reads any `input`
+  // as an edit: every import then asked to discard changes nobody had made,
+  // which is how an operator learns to click through the one guard standing
+  // between them and half an hour of unsaved typing. The relayed click from
+  // the button below bubbles for the same reason, and that one ran the full
+  // config walk and all three banner scans twice, undebounced, before the
+  // picker had opened.
+  for (const evt of ['input', 'change', 'click']) {
+    importInput.addEventListener(evt, (e) => e.stopPropagation());
+  }
+  form.append(section('Backup and restore',
+    el('div', { class: 'row' },
+      el('button', { class: 'btn', type: 'button', onclick: exportConfig }, 'Export configuration'),
+      help('Downloads everything on this form as one JSON file: paths, published services, protection with its region lists, '
+        + 'the query cache, linkers, egress networks and notifications. It is the configuration itself rather than a summary of it, '
+        + 'so importing it back puts the same system back rather than a reconstruction of it. It goes through the same checks a save does '
+        + 'on the way in, so a file written by an older build comes back with whatever that build never wrote filled in. What is written '
+        + 'is what is on the form, including anything typed since the last save.'),
+      el('button', { id: 'import-config', class: 'btn', type: 'button', onclick: () => { if (!importing) importInput.click(); } }, 'Import configuration'),
+      help('Reads a file back into this form and applies nothing. Check it over and press Save configuration, which is the point at which '
+        + 'anything changes on either host. A file the frontend refuses is reported with the same message a save would have refused it with, '
+        + 'and leaves the form alone. A file written by a newer build is refused by the name of the first setting this one has never heard of, '
+        + 'rather than loaded with that setting quietly dropped.'),
+      importInput,
+    ),
+    el('p', { class: 'hint', text: 'Four things in the file are ignored on import, and this host keeps its own. '
+      + 'Overlay addressing comes from the bootstrap file on both hosts and cannot be changed from here at all. The mode belongs to the dashboard, '
+      + 'so importing a file taken from an armed host does not arm this one. The public interface and public IP in the Frontend section stay as well: '
+      + 'they are what this box calls its NIC rather than settings that travel, and a name belonging to another box is an nftables table that matches nothing, '
+      + 'which reads as every published service being down while the configuration looks saved. Backend egress does travel, because that one is a routing decision.' }),
+    el('p', { class: 'hint', text: 'The shared secret is not in the file, because it lives in the bootstrap file rather than in the configuration. '
+      + 'The notification token is, in the clear, along with every region list and every published port. Treat the file the way you would treat a copy of this page.' }),
+  ));
+
   // Not part of the configuration blob, so it saves on its own rather than
   // with the button below - and deliberately at the end, where somebody who
   // has just been handed a generated password will scroll looking for it.
@@ -2233,6 +2302,143 @@ function renderSettings() {
   ));
 }
 
+// ---------------------------------------------------------------------------
+// Export and import
+//
+// One file, the whole configuration blob in the shape GET /api/config serves
+// and Save PUTs back, so a restore is the same configuration and not a
+// reconstruction of it. Paths, published services, protection with its region
+// lists, the query cache, linkers, egress networks, notifications.
+//
+// Four fields deliberately do not travel, and the frontend is what discards
+// them rather than this file: overlay addressing is bootstrap-owned on both
+// hosts, the mode belongs to the dashboard, and the public interface and the
+// address on it describe the box being imported into rather than the
+// deployment. See handleCheckConfig.
+//
+// What comes back from the import is the file after everything a save would
+// do to it, which is not always the file: an older build's export is missing
+// fields this one fills in. The badge lights accordingly.
+// ---------------------------------------------------------------------------
+
+// Mirrors web.maxConfigBytes, which bounds the same bytes at the far end.
+// Checked here so a mispicked file is refused before it is read rather than
+// after: this page cannot ask the frontend about a file it has not sent, and
+// reading first is a limit on memory already committed.
+const MAX_CONFIG_BYTES = 32 << 20;
+
+// The button only exists on a rendered form, and renderSettings cannot run
+// without a configuration, so there is nothing here to guard against a null
+// one. What is written is what is on the form, not what is stored, because
+// that is what the operator is looking at - and the unsaved badge beside the
+// Save button is already saying which of the two this is.
+function exportConfig() {
+  // Stamped in local time rather than toISOString's UTC. The stamp is the only
+  // thing telling two backups apart in a folder, and a backup taken at eight in
+  // the morning in Melbourne was filed under the previous day, so "the one from
+  // this morning" picked the wrong file.
+  const d = new Date();
+  const two = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+  // Compact rather than indented. Indenting is about 1.7x, which carries a
+  // region-heavy export past maxConfigBytes: the file this button writes has
+  // to fit back through the endpoint that reads it, which is the same ordering
+  // geoFetchMaxTotal < maxRegionsBytes < maxConfigBytes exists for. It is also
+  // what lets an import post the file's own bytes instead of a re-rendering
+  // of them.
+  const url = URL.createObjectURL(new Blob([`${JSON.stringify(config)}\n`], { type: 'application/json' }));
+  const a = el('a', { href: url, download: `homeport-config-${stamp}.json` });
+  document.body.append(a);
+  try {
+    a.click();
+  } finally {
+    a.remove();
+    // Revoked well after the click rather than on the next turn: the click is
+    // dispatched synchronously but the read of the blob behind it is not, and
+    // revoking while that is outstanding cancels the download with no error
+    // anywhere. In a finally because the alternative to revoking late is
+    // pinning the whole configuration, notification token included, in memory
+    // for the life of the tab.
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+}
+
+// importConfig fills the form and applies nothing. Deliberately, for the
+// reason the geo fetch fills the form rather than the configuration: this
+// arrives from outside, and what it decides is every published port, every
+// limit and every region lock on a live system. It goes through the operator's
+// eyes and then through Save like anything typed.
+//
+// The file is checked by the frontend rather than here. A file written by an
+// older build is missing whatever has been added since, exactly as an older
+// stored blob is, and model.Normalise is what repairs that - on the host, in
+// one copy. Binding this form straight to a parsed file would mean a second
+// copy of that repair in the browser, and the failure when it drifted is a row
+// builder reaching into a structure the file never carried.
+async function importConfig(file) {
+  try {
+    if (settingsDirty && !confirm(`Discard the unsaved changes on this form and load ${file.name}?`)) return;
+    // Bounded before it is read, not after. `accept` is a hint and every
+    // picker offers All Files, so the disk image sitting beside the backup is
+    // one mis-click away, and reading it stringifies the whole thing in this
+    // tab - with the parse beside it - before the frontend's own bound could
+    // refuse it, on the page somebody opens when all three tunnels are down.
+    if (file.size > MAX_CONFIG_BYTES) {
+      throw new Error(`${file.name} is ${Math.round(file.size / (1 << 20))} MB; a configuration file cannot be larger than ${MAX_CONFIG_BYTES >> 20} MB`);
+    }
+    importing = true;
+    const btn = document.getElementById('import-config');
+    if (btn) btn.disabled = true;
+    const text = await file.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      throw new Error(`${file.name} is not JSON: ${e.message}`);
+    }
+    // Parsed for the shape alone, and the bytes rather than the parse are what
+    // goes up. An array or a bare string decodes into model.Config as an error
+    // the endpoint would report as "invalid configuration", which reads as
+    // though the settings inside it were wrong rather than the file being the
+    // wrong thing entirely. Posting `text` is what makes the host validate
+    // what is actually on disk: re-serialising the parse would quietly round
+    // any number JSON.parse cannot hold exactly, and inflate a large file for
+    // no reason.
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`${file.name} does not hold a configuration object`);
+    }
+    const checked = await api('/api/config/check', { method: 'POST', body: text });
+    // Committed only once it has rendered. renderSettings empties the form as
+    // its first statement and appends section by section, so a throw partway
+    // through leaves half a form bound to a configuration nothing else knows
+    // about - and a throw landing after the save bar leaves a Save that posts
+    // a configuration the operator was never shown in full.
+    const previous = config;
+    config = checked;
+    try {
+      renderSettings();
+    } catch (e) {
+      config = previous;
+      renderSettings();
+      throw new Error(`${file.name} could not be displayed (${e.message}); the form is unchanged`);
+    }
+    // savedConfig is left where it is, so the badge lights and the tab is
+    // marked: until it is saved an import is an edit like any other, and
+    // Discard changes still puts the running configuration back.
+    updateDirty();
+    updateWarnings();
+    toast(`Loaded ${file.name}. Nothing has been applied yet: review it, then Save configuration.`);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    importing = false;
+    // Re-queried rather than held: a successful import has rebuilt the form,
+    // so the button locked above is no longer the one on the page.
+    const live = document.getElementById('import-config');
+    if (live) live.disabled = false;
+  }
+}
+
 async function loadSettings() {
   try {
     // A missing preset list is not fatal, but it must not be silent: the
@@ -2254,9 +2460,7 @@ async function loadSettings() {
     markSaved();
     // The form events keep them live from here; this covers a config loaded
     // already carrying either mismatch.
-    updateGeoWarn();
-    updateQcacheWarn();
-    updatePortClashWarn();
+    updateWarnings();
   } catch (e) {
     toast(e.message, true);
   }

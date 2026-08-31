@@ -139,6 +139,11 @@ func (s *Server) Handler(trusted bool) http.Handler {
 	api("GET /api/presets", s.handlePresets)
 	api("GET /api/protect-presets", s.handleProtectPresets)
 	api("PUT /api/config", s.handlePutConfig)
+	// Checks a configuration without applying it, which is how an imported
+	// file reaches the settings form: normalised and validated by the same
+	// rules a save uses, so the form binds to a complete structure and a bad
+	// file is refused with the message it would have been refused with anyway.
+	api("POST /api/config/check", s.handleCheckConfig)
 	api("GET /api/events", s.handleEvents)
 	api("GET /api/history", s.handleHistory)
 	api("GET /api/usage", s.handleUsage)

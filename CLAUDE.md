@@ -1785,6 +1785,120 @@ was configured. On a block lock the resolved regions keep their rules and the
 dangling one simply drops nothing, because there each region is its own rule
 and dropping less is the open direction.
 
+**Export and import are the configuration blob itself, and an import fills the
+form rather than the configuration.** The file is the shape `GET /api/config`
+serves and a save `PUT`s back, so a restore puts the same system back rather
+than a reconstruction of it: services, protection with its region lists, the
+query cache, linkers, egress networks, notifications. It is deliberately not a
+byte identity and must not be described as one, because `GET /api/config`
+serves the stored blob raw and nothing re-validates that on load: what comes
+back from an import is the file after everything a save would do to it, so an
+older build's export returns with the fields that build never wrote filled in,
+and a blob this build would now refuse - a stored service-port overlap, a
+region-name fold collision, a calibration below `MinCalibration`, all of which
+§6 records as legally storable - is refused on the way back in rather than
+quietly restored. Import follows the geo fetch's rule for the same reason,
+because it also arrives from outside and decides every published port and every
+limit on a live host: what came out of a file goes through the operator's eyes
+and then through `PUT /api/config` like anything typed.
+
+It is checked on the host rather than in the browser, and by the same function
+the save uses. `POST /api/config/check` and `PUT /api/config` both go through
+`Server.decodeConfig`, and that sharing *is* the promise: a file the check
+accepts is a file a save accepts, and one it refuses carries the message the
+save would have given. Two hand-copied preambles is exactly how that stops
+being true with nothing failing, and the two had already drifted by a line
+before the feature was a day old. What the shared half does is bound the body,
+refuse a field this build has never heard of, refuse anything after the end of
+the configuration, pin the server-owned fields and run `validate`. That is also
+what makes the result safe to bind a form to: a file written by an older build
+is missing whatever has been added since, exactly as a stored blob is, and
+`model.Normalise` is the one copy of the repair for that. Doing it in `app.js`
+would be a second copy to keep in step, and the failure when it drifted is a
+row builder reaching into a structure the file never carried. `validate` fills
+an absent `services` list in for the same reason: it marshals back as JSON
+null, the form binds a row builder straight to it, and a hand-trimmed backup
+took the settings page down from Published services downward, with no Save, no
+Discard and no Import left on it to get back from.
+
+**A field this build cannot name is refused rather than dropped, which is the
+opposite of the decoder's default.** Rolling the frontend back is a documented
+flow (§2), and restoring that morning's export into the older build dropped its
+query cache, its per-service connection overrides and every remembered country
+code in silence, handed the result back as an unconfigured form, and wrote that
+to the database on Save. Upgrading again does not bring them back, because
+`Normalise` fills defaults rather than the operator's values. `proto` reports a
+version mismatch separately from a bad MAC for the same reason: a build that
+cannot read what it was sent has to say so, because the two faults send an
+operator to different files. It costs the portal nothing, since what the page
+sends is what this package marshalled.
+
+**And `Decode` stops at the end of the first value, so what follows it has to
+be refused separately.** Two exports concatenated, or a truncated file with
+anything after the cut, were accepted on the strength of their first half.
+That matters here more than on the save because this endpoint writes nothing,
+which makes `curl --data-binary @backup.json` the obvious way to check a backup
+from a shell - and there is no `JSON.parse` in front of it there to catch what
+the decoder did not, so the operator learns the file is bad on the day they
+need it.
+
+Four fields stay with the host being imported into. Two of them are the ones a
+save discards anyway, `pinServerOwnedFields`: the overlay addressing, which is
+bootstrap-owned on both hosts, and the mode, so a file taken from an armed host
+does not arm the host it lands on. The other two are `pinHostIdentity`, and
+that one is import-only, because the settings form is where they are set and a
+save has to keep accepting them. `Frontend.PublicIface` and
+`Frontend.PublicIP` describe the machine rather than the deployment, and a
+file's copy of them fails in the direction that hides best: published traffic
+is translated only when it arrives on that interface, and the protection chains
+are scoped to it as a safety property, so a name belonging to another box is a
+table that matches nothing, with every published service dead behind a
+configuration that saved cleanly and three paths still measuring perfectly.
+`Frontend.BackendEgress` sits in the same struct and does travel: it is a
+decision about how the deployment routes, not a fact about the hardware.
+Restoring onto the host the file came from sees no difference either way, which
+is the case a backup is taken for.
+
+`pinHostIdentity` runs **after** `validate` and `pinServerOwnedFields` runs
+before it, and that split is the parity promise rather than housekeeping. The
+server-owned pair is discarded by a save too, so validating with them pinned is
+validating what a save validates. The host-identity pair is not: a save keeps
+whatever the form holds, since the form is where they are set. Pinned ahead of
+`validate`, this host's blank public interface replaced the file's own good
+value and `validate` then refused the file for it, naming a service the file
+publishes perfectly well - and the host with a blank one is the half-configured
+replacement box, which is exactly where a restore is being attempted and the
+one place there is nothing to suggest what to fix. Validate therefore sees the
+file as a save would see it, and the form is filled with this host's identity
+afterwards.
+
+**The browser's half is four rules, and each of them is a bound or a
+commitment point.** The file is sized before it is read, because a picker
+offers All Files whatever `accept` says and reading first is a bound on memory
+already committed, which is the argument `proto.MaxFrameBytes` carries in the
+other direction. The file's own bytes are posted rather than a re-serialisation
+of the parse, so what the host validates is what is on disk and no number
+`JSON.parse` cannot hold exactly is rounded on the way; the parsed copy is kept
+only to tell "this is the wrong kind of file" from "the settings in it are
+wrong". The export is compact rather than indented, because indenting is about
+1.7x and carries a region-heavy export past `maxConfigBytes`: what this button
+writes has to fit back through the endpoint that reads it, which is the
+ordering `geoFetchMaxTotal < maxRegionsBytes < maxConfigBytes` already exists
+for. And the imported configuration is committed to the page only once it has
+rendered, because `renderSettings` empties the form as its first statement and
+appends section by section, so a throw partway leaves half a form bound to a
+configuration nothing else knows about - and a throw landing after the save bar
+leaves a Save that posts a configuration the operator was never shown in full.
+
+The file input's own events are kept off the form's delegated listeners, and
+that is not tidiness either. Choosing a file fires a bubbling `input` before
+`change`, which the form reads as an edit, so every import asked to discard
+changes nobody had made: a guard that fires unconditionally is one an operator
+learns to click through, and the edit it exists to protect is the half hour of
+typing it will eventually be hiding. The relayed click from the button bubbles
+for the same reason, and ran the whole `sameConfig` walk and all three banner
+scans twice, undebounced, before the picker opened.
+
 **The automatic region lock lives entirely in the kernel, like the parking
 blocklist it copies.** `Service.GeoAutoPPS` makes the lock conditional: a
 `limit rate over` trigger writes the port into a dynamic `geo_lockdown_<proto>`
@@ -3108,6 +3222,35 @@ where a subtle regression would be invisible in production until an outage:
   trailing `=` skipped real call sites, so `const autoPPS = num(...)` was
   silently outside the scan along with anything that had an unrelated `const`
   within forty characters ahead of it.
+- `web/config_import_test.go` - the endpoint an imported file goes through:
+  the file's region lists come back intact, a group an older build never wrote
+  is filled in, an absent services list comes back as an empty one rather than
+  as the JSON null the form cannot bind a row builder to, the mode and the
+  overlay are taken from the running host rather than from the file, and so are
+  the public interface and the address on it, while backend egress beside them
+  still travels. That a file is *not* refused for this host's blank interface
+  is pinned beside them, because pinning the host's identity before `validate`
+  rather than after it refuses a good file on the one box a restore is aimed
+  at. None of it reaches the running engine, and that is asserted on the store
+  and the config version as well as the engine's own copy - the in-memory copy
+  is the one place the handler structurally cannot reach, so a future edit that
+  persisted the checked file would leave the test green while the next restart
+  came up on a configuration nobody approved.
+
+  The parity the endpoint exists for is driven through both doors rather than
+  claimed: the same bytes to `POST /api/config/check` and `PUT /api/config`, an
+  accepted configuration and three refusals (two paths on one fwmark, a setting
+  this build has never heard of, two configurations in one file), with the
+  error strings compared on every refusal. Without it the check can be given a
+  guard the save has not - which is what happened, and what stayed green. The
+  door is pinned too: an unauthenticated request is refused, because this
+  endpoint hands back the whole configuration with the notification token in it
+  and `POST /api/login` sits twelve lines above it registered without the
+  wrapper that would have stopped it. And `MAX_CONFIG_BYTES` in `app.js` is
+  held equal to `maxConfigBytes`, because the portal refuses an oversized file
+  before it reads it and can only do that against a copy of this package's
+  bound: drifted high, the mispicked file is read whole in the tab before the
+  frontend could refuse it, which is the whole reason for checking there.
 - `web/password_test.go` - a password can be changed, doing so logs out every
   other session while keeping the caller signed in, the current password is
   required, an unauthenticated request cannot change one, the local socket can

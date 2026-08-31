@@ -2,17 +2,12 @@ package web
 
 import (
 	"encoding/json"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 
 	"github.com/quinlan102/homeport/internal/engine"
 	"github.com/quinlan102/homeport/internal/model"
-	"github.com/quinlan102/homeport/internal/notify"
-	"github.com/quinlan102/homeport/internal/store"
 )
 
 // The dashboard reads these three fields straight out of /api/status: two to
@@ -21,22 +16,13 @@ import (
 // still parses, the values just come back undefined - so the wire names are
 // pinned here rather than only in the Go struct.
 func TestStatusAPICarriesTheFieldsTheDashboardReads(t *testing.T) {
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
 	oldVersion := engine.Version
 	t.Cleanup(func() { engine.Version = oldVersion })
 	engine.Version = "frontend-build-under-test"
 
-	eng := engine.New(log, st, notify.New(log), model.Defaults(), []byte("secret"), t.TempDir())
+	srv, eng, _ := portalServer(t, model.Defaults())
 	eng.SetBackendInfo("backend-build-under-test", "backend-host")
 
-	srv := New(eng, st, log, "test-psk")
 	rec := httptest.NewRecorder()
 	// trusted: this exercises the payload, not the login flow.
 	srv.Handler(true).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
