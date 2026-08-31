@@ -161,7 +161,15 @@ func TestBlocklistCacheSurvivesARestart(t *testing.T) {
 	first.blURL = f.start(t).URL
 	first.refreshBlocklist(context.Background())
 
+	// A restart is a restart of the same frontend, so it asks the same host.
+	// The loader only carries an age and an ETag across when the cache says
+	// they came from the source it is about to ask again, and this engine was
+	// built pointing at the shipped feed, so it has to be pointed back at the
+	// test's server and read the cache again.
 	second, _ := blocklistEngine(t, dir)
+	second.blURL = first.blURL
+	second.loadBlocklistCache()
+
 	if got := len(second.blNetworks); got != 2 {
 		t.Fatalf("a fresh engine started with %d networks, want 2 from the cache", got)
 	}
@@ -758,5 +766,34 @@ func TestBlocklistStalenessIsDecidedByTheAgent(t *testing.T) {
 	e.blUpdated = time.Time{}
 	if st := e.blocklistStatus(); st.Stale {
 		t.Error("a list that has never been fetched was reported stale")
+	}
+}
+
+// The age and the ETag describe a conversation with one host, so a cache
+// written against a different source must not lend either to the new one: the
+// card would report a freshness this frontend has never confirmed, and the
+// If-None-Match would carry another host's tag format, answered with a full
+// body rather than the 304 the refresh cadence is sized around. The list
+// itself is kept, because an old list beats none and boot-time protection
+// must not wait on a fetch.
+func TestACacheFromAnotherSourceKeepsTheListAndNotTheAge(t *testing.T) {
+	dir := t.TempDir()
+	first, _ := blocklistEngine(t, dir)
+	f := &feedServer{body: "203.0.113.0/24\n198.51.100.0/24\n", etag: `"from-the-old-host"`}
+	first.blURL = f.start(t).URL
+	first.refreshBlocklist(context.Background())
+
+	// Built against the shipped feed, so the cache on disk names somebody
+	// else - which is what changing the feed URL leaves behind on a live host.
+	moved, _ := blocklistEngine(t, dir)
+
+	if got := len(moved.blNetworks); got != 2 {
+		t.Fatalf("the list was discarded with the source: %d networks, want 2", got)
+	}
+	if !moved.blUpdated.IsZero() {
+		t.Error("an age confirmed against a different host was carried over to the new one")
+	}
+	if moved.blEtag != "" {
+		t.Errorf("another host's ETag %q was kept to be sent to this one", moved.blEtag)
 	}
 }

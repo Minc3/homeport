@@ -63,6 +63,17 @@ import (
 // conservative aggregate of DShield, abuse.ch Feodo, Spamhaus DROP and the
 // bogon list, regenerated upstream continuously and published daily.
 //
+// Taken from the project's own distribution site rather than from the git
+// repository the lists are built in, and that is upstream's request rather
+// than a preference: GitHub asked them to limit how often that repository is
+// updated because of its size and churn, so it now lands once a day and the
+// README points every consumer at iplists.firehol.org for direct links. It
+// costs this design nothing to comply. The file is byte for byte the same,
+// and the only property the refresh cadence rests on - a conditional request
+// answering 304 - holds there too, on an ETag and a Last-Modified both, in
+// front of a CDN that caches it for two hours. That is a host built to be
+// polled, which raw.githubusercontent.com is not.
+//
 // One built-in source rather than a configurable URL, and that is a security
 // property rather than a limitation. The value would otherwise be an operator
 // field naming a host this root process fetches from and loads into nftables
@@ -75,7 +86,7 @@ import (
 // this host saying why. The aggressive lists and the proxy lists will
 // eventually name a carrier NAT, and this deployment's own per-source limits
 // are already sized around 16 to 64 subscribers sharing one address.
-const blocklistFeedURL = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
+const blocklistFeedURL = "https://iplists.firehol.org/files/firehol_level1.netset"
 
 const (
 	// blocklistMaxBytes caps one response. The real file is well under a
@@ -150,9 +161,28 @@ func (e *Engine) loadBlocklistCache() {
 		return
 	}
 	e.mu.Lock()
+	// The list is kept whatever served it, because an old list beats none and
+	// that is this feature's rule everywhere else. The age and the ETag are
+	// not: both describe a conversation with one particular host. Carried
+	// across a change of source they have the card report a freshness this
+	// frontend has never confirmed with the host it now names, and send an
+	// If-None-Match built from another host's tag format, which is answered
+	// with a full body rather than the 304 the cadence is sized around.
+	// Zeroed, the refresher fetches on its next pass and both become true
+	// again - and the networks are still there in the meantime, so nothing
+	// about boot-time protection changes.
+	//
+	// Source was written and never read until this. That is the shape of
+	// record that starts lying without anything failing, which is exactly
+	// what blocklistStaleAfter was doing one commit ago.
 	e.rememberBlocklist(c.Networks)
-	e.blUpdated = c.Fetched
-	e.blEtag = c.ETag
+	if c.Source == e.blURL {
+		e.blUpdated = c.Fetched
+		e.blEtag = c.ETag
+	} else if c.Source != "" {
+		e.log.Info("the cached blocklist came from a different source; keeping the list and fetching again",
+			"cached", c.Source, "source", e.blURL)
+	}
 	e.mu.Unlock()
 }
 

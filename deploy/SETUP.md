@@ -653,7 +653,10 @@ entirely, and it lives in an nftables table of its own.
 
 **Settings, Blocklist**, tick **Enabled** and save. It needs the public
 interface set, for the same reason protection does, and it takes effect when
-armed. That is the whole of the setup: the feed, FireHOL level1, is built in.
+armed. That is the whole of the setup: the feed, FireHOL level1, is built in,
+fetched from the project's own distribution site at `iplists.firehol.org`
+rather than from the git repository the lists are built in, which is what
+upstream asks consumers to use.
 
 | Setting | Notes |
 |---|---|

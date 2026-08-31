@@ -1863,7 +1863,13 @@ a security property.** The value would otherwise be an operator field naming a
 host this root process fetches from on a timer and loads into nftables, which
 is a far larger thing to get wrong than a country code - and `handleGeoFetch`
 already refuses anything that is not a country code rather than escaping it,
-for the same reason. FireHOL level1 specifically, and not one of the larger
+for the same reason. It is fetched from `iplists.firehol.org` rather than from
+the git repository the lists are built in, which is upstream's own request:
+GitHub asked them to limit how often that repository is updated, so it now
+lands once a day and the README points consumers at the distribution site. The
+file is byte-identical and answers a conditional request with a 304 exactly as
+the repository did, so the refresh cadence is unaffected. FireHOL level1
+specifically, and not one of the larger
 lists beside it: it is the conservative aggregate, and the aggressive and
 proxy lists will eventually name a carrier NAT, which this deployment's own
 per-source presets are already sized around (16 to 64 subscribers behind one
