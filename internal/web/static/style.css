@@ -70,6 +70,18 @@ header h1 {
 .copy { cursor: pointer; }
 .copy:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
 
+/* A read-only form value, which is also click-to-copy. Styled to read as
+   not editable - a disabled input would do that on its own, but a disabled
+   input cannot be clicked or even selected in every browser, and these are
+   the values (overlay addresses, ports) an operator most often needs in a
+   shell on the other host. */
+input.readonly {
+  color: var(--muted);
+  background: var(--panel-2);
+  cursor: pointer;
+}
+input.readonly:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
+
 .badge {
   display: inline-flex;
   align-items: center;

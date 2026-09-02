@@ -262,7 +262,9 @@ function pathCard(p, pinned, shared) {
   return el('div', { class: 'card' + (p.active ? ' active' : '') },
     el('div', { class: 'card-head' },
       el('h2', { text: p.name }),
-      el('span', { class: 'prio', text: `priority ${p.priority} · ${p.iface}` }),
+      // The interface name is what an operator types after `wg show`,
+      // `ip route show table` or `tcpdump -i` when a path reads wrong.
+      el('span', { class: 'prio' }, `priority ${p.priority} · `, copyable(p.iface, 'The WireGuard interface carrying this path')),
       el('span', { class: 'spacer' }),
       p.active ? el('span', { class: 'badge ok', text: 'active' }) : null,
       pinned === p.id ? el('span', { class: 'badge warn', text: 'pinned' }) : null,
@@ -537,10 +539,16 @@ function renderBlocklist(b, armed) {
         + 'To accept what the feed now serves, stop the frontend unit, delete blocklist-cache.json from its state directory and start it again.' })));
   }
 
-  body.append(el('p', { class: 'hint', text: `Source: ${b.source || 'unset'}. Fetched by this frontend on a timer, checked whole, and loaded into a set of its `
+  // The URL is the one thing on this card somebody takes elsewhere: to open
+  // the feed and look for the network a visitor says is theirs, which is
+  // what the exceptions list exists for. It is a constant the operator
+  // cannot change, so a click that copies it is the whole affordance.
+  body.append(el('p', { class: 'hint' },
+    'Source: ', b.source ? copyable(b.source, 'The feed this list is fetched from') : 'unset',
+    '. Fetched by this frontend on a timer, checked whole, and loaded into a set of its '
     + 'own so a refresh never touches a rule or resets a counter. TCP only, and only on the public interface, so a false positive can never drop a player '
     + 'mid-match and nothing here can see a probe or the control channel. If a visitor cannot connect and you suspect this list, add their network to the '
-    + 'exceptions in Settings rather than turning the whole thing off.' }));
+    + 'exceptions in Settings rather than turning the whole thing off.'));
 }
 
 // The cache's freshness is the whole reason it is reported: a cache serving
@@ -683,8 +691,10 @@ function renderProtect(p) {
     body.append(el('p', { class: 'hint', text: `${blocked.length} source${blocked.length === 1 ? '' : 's'} currently parked. They expire on their own; nothing needs to be cleared by hand.` }));
     body.append(el('div', { class: 'table-wrap' }, el('table', {},
       el('thead', {}, el('tr', {}, el('th', { text: 'Address' }), el('th', { text: 'Expires in' }))),
+      // The address is what gets taken away from here: into a lookup, or
+      // into a region list or the blocklist exceptions in Settings.
       el('tbody', {}, blocked.slice(0, 20).map((b) => el('tr', {},
-        el('td', { text: b.address }),
+        el('td', {}, copyable(b.address, 'Parked source address')),
         el('td', { text: b.expires_sec ? `${b.expires_sec}s` : 'soon' })))))));
   }
 }
@@ -693,14 +703,18 @@ function linkerCard(l) {
   return el('div', { class: 'card' },
     el('div', { class: 'card-head' },
       el('h2', { text: l.name || l.overlay_ip }),
-      el('span', { class: 'prio', text: `${l.overlay_ip} · via ${l.lan_ip}` }),
+      // Two addresses, copied separately: the overlay one goes into a
+      // service row or an srcds -ip, the LAN one into an ssh command.
+      el('span', { class: 'prio' },
+        copyable(l.overlay_ip, 'This host\'s overlay address'), ' · via ',
+        copyable(l.lan_ip, 'This host\'s address on the backend\'s LAN')),
       el('span', { class: 'spacer' }),
       el('span', { class: 'badge ' + (l.up ? 'ok' : 'bad'), text: l.up ? 'up' : 'not connected' }),
     ),
     el('div', { class: 'metrics' },
       el('div', { class: 'metric' },
         el('div', { class: 'k', text: 'host' }),
-        el('div', { class: 'v', text: l.hostname || '-' })),
+        el('div', { class: 'v' }, l.hostname ? copyable(l.hostname, 'The hostname this host reported') : '-')),
       el('div', { class: 'metric' },
         el('div', { class: 'k', text: 'build' }),
         el('div', { class: 'v', text: l.version || '-' })),
@@ -1104,8 +1118,18 @@ function field(label, value, onInput, opts = {}) {
   return el('label', { class: 'field' }, caption(label, opts.help), input);
 }
 
+// A value shown in the form but owned elsewhere. It is readonly rather than
+// disabled, and that is the whole reason for the shape: a disabled input
+// swallows mouse events and, in Chrome, refuses to let its text be selected,
+// so the overlay addresses could be read off the page and nothing else. A
+// click copies the value, which is what anybody reaching for one of these
+// wants - into a bootstrap file on the other host, or an `ip route get`.
 function readOnly(label, value, tip) {
-  const input = el('input', { type: 'text', value: value ?? '', readonly: 'readonly', disabled: 'disabled' });
+  const what = value == null ? '' : String(value);
+  const input = el('input', {
+    type: 'text', value: what, readonly: 'readonly', class: 'readonly',
+    title: 'Click to copy', onclick: () => copyText(what),
+  });
   return el('label', { class: 'field' }, caption(label, tip), input);
 }
 
@@ -1472,6 +1496,23 @@ async function copyText(text) {
   const ok = document.execCommand('copy');
   ta.remove();
   toast(ok ? 'Copied' : 'Could not copy. Select it and copy by hand', !ok);
+}
+
+// A value somebody will want pasted somewhere else, rendered so a click puts
+// it on the clipboard: an address into a server browser or a shell, a URL into
+// a tab, a hostname into an ssh command. The same shape the WAN badge and the
+// version line already have, in one place, so every such value looks and
+// behaves the same. The tip says the value's role before it says to click,
+// because on a card the label beside the value is often the only thing
+// naming what it is.
+function copyable(text, tip) {
+  const what = text == null ? '' : String(text);
+  return el('span', {
+    class: 'copy',
+    title: (tip ? tip + '. ' : '') + 'Click to copy',
+    text: what,
+    onclick: (e) => { e.stopPropagation(); copyText(what); },
+  });
 }
 
 // The shared secret, fetched only when somebody opens a linker's setup block.
