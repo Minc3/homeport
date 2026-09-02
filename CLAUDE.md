@@ -1764,6 +1764,16 @@ alone, because the parse of a fixed list is deterministic and the next
 attempt fails identically, which is the reasoning the linker's refused egress
 push already carries.
 
+**And the refusal is on the card, because the figures beside it are not
+about the kernel.** The refresh accepts a list, counts it and writes it to
+the cache before the load runs, so a load the kernel refused read as N
+networks, loaded, no error, while the set held the previous list or nothing
+for as long as the retry kept failing. `BlocklistStatus.LoadError` carries
+what the kernel said until a load succeeds, and the portal renders it ahead
+of a failed fetch. The doc on that type says the same: `Networks` and
+`UpdatedAt` describe the last list accepted, and only `Loaded` and
+`LoadError` together describe the set.
+
 **`blOn` is whether the table is in the kernel, not whether this process armed
 it, and the difference is a disarm.** Invariant 13 leaves the rules loaded, so
 the table goes on dropping - and recorded as unloaded, the portal said the
@@ -1772,15 +1782,37 @@ is false in the one direction that matters, while the drop counter froze
 because the sampler read the same field. The counter is the only thing that
 would have said otherwise. So an unarmed apply leaves the record alone, and
 `sampleBlocklistCounter` is what corrects it in both directions from the
-kernel itself: an error means the table is not there to read, so the record
-goes with the latch, and a reading means it is, which is what makes clearing
-it on one failed read recoverable. That readback is also the only thing that
-finds a table left behind by an armed process this one has replaced, since the
-unit runs under `Restart=always` and a restart into observe mode installs
-nothing - the hole `qcache_applied` is persisted for, closed here by reading
-the kernel rather than by writing a record down. It is why the sampler's
-blocklist half is gated on the feature being enabled rather than on `blOn`:
-gated on what it sets, a cleared record would be permanent.
+kernel itself: the kernel saying the table is not there means the record
+goes with the latch, and a reading means it is. That readback is also the
+only thing that finds a table left behind by an armed process this one has
+replaced, since the unit runs under `Restart=always` and a restart into
+observe mode installs nothing - the hole `qcache_applied` is persisted for,
+closed here by reading the kernel rather than by writing a record down. It
+is why the sampler's blocklist half is gated on the feature being enabled
+rather than on `blOn`: gated on what it sets, a cleared record would be
+permanent.
+
+**"The kernel saying so" is `sysx.TableMissing`, and the distinction from a
+read that merely failed is load-bearing.** The first version cleared the
+record on any error, reasoning that the next successful read would restore
+it. It would, but that sampler runs only while somebody has the portal open,
+and the loader trusts the record: one `nft` timing out under a large load
+while the tab was open left `blOn` false once it was closed, and the next
+refresh then accepted a new list, wrote it to the cache and the card, saw no
+table to fill, loaded nothing and forgot the retry. Every 304 after that
+loads nothing by design, so the kernel kept the old list until the feed next
+changed with the portal open again, while the card read as fresh. A failure
+that does not name the table now costs the latch and nothing else.
+
+**`protectOn` carries the same shape, and it did not until the blocklist's
+fix was read back against it.** `applyProtect` set it to `armed`, so a
+disarm recorded the still-loaded protection table as off: the card vanished
+and nothing was sampled, and a source parked mid-flood read as protection
+being off. An unarmed apply now leaves it alone, `sampleProtect` is gated on
+the record *or* the feature being enabled and sets the record from the
+readback, and its failed-read branch drops all three samples whatever the
+failure - the portal states them as live facts - while clearing the record
+only on `TableMissing`, for the reason above.
 
 **It is the one thing here that acts on data nobody in this deployment
 reviewed, so every rule around it is about bounding a bad fetch.** Everything
@@ -1810,6 +1842,21 @@ is every way this list could become wrong in the closed direction:
   real collapse is refused every time until somebody looks rather than
   ratcheting the list down one refusal at a time - which is what measuring
   against the previous fetch would have given.
+
+  A refusal is a state rather than a failure, and it is paced and reported
+  as one. Retried at `blocklistRetryEvery` it was a full download (the ETag
+  is deliberately not advanced on a refusal, since a 304 against a list this
+  host never loaded would read as confirmation), an `Error` line and an
+  event row every fifteen minutes for as long as nobody intervened - nearly
+  a hundred rows a day pushing real events out of the Activity tab.
+  `Engine.blShrinkRefused` marks the streak: the retry runs at the refresh
+  interval, the `Error` and the event are written once per streak with a
+  `Warn` on each later attempt, and the status carries the refusal
+  throughout. The hint also has to be true: the floor is measured against
+  the list in memory and the cache file is read once, at start, so deleting
+  it on a running frontend changes nothing, which is what the first hint
+  said to do. Accepting the feed's new list means stopping the unit,
+  deleting `blocklist-cache.json` and starting it again.
 - **Carrier-grade NAT and private space stripped before anything is loaded**
   (`sysx.dropNonInternet`). This is the one filter that protects people rather
   than the ruleset: a feed that ever listed a slice of `100.64/10` would drop
@@ -1889,9 +1936,18 @@ switch and the revert latch are read on every pass. That is what lets a
 changed interval or the feature being switched on take effect without the
 goroutine being torn down and restarted from a settings save, which is
 invariant 9's whole family of bugs avoided rather than guarded against. It
-runs on `baseCtx`, and `installBlocklistElements` takes `applyMu` like every
-other writer, while `applyBlocklist` calls `loadBlocklistElements` directly
-because its caller already holds it.
+runs on `baseCtx`. `installBlocklistElements` takes `Engine.blMu` rather than
+`applyMu`, and that is a lock of its own for a reason: the element load
+touches no route, and an interval set of tens of thousands of entries takes
+nft seconds, so under `applyMu` a path condemned during a refresh waited
+behind the load before `evaluate` could move traffic. What `applyMu` was
+buying there was the runner - a swap to observe landing mid-load - so
+`Reconfigure` takes `blMu` around the swap instead, and `applyBlocklist`
+takes it inside `applyMu` (always in that order) and calls
+`loadBlocklistElements` directly. `rememberBlocklist` counts the list before
+it takes the state lock for the same family of reason: the count is the whole
+parse, filter and merge, and under the write lock it stalled the decision
+loop and every probe result for the duration.
 
 **Region locks are operator-declared network lists, not a GeoIP database.**
 `Protect.Regions` is named lists of CIDRs; `Service.GeoRegions` locks a port to
@@ -2716,8 +2772,9 @@ Breaking any of these is a correctness bug even if the tests pass.
     mutexes are not reentrant. A decision running in that gap sees the new
     configuration and is right to.
 
-    **Frontend lock order is `reconfMu` then `applyMu`, never the reverse.**
-    `Run`'s goroutine takes only `applyMu`, so there is no cycle. `applyMu` is
+    **Frontend lock order is `reconfMu` then `applyMu` then `blMu`, never the
+    reverse.** `Run`'s goroutine takes only `applyMu`, and the blocklist
+    refresher only `blMu`, so there is no cycle. `applyMu` is
     deliberately not taken inside `applyActivePath` or `applyPlumbing`: their
     callers hold it across several groups of shell-outs precisely so a decision
     cannot land between them.
@@ -3080,9 +3137,14 @@ which changes on a timer. `blocklist-cache.json` is the last good list with the
 time it was confirmed current and the feed's ETag: agent state, not
 configuration, which is why it is here rather than in the database - it is what
 the frontend fetched, not what the operator decided, and putting it in the
-config blob would bump `cfgVersion` on every refresh. All three are removed by
-`uninstall.sh`, which deletes by name rather than emptying the directory, so a
-new state file has to be added there or it is left behind.
+config blob would bump `cfgVersion` on every refresh. It is written to
+`blocklist-cache.json.tmp` and renamed over the target, because it is
+rewritten on every refresh, a 304 included, and it is what boot-time
+protection installs when the feed is unreachable: written in place, a crash
+mid-write left a truncated file the loader refused whole and a restart with
+nothing to fall back on. All four names are removed by `uninstall.sh`, which
+deletes by name rather than emptying the directory, so a new state file has
+to be added there or it is left behind.
 
 **Backend** - no database. `backend-config.json` (cached pushed config, so a
 frontend outage does not leave it unable to route replies after a restart),
@@ -3435,7 +3497,11 @@ where a subtle regression would be invisible in production until an outage:
   claimed: the same bytes to `POST /api/config/check` and `PUT /api/config`, an
   accepted configuration and three refusals (two paths on one fwmark, a setting
   this build has never heard of, two configurations in one file), with the
-  error strings compared on every refusal. Without it the check can be given a
+  error strings compared on every refusal. A stray `}` or `]` after the
+  configuration is refused beside them and a trailing newline is not:
+  `json.Decoder.More` peeks at the next byte and answers false for a closing
+  delimiter, so the first guard refused a second object and passed the
+  ordinary hand-edit corruption, and `Token` is what reads to the end. Without it the check can be given a
   guard the save has not - which is what happened, and what stayed green. The
   door is pinned too: an unauthenticated request is refused, because this
   endpoint hands back the whole configuration with the notification token in it
@@ -3489,7 +3555,12 @@ where a subtle regression would be invisible in production until an outage:
   the flags sit ahead of the verb, which is the shape `args[0]` misread.
   `engine/protect_test.go` holds the idle gate: with nobody watching no `nft`
   runs at all, a `Status` call resumes it on the next tick, and protection
-  being off still samples nothing whether or not the portal is open.
+  being off still samples nothing whether or not the portal is open. And the
+  record's shape, mirrored from the blocklist's: a disarm leaves protection
+  recorded as loaded and removes nothing, a failed read drops every sample
+  and keeps the record unless the kernel says the table is missing, and a
+  table left behind by a replaced process is found by the readback with the
+  record cleared.
   `store/path_samples_test.go` holds that batching the tick's rows into one
   transaction did not cost the graph - every path's sample lands under the one
   timestamp and reads back per path - and that a tick with no paths writes
@@ -3638,6 +3709,16 @@ where a subtle regression would be invisible in production until an outage:
   cannot be read and restoring it when it can, which is what makes the first
   half safe. Beside them the staleness verdict, taken from the constant at
   both edges of the window and withheld for a list never fetched.
+
+  Then what the first pass at that record got wrong. A readback that failed
+  without naming the table keeps the record and costs the latch, and the
+  refresh after it still loads; a load the kernel refused is on the status
+  until a load succeeds; a shrink refusal is retried at the refresh interval
+  rather than the failure cadence, writes one event per streak, and the
+  streak ends when a list is accepted; the cache is replaced whole with no
+  temporary file left beside it; and the refresher never waits on `applyMu`,
+  while the runner swap does wait on a load in progress, which is the one
+  thing `applyMu` was buying it.
 - `web/blocklist_validate_test.go` - the save side: enabled with no public
   interface is refused with the reason in the message, the refresh interval is
   bounded at both ends with zero still meaning the default, an exception that

@@ -464,7 +464,7 @@ if [ "$KEEP_CONFIG" -eq 0 ] || [ "$KEEP_STATE" -eq 0 ]; then
 
 	if [ "$KEEP_STATE" -eq 0 ]; then
 		case "$ROLE" in
-		frontend) files="failover.db failover.db-wal failover.db-shm ruleset.nft egress.nft protect.nft blocklist.nft blocklist-feed.nft blocklist-cache.json" ;;
+		frontend) files="failover.db failover.db-wal failover.db-shm ruleset.nft egress.nft protect.nft blocklist.nft blocklist-feed.nft blocklist-cache.json blocklist-cache.json.tmp" ;;
 		backend) files="backend-config.json usage-buffer.jsonl meter-state.json return.nft egress.nft" ;;
 		linker) files="linker-return.nft linker-egress.nft" ;;
 		esac

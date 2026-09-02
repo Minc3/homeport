@@ -160,6 +160,7 @@ func (e *Engine) loadBlocklistCache() {
 		e.log.Warn("cannot parse the cached blocklist; it will be fetched again", "err", err)
 		return
 	}
+	e.rememberBlocklist(c.Networks)
 	e.mu.Lock()
 	// The list is kept whatever served it, because an old list beats none and
 	// that is this feature's rule everywhere else. The age and the ETag are
@@ -175,7 +176,6 @@ func (e *Engine) loadBlocklistCache() {
 	// Source was written and never read until this. That is the shape of
 	// record that starts lying without anything failing, which is exactly
 	// what blocklistStaleAfter was doing one commit ago.
-	e.rememberBlocklist(c.Networks)
 	if c.Source == e.blURL {
 		e.blUpdated = c.Fetched
 		e.blEtag = c.ETag
@@ -194,12 +194,29 @@ func (e *Engine) loadBlocklistCache() {
 // meant parsing, filtering and sorting several thousand networks under that
 // lock, every second, for a number that changes a few times a day.
 //
-// The caller holds e.mu for writing.
+// It takes the lock itself, after the count, and that is the same reasoning
+// from the other side: the count is the whole parse, filter and merge over
+// up to two hundred thousand entries, and held under the write lock it
+// stalled the decision loop, every probe result and every status request
+// for the duration - strictly worse than the read lock Status used to hold.
+// The caller must not hold e.mu.
 func (e *Engine) rememberBlocklist(nets []string) {
-	e.blNetworks = nets
-	e.blCount = sysx.CountBlocklistElements(nets)
+	count := sysx.CountBlocklistElements(nets)
+	e.mu.Lock()
+	e.blNetworks, e.blCount = nets, count
+	e.mu.Unlock()
 }
 
+// saveBlocklistCache writes the last good list, whole or not at all.
+//
+// A temporary file renamed over the target, because this file is what
+// boot-time protection installs when the feed is unreachable and it is
+// rewritten on every refresh, a 304 included: written in place, a crash or a
+// power cut mid-write left a truncated file that loadBlocklistCache refused
+// whole, and the restart came up with an empty set and nothing on disk to
+// fall back on - which is the outage the cache exists to prevent. The rename
+// is atomic on the filesystems a state directory lives on, so what the next
+// start reads is either the previous list or this one.
 func (e *Engine) saveBlocklistCache(c blocklistCache) {
 	raw, err := json.Marshal(c)
 	if err != nil {
@@ -207,8 +224,14 @@ func (e *Engine) saveBlocklistCache(c blocklistCache) {
 		return
 	}
 	path := filepath.Join(e.stateDir, blocklistCacheFile)
-	if err := os.WriteFile(path, raw, 0o644); err != nil {
-		e.log.Error("cannot write the blocklist cache; a restart will refetch it", "err", err, "path", path)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		e.log.Error("cannot write the blocklist cache; a restart will refetch it", "err", err, "path", tmp)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		e.log.Error("cannot replace the blocklist cache; a restart will refetch it", "err", err, "path", path)
+		_ = os.Remove(tmp)
 	}
 }
 
@@ -252,6 +275,7 @@ func (e *Engine) maybeRefreshBlocklist(ctx context.Context) {
 	updated, lastTry, lastErr := e.blUpdated, e.blLastTry, e.blLastErr
 	have := len(e.blNetworks)
 	loadFailed := e.blLoadFailed
+	shrink := e.blShrinkRefused
 	e.mu.RUnlock()
 
 	// A reverted engine installs and repairs nothing, and fetching a list it
@@ -276,7 +300,17 @@ func (e *Engine) maybeRefreshBlocklist(ctx context.Context) {
 	}
 
 	due := updated.Add(blocklistRefreshInterval(cfg.Blocklist))
-	if lastErr != "" || have == 0 {
+	switch {
+	case shrink:
+		// A shrink refusal is a state, not a failure: the feed serves the
+		// same short list until somebody looks, so retrying at the failure
+		// cadence bought nothing and cost a full download, an Error line
+		// and an event row every fifteen minutes. The ETag is deliberately
+		// not advanced on a refusal - a 304 against a list this host never
+		// loaded would read as confirmation - so each attempt is a full
+		// body, at the interval the operator chose.
+		due = lastTry.Add(blocklistRefreshInterval(cfg.Blocklist))
+	case lastErr != "" || have == 0:
 		due = lastTry.Add(blocklistRetryEvery)
 	}
 	if now.Before(due) {
@@ -348,19 +382,45 @@ func (e *Engine) refreshBlocklist(ctx context.Context) {
 		e.blLastTry = now
 		e.blLastErr = fmt.Sprintf("feed returned %d networks against %d loaded; refused as an implausible shrink",
 			len(networks), previous)
+		first := !e.blShrinkRefused
+		e.blShrinkRefused = true
 		e.mu.Unlock()
-		e.log.Error("the blocklist feed shrank implausibly; the previous list stays loaded",
-			"returned", len(networks), "loaded", previous, "source", e.blURL,
-			"hint", "check the feed by hand; clearing "+blocklistCacheFile+" accepts whatever it now serves")
-		_ = e.st.AddEvent(store.EventSystem, 0,
-			"blocklist refresh refused: the feed returned %d networks against %d loaded", len(networks), previous)
+		// Once per streak at Error with an event beside it, because it is
+		// the one state here that does not resolve itself and somebody has
+		// to look. Every later attempt is the same refusal of the same list,
+		// and a line per attempt for as long as nobody intervenes is the
+		// peer-driven journal volume ControlServer.throttle exists to stop,
+		// with the feed as the peer. The status carries the refusal
+		// throughout, so the portal is not waiting on the log.
+		//
+		// The hint has to be true. The floor is measured against the list
+		// in memory, and the cache file is read once, at start: deleting it
+		// on a running frontend changes nothing, and the first version of
+		// this said it did. Accepting the feed's new list means starting
+		// with no list, which is exactly what a stopped unit, a deleted
+		// cache and a start again produce.
+		if first {
+			e.log.Error("the blocklist feed shrank implausibly; the previous list stays loaded",
+				"returned", len(networks), "loaded", previous, "source", e.blURL,
+				"hint", "check the feed by hand; to accept what it now serves, stop the unit, delete "+
+					blocklistCacheFile+" from the state directory and start it again")
+			_ = e.st.AddEvent(store.EventSystem, 0,
+				"blocklist refresh refused: the feed returned %d networks against %d loaded", len(networks), previous)
+		} else {
+			e.log.Warn("the blocklist feed is still serving an implausibly short list; the previous list stays loaded",
+				"returned", len(networks), "loaded", previous, "source", e.blURL)
+		}
 		return
 	}
 
-	e.mu.Lock()
+	// The count runs outside the lock; see rememberBlocklist. The window in
+	// which the list is new and the age is not is harmless, because nothing
+	// reads the two together except Status, which renders either truthfully.
 	e.rememberBlocklist(networks)
+	e.mu.Lock()
 	e.blUpdated, e.blLastTry, e.blLastErr = now, now, ""
 	e.blEtag = newEtag
+	e.blShrinkRefused = false
 	loaded := e.blCount
 	cache := blocklistCache{Source: e.blURL, Fetched: now, ETag: newEtag, Networks: networks}
 	e.mu.Unlock()
@@ -492,12 +552,15 @@ func (e *Engine) applyBlocklist(ctx context.Context, cfg model.Config, gated, re
 		}
 		sysx.RemoveBlocklistRuleset(ctx, real)
 		e.mu.Lock()
-		e.blOn = false
-		e.blApplied = ""
-		e.blCounter = model.ProtectCounter{}
+		e.forgetBlocklistTable()
 		e.mu.Unlock()
 		return
 	}
+
+	// Against the refresher, which loads elements under this lock alone. The
+	// caller's applyMu does not cover it, and that is the point of blMu.
+	e.blMu.Lock()
+	defer e.blMu.Unlock()
 
 	// The same latch applyProtect carries, for a weaker version of the same
 	// reason: a rebuild here resets one counter rather than unparking every
@@ -557,16 +620,36 @@ func (e *Engine) applyBlocklist(ctx context.Context, cfg model.Config, gated, re
 	e.wakeBlocklist()
 }
 
-// installBlocklistElements loads the current list into the kernel, taking the
-// apply lock. This is the refresher's entry point; applyBlocklist calls
-// loadBlocklistElements directly because its caller already holds the lock.
+// installBlocklistElements loads the current list into the kernel. This is
+// the refresher's entry point; applyBlocklist calls loadBlocklistElements
+// directly because it already holds the lock.
+//
+// blMu and not applyMu, deliberately. The load touches no route, and an
+// interval set of tens of thousands of elements takes nft seconds: under
+// applyMu a path condemned during a refresh waited behind it before evaluate
+// could move traffic. What applyMu was buying here was the runner - a swap to
+// observe landing mid-load - and Reconfigure now takes blMu around the swap
+// for exactly that, so the runner captured below is the one in force for the
+// whole load.
 func (e *Engine) installBlocklistElements(ctx context.Context) {
-	e.applyMu.Lock()
-	defer e.applyMu.Unlock()
+	e.blMu.Lock()
+	defer e.blMu.Unlock()
 	e.mu.RLock()
 	gated := e.runner
 	e.mu.RUnlock()
 	e.loadBlocklistElements(ctx, gated)
+}
+
+// forgetBlocklistTable records that the table is not in the kernel: the
+// feature switched off, the revert that removed it, or the readback saying it
+// has gone. One spelling for the three, because the record is three fields
+// that describe one thing and the next field added to it - the retry latch,
+// say - has to be cleared at every site or the portal assembles a state from
+// fields reset on different occasions. The caller holds e.mu for writing.
+func (e *Engine) forgetBlocklistTable() {
+	e.blOn = false
+	e.blApplied = ""
+	e.blCounter = model.ProtectCounter{}
 }
 
 // loadBlocklistElements writes the set contents in one nft transaction.
@@ -580,7 +663,7 @@ func (e *Engine) installBlocklistElements(ctx context.Context) {
 // do unarmed, and would leave a feed file on disk describing a set the kernel
 // does not have.
 //
-// The caller holds applyMu.
+// The caller holds blMu.
 func (e *Engine) loadBlocklistElements(ctx context.Context, gated sysx.Runner) {
 	e.mu.RLock()
 	on := e.blOn
@@ -611,6 +694,7 @@ func (e *Engine) loadBlocklistElements(ctx context.Context, gated sysx.Runner) {
 		_ = e.st.AddEvent(store.EventSystem, 0, "blocklist networks not loaded: %v", err)
 		e.mu.Lock()
 		e.blLoadFailed = time.Now()
+		e.blLoadErr = err.Error()
 		e.mu.Unlock()
 		return
 	}
@@ -624,6 +708,7 @@ func (e *Engine) loadBlocklistElements(ctx context.Context, gated sysx.Runner) {
 func (e *Engine) forgetBlocklistLoadFailure() {
 	e.mu.Lock()
 	e.blLoadFailed = time.Time{}
+	e.blLoadErr = ""
 	e.mu.Unlock()
 }
 
@@ -635,16 +720,29 @@ func (e *Engine) sampleBlocklistCounter(ctx context.Context) {
 		e.log.Debug("cannot read blocklist state", "err", err)
 		// The table may be gone underneath the agent. Dropping the latch makes
 		// the next save load it again rather than skipping it as unchanged,
-		// exactly as sampleProtect does - and the record of it being loaded
-		// goes with it, because this readback is the only thing here that
-		// reports the kernel rather than this agent's belief about it.
-		// Leaving it set had the portal claim the rules were in the kernel
-		// immediately after the read proved they were not, and had every
-		// refresh load elements into a table that is not there.
+		// exactly as sampleProtect does - and when the kernel says the table
+		// is not there, the record of it being loaded goes with it, because
+		// this readback is the only thing here that reports the kernel rather
+		// than this agent's belief about it. Leaving it set had the portal
+		// claim the rules were in the kernel immediately after the read
+		// proved they were not, and had every refresh load elements into a
+		// table that is not there.
+		//
+		// Only when the kernel says so, and not on any failure, because the
+		// loader trusts this record and this sampler runs only while the
+		// portal is open. Cleared by one slow nft, it stayed cleared once the
+		// tab was closed; the next refresh then wrote the new list to the
+		// cache and the count to the card, saw no table to fill, loaded
+		// nothing and forgot the retry, and every 304 after that loads no
+		// elements by design - so the kernel kept the old list for as long
+		// as it took the feed to change with the portal open again, while the
+		// card read as fresh. A failure that says nothing about the table
+		// costs the latch and nothing else.
 		e.mu.Lock()
-		e.blOn = false
 		e.blApplied = ""
-		e.blCounter = model.ProtectCounter{}
+		if sysx.TableMissing(err) {
+			e.forgetBlocklistTable()
+		}
 		e.mu.Unlock()
 		return
 	}
@@ -677,6 +775,7 @@ func (e *Engine) blocklistStatus() *model.BlocklistStatus {
 		UpdatedAt:  e.blUpdated,
 		LastTry:    e.blLastTry,
 		LastError:  e.blLastErr,
+		LoadError:  e.blLoadErr,
 		Loaded:     e.blOn,
 		Packets:    e.blCounter.Packets,
 		Bytes:      e.blCounter.Bytes,

@@ -431,14 +431,7 @@ type connOverride struct {
 func (s ProtectSpec) connOverrides() []connOverride {
 	var out []connOverride
 	taken := map[string]bool{}
-	uniq := func(base string) string {
-		name := base
-		for n := 2; taken[name]; n++ {
-			name = fmt.Sprintf("%s_%d", base, n)
-		}
-		taken[name] = true
-		return name
-	}
+	uniq := func(base string) string { return uniqueName(taken, base) }
 	for _, sv := range s.Services {
 		if !sv.overridesConnRate() && !sv.overridesConnCount() {
 			continue
@@ -717,13 +710,24 @@ func (p *parkChains) target(comment string) string {
 	if p.used == nil {
 		p.used = map[string]bool{}
 	}
-	base := foldSetName("park_", comment)
-	name := base
-	for i := 2; p.used[name]; i++ {
-		name = fmt.Sprintf("%s_%d", base, i)
-	}
-	p.used[name] = true
+	name := uniqueName(p.used, foldSetName("park_", comment))
 	p.chains = append(p.chains, parkChain{name: name, comment: comment})
+	return name
+}
+
+// uniqueName claims base in taken, suffixing it numerically from 2 when the
+// bare name is already held. One spelling for the per-service sets and the
+// park chains alike, because the two have to suffix a collision identically
+// or a service whose folded name collides gets a set named one way and a
+// chain named another, which loads fine and cannot be paired up by a reader
+// of `nft list ruleset`. Written out twice, that was a property of two loops
+// staying in step by hand.
+func uniqueName(taken map[string]bool, base string) string {
+	name := base
+	for n := 2; taken[name]; n++ {
+		name = fmt.Sprintf("%s_%d", base, n)
+	}
+	taken[name] = true
 	return name
 }
 

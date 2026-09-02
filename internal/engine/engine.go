@@ -285,7 +285,27 @@ type Engine struct {
 	// the reload, and the feed republishes about daily against a four hour
 	// interval, so nearly every refresh is a 304 that loads no elements.
 	blLoadFailed time.Time
-	blCounter    model.ProtectCounter
+	// blLoadErr is what the kernel said when it refused, kept beside the time
+	// so the portal can show it: the refresh commits the new list and its
+	// count before the load runs, so without this a refused load read as N
+	// networks, loaded, no error, while the kernel dropped nothing.
+	blLoadErr string
+	// blShrinkRefused is set while the feed keeps serving a list the shrink
+	// guard refuses. The state does not resolve itself, so the refusal is
+	// retried at the refresh interval rather than the failure cadence and
+	// said out loud once per streak rather than on every attempt: at fifteen
+	// minutes it was a full download, an Error line and an event row nearly
+	// a hundred times a day, pushing real events out of the Activity tab.
+	blShrinkRefused bool
+	blCounter       model.ProtectCounter
+	// blMu serialises the two blocklist writers, applyBlocklist and the
+	// refresher, and it is a lock of its own rather than applyMu because the
+	// element load touches no route: an interval set of tens of thousands of
+	// entries takes nft seconds, and under applyMu a path condemned during a
+	// refresh waited behind it before traffic moved. Always after applyMu
+	// where both are held; the runner swap takes it too, so a load captured
+	// with the armed runner finishes before the mode goes to observe.
+	blMu sync.Mutex
 	// blWake asks the refresher to reconsider now. Buffered one deep and
 	// written without blocking, like wake.
 	blWake chan struct{}
@@ -1279,10 +1299,18 @@ func (e *Engine) applyProtect(ctx context.Context, cfg model.Config, gated, real
 		return
 	}
 	e.mu.Lock()
-	e.protectOn = armed
 	if armed {
+		e.protectOn = true
 		e.protectApplied = ruleset
 	} else {
+		// Observe mode ran no nft, so protectOn is left where it was, for the
+		// reason applyBlocklist records: disarming is not a teardown, so a
+		// table loaded while armed is still in the kernel, still dropping and
+		// still parking. Recorded as unloaded, the card vanished and nothing
+		// was sampled, so a source parked mid-flood read as protection being
+		// off. sampleProtect corrects the record from the kernel itself. The
+		// latch still goes, because whatever is loaded is no longer this
+		// ruleset.
 		e.protectApplied = ""
 	}
 	e.mu.Unlock()
@@ -1392,12 +1420,14 @@ const protectSampleIdleAfter = 30 * time.Second
 // drops the stale samples, so the re-test happens as the portal opens.
 func (e *Engine) sampleProtect(ctx context.Context) {
 	e.mu.RLock()
-	on := e.protectOn
-	// The blocklist's half is gated on the feature being enabled rather than
-	// on blOn, and that is not a widening for its own sake: the readback is
-	// what sets blOn, so gating the readback on it would make a cleared one
-	// permanent - and a table left loaded by an armed process this one has
-	// replaced would never be found at all.
+	// Each half is gated on its table being recorded as loaded or on its
+	// feature being enabled, and the second clause is not a widening for its
+	// own sake: the readback is what sets the record, so gating it on the
+	// record alone would make a cleared one permanent - and a table left
+	// loaded by an armed process this one has replaced would never be found
+	// at all. The record alone still holds a disarmed site's sampling open,
+	// because disarming is not a teardown and the table is still dropping.
+	on := e.protectOn || e.cfg.Protect.Enabled
 	blEnabled := e.cfg.Blocklist.Enabled
 	e.mu.RUnlock()
 	if !on && !blEnabled {
@@ -1422,13 +1452,28 @@ func (e *Engine) sampleProtect(ctx context.Context) {
 		// nft restarted. Dropping the reload latch makes the next save load
 		// the ruleset again instead of skipping it as unchanged; a transient
 		// read failure costs one reload, which was every save's price before
-		// the latch existed.
+		// the latch existed. The samples go with it whatever the failure,
+		// because the portal states them as live facts - parked sources with
+		// seconds left, an engaged lock that reads as the service being down
+		// - and a reading the kernel would not confirm is not one to serve.
+		// The record of the table goes only when the kernel says the table
+		// is not there: cleared on a timeout it is cleared by one slow nft,
+		// and the sampler that would set it again runs only while the
+		// portal is open.
 		e.mu.Lock()
 		e.protectApplied = ""
+		e.protectCounters, e.protectBlocked, e.protectGeoLocked = nil, nil, nil
+		if sysx.TableMissing(err) {
+			e.protectOn = false
+		}
 		e.mu.Unlock()
 		return
 	}
 	e.mu.Lock()
+	// And upward, which is the half that finds a table left behind by an
+	// armed process this one has replaced, and a table still loaded across a
+	// disarm.
+	e.protectOn = true
 	e.protectCounters = counters
 	e.protectBlocked = blocked
 	e.protectGeoLocked = locked
@@ -2280,6 +2325,11 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 	// these mutexes are not reentrant; evaluate running in the gap sees the new
 	// configuration and is correct to.
 	e.applyMu.Lock()
+	// And blMu, for the refresher: it loads elements under that lock alone,
+	// with a runner captured before it started, and the swap has to wait for
+	// that load to finish or elements go in with the armed runner after the
+	// mode has gone to observe.
+	e.blMu.Lock()
 	e.mu.Lock()
 	prevMode := e.cfg.Mode
 	e.cfg = cfg
@@ -2292,6 +2342,7 @@ func (e *Engine) Reconfigure(cfg model.Config) error {
 	ctx := e.baseCtx
 	dataPlane := e.dataPlane
 	e.mu.Unlock()
+	e.blMu.Unlock()
 	e.applyMu.Unlock()
 
 	// The persisted copy comes off with it, or the next restart would start
@@ -2526,6 +2577,10 @@ func (e *Engine) Revert(ctx context.Context) {
 	// between two of the removals below. Always after reconfMu; see applyMu.
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
+	// And the refresher, which would otherwise load elements into the
+	// blocklist table between its removal below and the record of it going.
+	e.blMu.Lock()
+	defer e.blMu.Unlock()
 
 	// Latched before anything is torn down, so a reconcile or evaluate parked
 	// on applyMu behind this cannot repair the removals the moment it is
@@ -2609,9 +2664,7 @@ func (e *Engine) Revert(ctx context.Context) {
 	// so re-arming reloads it without another fetch, but the counter
 	// describes a rule that no longer exists and the latch must not let the
 	// next save skip a reload.
-	e.blOn = false
-	e.blApplied = ""
-	e.blCounter = model.ProtectCounter{}
+	e.forgetBlocklistTable()
 	e.mu.Unlock()
 
 	_ = e.st.AddEvent(store.EventSystem, 0,

@@ -797,3 +797,197 @@ func TestACacheFromAnotherSourceKeepsTheListAndNotTheAge(t *testing.T) {
 		t.Errorf("another host's ETag %q was kept to be sent to this one", moved.blEtag)
 	}
 }
+
+// A readback that merely failed says nothing about the table, and the loader
+// trusts the record this sampler keeps. Cleared on any failure, one slow nft
+// while the portal was open left the record cleared once the tab was closed,
+// since nothing else sets it: the next refresh then accepted a new list,
+// wrote it to the cache and the card, saw no table to fill, loaded nothing
+// and forgot the retry - and every 304 after that loads nothing by design.
+// The kernel kept the old list while the card read as fresh. So a failure
+// that does not name the table costs the latch and nothing else, and the
+// refresh that follows it still loads.
+func TestATransientReadbackFailureKeepsTheLoadedRecord(t *testing.T) {
+	dir := t.TempDir()
+	e, q := blocklistEngine(t, dir)
+	const list = "nft -j -t list table ip failover_blocklist"
+	q.fails = map[string]string{list: "Error: timed out"}
+	e.blOn, e.blApplied = true, "table ip failover_blocklist {}"
+
+	e.sampleBlocklistCounter(context.Background())
+	if !e.blOn {
+		t.Fatal("one failed read that said nothing about the table cleared the record of it being loaded")
+	}
+	if e.blApplied != "" {
+		t.Error("the reload latch survived a failed read; the next save should reload rather than trust it")
+	}
+
+	e.rememberBlocklist([]string{"203.0.113.0/24"})
+	e.installBlocklistElements(context.Background())
+	if got := q.count("nft -f " + filepath.Join(dir, "blocklist-feed.nft")); got != 1 {
+		t.Errorf("a refresh after a transient readback failure loaded the elements %d times, want 1", got)
+	}
+}
+
+// The figures on the card describe the list the frontend accepted, and the
+// list is accepted before it is loaded. So a load the kernel refused used to
+// read as N networks, loaded, no error, while the set held the previous list
+// or nothing, for as long as the retry kept failing. The refusal has to be in
+// the status, and has to leave it once a load succeeds.
+func TestARefusedElementLoadIsReportedInStatus(t *testing.T) {
+	dir := t.TempDir()
+	e, q := blocklistEngine(t, dir)
+	feed := "nft -f " + filepath.Join(dir, "blocklist-feed.nft")
+	q.fails = map[string]string{feed: "Error: Could not process rule"}
+	e.rememberBlocklist([]string{"203.0.113.0/24"})
+
+	e.applyBlocklist(context.Background(), e.cfg, e.runner, e.real)
+	st := e.blocklistStatus()
+	if st.LoadError == "" {
+		t.Fatal("a load the kernel refused is not reported; the card reads as loaded and dropping")
+	}
+	if !st.Loaded {
+		t.Error("the table itself is fine and should still read as loaded")
+	}
+
+	delete(q.fails, feed)
+	e.blUpdated, e.blLastTry = time.Now(), time.Now()
+	e.blLoadFailed = time.Now().Add(-blocklistRetryEvery - time.Second)
+	e.maybeRefreshBlocklist(context.Background())
+	if st := e.blocklistStatus(); st.LoadError != "" {
+		t.Errorf("a load that succeeded left the refusal on the card: %q", st.LoadError)
+	}
+}
+
+// A shrink refusal is a state rather than a failure: the feed serves the same
+// short list until somebody looks. Retried at the failure cadence it was a
+// full download, an Error line and an event row every fifteen minutes for as
+// long as nobody intervened - nearly a hundred event rows a day, pushing real
+// events out of the Activity tab. It is retried at the refresh interval, said
+// out loud once per streak, and the streak ends when a list is accepted.
+func TestAShrinkRefusalIsRetriedAtTheIntervalAndReportedOnce(t *testing.T) {
+	e, _ := blocklistEngine(t, t.TempDir())
+	var loaded []string
+	for i := 0; i < 10; i++ {
+		loaded = append(loaded, fmt.Sprintf("203.0.%d.0/24", i))
+	}
+	e.rememberBlocklist(loaded)
+
+	feed := &feedServer{body: "198.51.100.0/24\n"}
+	e.blURL = feed.start(t).URL
+	e.blClient = http.DefaultClient
+
+	e.refreshBlocklist(context.Background())
+	e.refreshBlocklist(context.Background())
+	if !e.blShrinkRefused {
+		t.Fatal("two refusals did not record a streak")
+	}
+	events, err := e.st.Events(50)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	refusals := 0
+	for _, ev := range events {
+		if strings.Contains(fmt.Sprintf("%+v", ev), "refused") {
+			refusals++
+		}
+	}
+	if refusals != 1 {
+		t.Errorf("two refusals in one streak wrote %d event rows, want 1", refusals)
+	}
+
+	// Past the failure cadence and inside the interval: not due.
+	e.blLastTry = time.Now().Add(-blocklistRetryEvery - time.Minute)
+	before := feed.requests
+	e.maybeRefreshBlocklist(context.Background())
+	if feed.requests != before {
+		t.Error("a shrink refusal was retried at the failure cadence rather than the refresh interval")
+	}
+	// Past the interval: due.
+	e.blLastTry = time.Now().Add(-blocklistRefreshInterval(e.cfg.Blocklist) - time.Minute)
+	e.maybeRefreshBlocklist(context.Background())
+	if feed.requests != before+1 {
+		t.Errorf("a shrink refusal was not retried at the refresh interval: %d requests, want %d", feed.requests, before+1)
+	}
+
+	// The feed comes right and the streak ends with it, so the next refusal
+	// is a new one and is said out loud again.
+	feed.body = strings.Join(loaded, "\n") + "\n"
+	e.refreshBlocklist(context.Background())
+	if e.blShrinkRefused {
+		t.Error("an accepted list did not end the refusal streak")
+	}
+}
+
+// The cache is what boot-time protection installs when the feed is
+// unreachable, and it is rewritten on every refresh. Written in place, a
+// crash mid-write left a truncated file the loader refused whole, and the
+// restart came up with nothing on disk to fall back on. It is written beside
+// the target and renamed over it, so nothing is left behind and what is read
+// back is always a whole list.
+func TestBlocklistCacheIsReplacedWholeRatherThanRewrittenInPlace(t *testing.T) {
+	dir := t.TempDir()
+	e, _ := blocklistEngine(t, dir)
+	e.saveBlocklistCache(blocklistCache{Source: e.blURL, Networks: []string{"203.0.113.0/24"}})
+	e.saveBlocklistCache(blocklistCache{Source: e.blURL, Networks: []string{"203.0.113.0/24", "198.51.100.0/24"}})
+
+	if _, err := os.Stat(filepath.Join(dir, blocklistCacheFile+".tmp")); !os.IsNotExist(err) {
+		t.Error("the temporary file was left beside the cache")
+	}
+	e2, _ := blocklistEngine(t, dir)
+	e2.loadBlocklistCache()
+	if len(e2.blNetworks) != 2 {
+		t.Errorf("read back %d networks from the replaced cache, want 2", len(e2.blNetworks))
+	}
+}
+
+// The element load touches no route and can take nft seconds for a large
+// interval set. Under applyMu a path condemned during a refresh waited behind
+// it before evaluate could move traffic, so the refresher holds a lock of its
+// own and never the one the decision loop needs.
+func TestARefreshDoesNotWaitOnTheRouteWriters(t *testing.T) {
+	e, _ := blocklistEngine(t, t.TempDir())
+	e.rememberBlocklist([]string{"203.0.113.0/24"})
+	e.blOn = true
+
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		e.installBlocklistElements(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the refresher waited on applyMu, which the decision loop needs to move traffic")
+	}
+}
+
+// What applyMu was buying the refresher was the runner: a swap to observe
+// landing mid-load put elements in with the armed runner after the mode had
+// changed. Taking the refresher off applyMu keeps that only if the swap waits
+// on the refresher's own lock instead.
+func TestTheRunnerSwapWaitsOnARefreshInProgress(t *testing.T) {
+	e, _ := blocklistEngine(t, t.TempDir())
+
+	e.blMu.Lock()
+	done := make(chan struct{})
+	cfg := e.cfg
+	cfg.Mode = model.ModeObserve
+	go func() {
+		_ = e.Reconfigure(cfg)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("the runner swap did not wait for a load in progress; elements could go in armed after a disarm")
+	case <-time.After(300 * time.Millisecond):
+	}
+	e.blMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the swap never completed once the load finished")
+	}
+}

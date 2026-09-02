@@ -1177,11 +1177,14 @@ type BlockedSource struct {
 
 // BlocklistStatus is what the feed-driven drop list is currently doing.
 //
-// Networks and UpdatedAt describe the list actually loaded into the kernel,
-// not the last thing fetched: a refusal by the shrink guard or by nft leaves
-// both where they were, which is the point of them. LastError and LastTry
-// describe the most recent attempt, so a feed that has been failing for a
-// week reads as a working list going stale rather than as either alone.
+// Networks and UpdatedAt describe the last list the frontend accepted, not
+// the last thing fetched: a refusal by the shrink guard leaves both where
+// they were, which is the point of them. What they do not describe is the
+// kernel. The list is accepted before it is loaded, so a load the kernel
+// refuses leaves both moved on while the set holds the previous list, and
+// LoadError is what says so until the retry succeeds. LastError and LastTry
+// describe the most recent fetch, so a feed that has been failing for a week
+// reads as a working list going stale rather than as either alone.
 type BlocklistStatus struct {
 	// Networks is how many the loaded set holds, and Exceptions how many the
 	// operator's allow set does.
@@ -1209,6 +1212,13 @@ type BlocklistStatus struct {
 	// means it succeeded.
 	LastTry   time.Time `json:"last_try,omitempty"`
 	LastError string    `json:"last_error,omitempty"`
+
+	// LoadError is what the kernel said when it refused the accepted list,
+	// empty once a load has succeeded. It is the difference between the
+	// figures above and the set: without it a refused load read as N
+	// networks, loaded, no error, while the kernel dropped nothing for as
+	// long as the retry kept failing.
+	LoadError string `json:"load_error,omitempty"`
 
 	// Loaded reports that the rules are really in the kernel, which is not the
 	// same as this process having armed them: disarming is not a teardown

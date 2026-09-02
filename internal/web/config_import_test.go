@@ -359,9 +359,21 @@ func TestCheckConfigRefusesAnythingAfterTheConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	rec := sendRaw(t, srv, http.MethodPost, "/api/config/check", string(raw)+"GARBAGE")
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status %d, want a refusal: %s", rec.Code, rec.Body.String())
+	// A stray closing delimiter is the shape a hand edit leaves, and it is the
+	// one json.Decoder.More does not see: it peeks at the next byte and
+	// answers false for `}` and `]`, so the first version of this guard
+	// refused a second object and passed the ordinary corruption.
+	for _, trailing := range []string{"GARBAGE", "}", "]", "\n}", string(raw)} {
+		rec := sendRaw(t, srv, http.MethodPost, "/api/config/check", string(raw)+trailing)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("trailing %q: status %d, want a refusal: %s", trailing, rec.Code, rec.Body.String())
+		}
+	}
+	// And whitespace after the value is not content: every export ends in a
+	// newline.
+	rec := sendRaw(t, srv, http.MethodPost, "/api/config/check", string(raw)+"\n  \n")
+	if rec.Code != http.StatusOK {
+		t.Errorf("a trailing newline was refused: status %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

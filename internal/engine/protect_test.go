@@ -458,3 +458,85 @@ func TestPollingDoesNotWakeTheProtectionSampleEveryRequest(t *testing.T) {
 	default:
 	}
 }
+
+// Invariant 13 for the protection table, and the fix the blocklist got
+// first: disarming is not a teardown, so a table loaded while armed is still
+// in the kernel, still dropping and still parking. Recorded as unloaded, the
+// card vanished and nothing was sampled, so a source parked mid-flood read
+// as protection being off.
+func TestDisarmingLeavesProtectionRecordedAsLoaded(t *testing.T) {
+	cfg := protectedConfig()
+	e, q := engineForReconcile(t, healthyKernel())
+	e.cfg = cfg
+	e.applyProtect(context.Background(), cfg, e.runner, e.real)
+	if !e.protectOn {
+		t.Fatal("the armed apply did not record the table as loaded")
+	}
+
+	observe := cfg
+	observe.Mode = model.ModeObserve
+	e.applyProtect(context.Background(), observe, &dryRunner{q}, e.real)
+
+	if !e.protectOn {
+		t.Error("a disarm recorded protection as unloaded while its table is still in the kernel and still dropping")
+	}
+	if e.protectApplied != "" {
+		t.Error("the reload latch survived a disarm; what is loaded is no longer this ruleset")
+	}
+	if n := q.count("nft delete table ip failover_protect"); n != 0 {
+		t.Errorf("a disarm removed the table %d times; disarming is not a teardown", n)
+	}
+}
+
+// A read that fails drops the samples whatever the failure, because the
+// portal states them as live facts, but drops the record of the table only
+// when the kernel says the table is not there. Cleared on a timeout it is
+// cleared by one slow nft, and the sampler that would set it again runs only
+// while the portal is open.
+func TestAFailedProtectReadDropsTheSamplesAndKeepsTheRecord(t *testing.T) {
+	e, q := engineForReconcile(t, healthyKernel())
+	const list = "nft -j -t list table ip failover_protect"
+	q.fails = map[string]string{list: "Error: timed out"}
+	e.protectOn = true
+	e.protectApplied = "table ip failover_protect {}"
+	e.protectCounters = []model.ProtectCounter{{Name: "geo:src", Packets: 4}}
+	e.protectBlocked = []model.BlockedSource{{Address: "198.51.100.7"}}
+	e.protectGeoLocked = []model.GeoLockedPort{{Proto: "udp", Port: 27015}}
+
+	_ = e.Status()
+	e.sampleProtect(context.Background())
+	if e.protectCounters != nil || e.protectBlocked != nil || e.protectGeoLocked != nil {
+		t.Error("samples the kernel would not confirm were kept to be served as live facts")
+	}
+	if !e.protectOn {
+		t.Error("one failed read that said nothing about the table cleared the record of it being loaded")
+	}
+	if e.protectApplied != "" {
+		t.Error("the reload latch survived a failed read")
+	}
+
+	q.fails[list] = "Error: No such file or directory"
+	e.sampleProtect(context.Background())
+	if e.protectOn {
+		t.Error("a table the kernel cannot find is still recorded as loaded")
+	}
+}
+
+// The unit runs under Restart=always and a restart into observe mode installs
+// nothing, so a table left loaded by the armed process this one replaced is
+// found only by reading the kernel. Gated on the record alone, a cleared
+// record would have been permanent and the card absent for a table that was
+// dropping.
+func TestTheProtectReadbackFindsATableLeftBehind(t *testing.T) {
+	cfg := protectedConfig()
+	e, q := engineForReconcile(t, healthyKernel())
+	e.cfg = cfg
+	q.replies["nft -j -t list table ip failover_protect"] = `{"nftables":[]}`
+	e.protectOn = false
+
+	_ = e.Status()
+	e.sampleProtect(context.Background())
+	if !e.protectOn {
+		t.Error("a protection table the kernel answered for was not recorded as loaded")
+	}
+}

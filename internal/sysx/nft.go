@@ -771,3 +771,19 @@ func ForwardIsBlocked(ctx context.Context, r Runner) bool {
 	}
 	return false
 }
+
+// TableMissing reports whether an nft failure says the table it was asked
+// about is not in the kernel, as distinct from nft failing to answer at all.
+//
+// The two are not the same event and the readbacks treat them differently: a
+// missing table means the agent's record of it is wrong and has to be
+// corrected, while a timeout or a busy kernel says nothing about the table.
+// A record cleared on any failure is a record one slow `nft` can clear, and
+// the sampler that would set it again runs only while somebody has the
+// portal open, so a transient failure used to leave the blocklist's loader
+// believing there was no set to fill for as long as the tab stayed closed.
+// nft reports the missing table as ENOENT, in words, whatever the listing
+// flags; the runner folds stderr into the error text.
+func TableMissing(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such file or directory")
+}

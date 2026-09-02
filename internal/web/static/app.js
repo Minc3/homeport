@@ -517,11 +517,24 @@ function renderBlocklist(b, armed) {
         + 'deliberate - an old blocklist beats none - but it is no longer picking up newly listed networks.' })));
   }
 
+  // A refused kernel load is its own alert, ahead of a failed fetch, because
+  // the figures above describe the list the frontend accepted and not the
+  // set: the list is accepted before it is loaded, so without this a refusal
+  // read as N networks, loaded, no error, while the kernel went on dropping
+  // from the previous list or from nothing.
+  if (b.load_error) {
+    body.append(el('div', { class: 'alert warn' },
+      el('p', { text: `The list was fetched but the kernel refused to load it: ${b.load_error}` }),
+      el('p', { text: 'The set still holds whatever it held before, so the count above is not what is being dropped. '
+        + 'The load is retried on its own every fifteen minutes; if this stays, the Activity tab has the full error.' })));
+  }
+
   if (b.last_error) {
     body.append(el('div', { class: 'alert warn' },
       el('p', { text: `The last refresh failed: ${b.last_error}` }),
       el('p', { text: 'The previously loaded list is untouched and still dropping. This retries on its own; a refusal naming an '
-        + 'implausible shrink means the feed served a short list and was not believed, which needs somebody to look at the feed by hand.' })));
+        + 'implausible shrink means the feed served a short list and was not believed, which needs somebody to look at the feed by hand. '
+        + 'To accept what the feed now serves, stop the frontend unit, delete blocklist-cache.json from its state directory and start it again.' })));
   }
 
   body.append(el('p', { class: 'hint', text: `Source: ${b.source || 'unset'}. Fetched by this frontend on a timer, checked whole, and loaded into a set of its `
@@ -2130,10 +2143,14 @@ function renderSettings() {
       + 'protection does. The first fetch happens within a minute of saving; until it lands the rules are loaded and drop nothing. The last good list is '
       + 'kept on disk, so a restart while the feed is unreachable still comes up protected.')),
     el('div', { class: 'grid' },
+      // A floor of 0 rather than validate's 1, because 0 is not a cadence
+      // here: it is "use the default", which validate accepts and every other
+      // "0 = default" box on this form spells the same way. Clamped to 1 it
+      // silently stored an hourly poll of somebody else's host.
       num('Refresh interval (hours)', c.blocklist.refresh_hours || '', (v) => (c.blocklist.refresh_hours = v || 0), {
-        min: 1, max: 168, placeholder: 'empty = 4',
+        min: 0, max: 168, placeholder: 'empty = 4',
         help: 'How often the feed is re-fetched. The request is conditional, so an unchanged feed costs almost nothing and this can be short. The feed '
-          + 'itself republishes about once a day. Between 1 and 168 hours; clear the box for the default 4. A failed fetch is retried sooner than this '
+          + 'itself republishes about once a day. Between 1 and 168 hours; 0 or an empty box means the default 4. A failed fetch is retried sooner than this '
           + 'on its own, and never empties the loaded list.',
       }),
     ),

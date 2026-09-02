@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -134,7 +135,14 @@ func (s *Server) decodeConfig(w http.ResponseWriter, r *http.Request) (model.Con
 	// whether a file is good, and which is the obvious thing to point a curl
 	// at from a shell, where there is no JSON.parse in front of it to catch
 	// what this did not.
-	if dec.More() {
+	//
+	// Token rather than More, and the difference is the ordinary corruption.
+	// More peeks at the next byte and answers false for a closing delimiter,
+	// so a file ending in a stray `}` or `]` - the shape a hand edit leaves -
+	// passed as cleanly as one ending in whitespace. Token reads the next
+	// value: only a clean end of input comes back as io.EOF, a delimiter is a
+	// syntax error and a second object is a token, and both are refused.
+	if _, err := dec.Token(); err != io.EOF {
 		clientErr(w, errors.New("invalid configuration: trailing content after the end of the configuration"))
 		return cfg, false
 	}
@@ -716,23 +724,11 @@ func validate(cfg *model.Config) error {
 		seenRegionSet[key] = rg.Name
 		regionDefined[rg.Name] = true
 
-		cleaned := make([]string, 0, len(rg.CIDRs))
-		for _, c := range rg.CIDRs {
-			c = trimmed(c)
-			if c == "" {
-				continue
-			}
-			// A bare address is a /32. The lists get pasted from country zone
-			// files, and refusing the odd single address in one would send
-			// somebody off to edit a thousand-line paste by hand.
-			if !strings.Contains(c, "/") {
-				c += "/32"
-			}
-			netw, err := parseIPv4Network(c)
-			if err != nil {
-				return fmt.Errorf("region %s: %v", rg.Name, err)
-			}
-			cleaned = append(cleaned, netw)
+		cleaned, err := cleanNetworkList(rg.CIDRs, "region "+rg.Name)
+		if err != nil {
+			return err
+		}
+		for _, netw := range cleaned {
 			regionsBytes += len(netw) + 1
 		}
 		rg.CIDRs = cleaned
@@ -787,22 +783,9 @@ func validate(cfg *model.Config) error {
 		return fmt.Errorf("blocklist: %d exceptions; the most is %d - these are meant to be the handful of "+
 			"networks the feed gets wrong, not a second list", len(bl.Exceptions), maxBlocklistExceptions)
 	}
-	cleanedEx := make([]string, 0, len(bl.Exceptions))
-	for _, c := range bl.Exceptions {
-		c = trimmed(c)
-		if c == "" {
-			continue
-		}
-		// A bare address is a /32, matching the regions: an exception is
-		// usually one address somebody has just found in the list.
-		if !strings.Contains(c, "/") {
-			c += "/32"
-		}
-		netw, err := parseIPv4Network(c)
-		if err != nil {
-			return fmt.Errorf("blocklist exception: %v", err)
-		}
-		cleanedEx = append(cleanedEx, netw)
+	cleanedEx, err := cleanNetworkList(bl.Exceptions, "blocklist exception")
+	if err != nil {
+		return err
 	}
 	bl.Exceptions = cleanedEx
 
@@ -1388,4 +1371,32 @@ func (s *Server) serveSocket(ctx context.Context, path string) {
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		s.log.Warn("control socket closed", "err", err)
 	}
+}
+
+// cleanNetworkList is how the portal reads a pasted list of networks, and it
+// is one function because two of them have to read the same paste the same
+// way: a region's list and the blocklist's exceptions. Blank entries are
+// dropped, a bare address is a /32 - the lists get pasted from country zone
+// files and from the feed itself, and refusing the odd single address would
+// send somebody off to edit a thousand-line paste by hand - and everything
+// else has to be a network parseIPv4Network can render, which is the one
+// definition of IPv4 the generators accept. The error names what the list
+// belongs to, and nothing else differs between the two callers.
+func cleanNetworkList(items []string, what string) ([]string, error) {
+	cleaned := make([]string, 0, len(items))
+	for _, c := range items {
+		c = trimmed(c)
+		if c == "" {
+			continue
+		}
+		if !strings.Contains(c, "/") {
+			c += "/32"
+		}
+		netw, err := parseIPv4Network(c)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %v", what, err)
+		}
+		cleaned = append(cleaned, netw)
+	}
+	return cleaned, nil
 }
