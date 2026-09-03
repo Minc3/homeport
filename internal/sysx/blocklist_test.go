@@ -2,6 +2,7 @@ package sysx
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -355,3 +356,51 @@ func (s *stubRunner) Run(_ context.Context, name string, args ...string) (string
 }
 
 func (s *stubRunner) Applying() bool { return true }
+
+// The parse and the shrink guard count entries and say nothing about how
+// much address space an entry covers, so nine perfect lines could take half
+// the routable internet's TCP off every published port. The floor is applied
+// to what survives the reserved-space strip, because the honest feed carries
+// 224.0.0.0/4 and 10.0.0.0/8 from its bogon source and a floor on the raw
+// list would refuse it every day.
+func TestBlocklistRefusesAShortPrefixOnlyAfterTheReservedStrip(t *testing.T) {
+	if _, err := CheckBlocklist([]string{"203.0.113.0/24", "32.0.0.0/3", "198.51.100.0/24"}); err == nil ||
+		!strings.Contains(err.Error(), "32.0.0.0/3") {
+		t.Fatalf("a /3 survived the floor: %v", err)
+	}
+	n, err := CheckBlocklist([]string{"224.0.0.0/4", "240.0.0.0/4", "10.0.0.0/8", "0.0.0.0/8", "203.0.113.0/24"})
+	if err != nil || n != 1 {
+		t.Fatalf("the honest reserved entries were refused rather than stripped: n=%d err=%v", n, err)
+	}
+	if _, err := CheckBlocklist([]string{"1.0.0.0/8"}); err != nil {
+		t.Fatalf("a /8 exactly is the floor and must pass: %v", err)
+	}
+}
+
+// The ceiling is on merged address coverage, not on entries. A list of a few
+// thousand /24s and /16s is the honest shape and loads; one that has absorbed
+// a quarter of the internet does not, however few lines it took.
+func TestBlocklistRefusesCoverageOverTheCeiling(t *testing.T) {
+	var honest []string
+	for i := 0; i < 2000; i++ {
+		honest = append(honest, fmt.Sprintf("203.%d.%d.0/24", i/256, i%256))
+	}
+	for i := 0; i < 200; i++ {
+		honest = append(honest, fmt.Sprintf("5.%d.0.0/16", i))
+	}
+	if _, err := CheckBlocklist(honest); err != nil {
+		t.Fatalf("an ordinary list was refused: %v", err)
+	}
+	// Nine /8s is 2^27 exactly, at the ceiling; the tenth is over it.
+	var wide []string
+	for i := 1; i <= 9; i++ {
+		wide = append(wide, fmt.Sprintf("%d.0.0.0/8", i*3))
+	}
+	if _, err := CheckBlocklist(wide); err == nil {
+		t.Fatal("2^27 addresses in ten /8s passed the ceiling")
+	}
+	// Precisely 2^27 is admitted: eight /8s.
+	if _, err := CheckBlocklist(wide[:8]); err != nil {
+		t.Fatalf("coverage at the ceiling was refused: %v", err)
+	}
+}

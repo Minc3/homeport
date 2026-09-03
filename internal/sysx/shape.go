@@ -58,12 +58,18 @@ func EnsureQdisc(ctx context.Context, r Runner, iface string, mbit float64) (boo
 	if iface == "" {
 		return false, fmt.Errorf("no interface")
 	}
-	have, kind, err := QdiscRate(ctx, r, iface)
+	have, kind, ours, err := qdiscInfo(ctx, r, iface)
 	if err != nil {
 		return false, err
 	}
 	if mbit <= 0 {
-		if kind != ShapeQdisc {
+		// Only a shaper carrying this agent's own signature. This branch is
+		// reached with zero for every unshaped path on every settings save
+		// and every config push, so "any cake" here removed a CAKE the
+		// operator had put on a tunnel by hand, on a site that never set a
+		// rate in the portal, with a "changed" line as the only trace.
+		// Invariant 8: never touch what the agent did not install.
+		if kind != ShapeQdisc || !ours {
 			return false, nil // nothing of ours to take down
 		}
 		RemoveQdisc(ctx, r, iface)
@@ -71,8 +77,10 @@ func EnsureQdisc(ctx context.Context, r Runner, iface string, mbit float64) (boo
 	}
 	// Compared loosely: tc rounds to its own units on the way in and prints
 	// them back rounded, so an exact match would reinstall the same shaper
-	// forever and blow away the queue's state every ten seconds.
-	if kind == ShapeQdisc && sameRate(have, mbit) {
+	// forever and blow away the queue's state every ten seconds. A cake
+	// without the signature is replaced: a configured rate is the operator
+	// asking for this shaper on this interface.
+	if kind == ShapeQdisc && ours && sameRate(have, mbit) {
 		return false, nil
 	}
 	if _, err := r.Run(ctx, "tc", "qdisc", "replace", "dev", iface, "root", ShapeQdisc,
@@ -97,9 +105,19 @@ func RemoveQdisc(ctx context.Context, r Runner, iface string) {
 // queue discipline goes with it, and the agent's own belief about it survives
 // the loss perfectly intact.
 func QdiscRate(ctx context.Context, r Runner, iface string) (float64, string, error) {
+	rate, kind, _, err := qdiscInfo(ctx, r, iface)
+	return rate, kind, err
+}
+
+// qdiscInfo is QdiscRate plus whether the shaper is recognisably this
+// agent's. EnsureQdisc installs exactly `cake bandwidth X overhead 80
+// besteffort`, and tc prints the overhead and the priority mode back, so a
+// cake carrying both is treated as ours and one carrying neither is somebody
+// else's shaping that happens to use the same discipline.
+func qdiscInfo(ctx context.Context, r Runner, iface string) (rate float64, kind string, ours bool, err error) {
 	out, err := r.Run(ctx, "tc", "qdisc", "show", "dev", iface)
 	if err != nil {
-		return 0, "", fmt.Errorf("read qdisc on %s: %w", iface, err)
+		return 0, "", false, fmt.Errorf("read qdisc on %s: %w", iface, err)
 	}
 	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
@@ -110,16 +128,22 @@ func QdiscRate(ctx context.Context, r Runner, iface string) (float64, string, er
 		if kind != ShapeQdisc {
 			// Something else owns this interface - the kernel default, or an
 			// operator's own shaping. Reported, never overwritten silently.
-			return 0, kind, nil
+			return 0, kind, false, nil
 		}
+		overhead, besteffort := false, false
 		for i, f := range fields {
-			if f == "bandwidth" && i+1 < len(fields) {
-				return parseRate(fields[i+1]), kind, nil
+			switch {
+			case f == "bandwidth" && i+1 < len(fields):
+				rate = parseRate(fields[i+1])
+			case f == "overhead" && i+1 < len(fields):
+				overhead = fields[i+1] == strconv.Itoa(ShapeOverheadBytes)
+			case f == "besteffort":
+				besteffort = true
 			}
 		}
-		return 0, kind, nil
+		return rate, kind, overhead && besteffort, nil
 	}
-	return 0, "", nil
+	return 0, "", false, nil
 }
 
 // formatRate renders a rate the way tc accepts it. %g so a whole number stays

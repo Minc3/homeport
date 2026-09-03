@@ -562,7 +562,7 @@ function renderQueryCache(states) {
   // that carry the story; a port nobody has queried has no story yet. A bind
   // error always shows, because that port is redirecting queries to nothing.
   const list = all.filter((q) => q.error || q.refresh_error
-    || q.answered || q.challenged || q.unanswered
+    || q.answered || q.challenged || q.unanswered || q.paced
     || q.info_age_sec >= 0 || q.player_age_sec >= 0 || q.rules_age_sec >= 0);
   section.classList.toggle('hidden', list.length === 0);
   if (!list.length) return;
@@ -579,6 +579,10 @@ function renderQueryCache(states) {
     el('thead', {}, el('tr', {},
       el('th', { text: 'Port' }), el('th', { text: 'Service' }),
       el('th', { text: 'Answered' }), el('th', { text: 'Challenged' }), el('th', { text: 'Unanswered' }),
+      // Paced is a verified source asking faster than its reply-byte budget
+      // refills: one real address, not a spoofed flood, drawing the cached
+      // reply at line rate. Nothing else on this row can tell the two apart.
+      el('th', { text: 'Paced' }),
       el('th', { text: 'Info age' }), el('th', { text: 'Players age' }), el('th', { text: 'Rules age' }),
       el('th', { text: 'Problem' }))),
     el('tbody', {}, list.map((q) => el('tr', {},
@@ -587,9 +591,14 @@ function renderQueryCache(states) {
       el('td', { text: q.answered.toLocaleString() }),
       el('td', { text: q.challenged.toLocaleString() }),
       el('td', { text: q.unanswered.toLocaleString() }),
+      el('td', { text: (q.paced || 0).toLocaleString() }),
       el('td', { text: age(q.info_age_sec, q.stale_sec) }),
       el('td', { text: age(q.player_age_sec, q.stale_sec) }),
-      el('td', { text: age(q.rules_age_sec, q.stale_sec) }),
+      // RULES is refreshed and served under a longer window than the other
+      // two, and the snapshot carries that window; judged against stale_sec
+      // a reply being served perfectly well would read as stale for most
+      // of its life.
+      el('td', { text: age(q.rules_age_sec, q.rules_stale_sec || q.stale_sec) }),
       // An icon with the message on hover, not the message itself: the error
       // strings carry whole socket addresses and were wider than the rest of
       // the table put together. data-tip, not title: the browser sits on a
@@ -688,7 +697,10 @@ function renderProtect(p) {
   }
 
   if (blocked.length) {
-    body.append(el('p', { class: 'hint', text: `${blocked.length} source${blocked.length === 1 ? '' : 's'} currently parked. They expire on their own; nothing needs to be cleared by hand.` }));
+    // The readback hands back a bounded share of a possibly very long list
+    // and the total beside it; the total is the figure, the list a sample.
+    const total = Math.max(p.blocked_total || 0, blocked.length);
+    body.append(el('p', { class: 'hint', text: `${total} source${total === 1 ? '' : 's'} currently parked. They expire on their own; nothing needs to be cleared by hand.` }));
     body.append(el('div', { class: 'table-wrap' }, el('table', {},
       el('thead', {}, el('tr', {}, el('th', { text: 'Address' }), el('th', { text: 'Expires in' }))),
       // The address is what gets taken away from here: into a lookup, or

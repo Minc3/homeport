@@ -18,6 +18,11 @@ type fakeUpstream struct {
 	multi     [][]byte // when set, the INFO answer is these datagrams instead
 	fetches   atomic.Int64
 	challenge []byte
+
+	// Per-type counts, for the tests that pin the RULES cadence against the
+	// INFO one. fetches is still the total.
+	infoFetches  atomic.Int64
+	rulesFetches atomic.Int64
 }
 
 // tune runs before the serve goroutine starts, so a test setting the multi
@@ -65,6 +70,7 @@ func (u *fakeUpstream) serve() {
 				continue
 			}
 			u.fetches.Add(1)
+			u.infoFetches.Add(1)
 			if u.multi != nil {
 				for _, d := range u.multi {
 					u.conn.WriteToUDP(d, addr)
@@ -87,6 +93,7 @@ func (u *fakeUpstream) serve() {
 				continue
 			}
 			u.fetches.Add(1)
+			u.rulesFetches.Add(1)
 			u.conn.WriteToUDP(u.rulesBody(), addr)
 		}
 	}

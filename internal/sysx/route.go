@@ -1006,9 +1006,22 @@ func EnsureSysctls(ctx context.Context, r Runner, ifaces []string) {
 	// The effective value is max(all, dev), so both have to be zero.
 	set("net.ipv4.conf.all.rp_filter", "0")
 	for _, i := range ifaces {
-		set("net.ipv4.conf."+i+".rp_filter", "0")
+		set(rpFilterKey(i), "0")
 	}
 	set("net.ipv4.ip_forward", "1")
+}
+
+// rpFilterKey names one interface's rp_filter in sysctl's slash form.
+//
+// The dotted form splits on every dot, so an interface with one in its name,
+// which a VLAN sub-interface always has (eth0.100), became a key for a
+// device that does not exist: the write failed on every tick, rp_filter
+// stayed at the system default, and the path read as dead for the reason
+// RPFilterOff describes, with the sysctl error the only clue. sysctl(8)
+// treats slashes as the separator and dots literally when a key contains a
+// slash, which is what every key here needs.
+func rpFilterKey(iface string) string {
+	return "net/ipv4/conf/" + iface + "/rp_filter"
 }
 
 // RPFilterOff disables reverse-path filtering on one interface, reporting
@@ -1028,7 +1041,7 @@ func EnsureSysctls(ctx context.Context, r Runner, ifaces []string) {
 // leaving, `wg show` looks perfect, and the path reads as 100% loss forever.
 // That is what a restarted tunnel did before this existed.
 func RPFilterOff(ctx context.Context, r Runner, iface string) (bool, error) {
-	key := "net.ipv4.conf." + iface + ".rp_filter"
+	key := rpFilterKey(iface)
 	out, err := r.Run(ctx, "sysctl", "-n", key)
 	if err != nil {
 		return false, err

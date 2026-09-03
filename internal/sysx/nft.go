@@ -104,7 +104,7 @@ func BuildRuleset(cfg model.Config) string {
 			what string
 		}{{0x54, "info"}, {0x55, "players"}, {0x56, "rules"}} {
 			fmt.Fprintf(&b, "\t\t%sudp dport %s %s @th,96,8 0x%02x redirect comment %q\n",
-				serviceScope(cfg), port, connectionlessMatch, t.b, fmt.Sprintf("qcache %s: %s", t.what, sp.Service))
+				serviceScope(cfg), port, connectionlessMatch, t.b, nftSafe(fmt.Sprintf("qcache %s: %s", t.what, sp.Service)))
 		}
 	}
 
@@ -125,7 +125,7 @@ func BuildRuleset(cfg model.Config) string {
 		// and the routing to get there is the same route widened by one
 		// prefix - there is no second mechanism here.
 		fmt.Fprintf(&b, "\t\t%s%s dport %s dnat to %s comment %q\n",
-			serviceScope(cfg), proto, port, s.TargetOr(cfg.Overlay.BackendIP), s.Name)
+			serviceScope(cfg), proto, port, s.TargetOr(cfg.Overlay.BackendIP), nftSafe(s.Name))
 	}
 
 	b.WriteString("\t}\n")
@@ -141,7 +141,7 @@ func BuildRuleset(cfg model.Config) string {
 func serviceScope(cfg model.Config) string {
 	var s strings.Builder
 	if cfg.Frontend.PublicIface != "" {
-		fmt.Fprintf(&s, "iifname %q ", cfg.Frontend.PublicIface)
+		fmt.Fprintf(&s, "iifname %q ", nftSafe(cfg.Frontend.PublicIface))
 	}
 	if cfg.Frontend.PublicIP != "" {
 		fmt.Fprintf(&s, "ip daddr %s ", cfg.Frontend.PublicIP)
@@ -149,13 +149,56 @@ func serviceScope(cfg model.Config) string {
 	return s.String()
 }
 
+// pathIfaces lists each path's interface once, in path order. Two paths on
+// one tunnel is refused by web.validate, but a blob saved before that check
+// can carry it, and a repeated element in an anonymous set (`oifname {
+// "wg-lte1", "wg-lte1" }`) has nft reject the whole table: every published
+// service down over a save that validated.
 func pathIfaces(cfg model.Config) []string {
 	ifaces := make([]string, 0, len(cfg.Paths))
+	seen := map[string]bool{}
 	for _, p := range cfg.Paths {
+		if seen[p.Iface] {
+			continue
+		}
+		seen[p.Iface] = true
 		ifaces = append(ifaces, p.Iface)
 	}
 	return ifaces
 }
+
+// nftSafe is what every operator-supplied string goes through before it is
+// rendered into ruleset text: a service name into a comment, an interface
+// name into an ifname match. The sites render it with Go's %q, and that was
+// doing less than it looked like it was doing. nftables' lexer reads a quoted
+// string as everything up to the next double quote with no escape processing
+// at all, so the `\"` Go emits for a quote does not neutralise it: the string
+// ends there and the rest of the value is lexed as rule text, loaded as root.
+// web.validate refuses those bytes in a service name, and does not refuse
+// them in an interface name at all until now. Either way the generator is
+// the boundary, for the reason EgressNetworks is: what reaches it is
+// whatever the stored blob or the peer at the far end of a socket said.
+//
+// Quotes, backslashes, control characters and anything outside ASCII are
+// dropped rather than escaped, because there is no escape nft would honour,
+// and the result is capped at nftMaxString bytes, under nft's 128-byte
+// comment limit. A clean ASCII name is not moved by a byte, which is what
+// keeps every existing ruleset identical.
+func nftSafe(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s) && b.Len() < nftMaxString; i++ {
+		c := s[i]
+		if c < 0x20 || c >= 0x7f || c == '"' || c == '\\' {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// nftMaxString is the longest rendered string, under the 128 bytes nft
+// allows a comment.
+const nftMaxString = 120
 
 // writeMSSClamp renders a forward chain that caps the TCP MSS of every SYN
 // leaving by a tunnel to what the tunnel can carry.
@@ -185,7 +228,7 @@ func writeMSSClamp(b *strings.Builder, ifaces []string) {
 	}
 	quoted := make([]string, 0, len(ifaces))
 	for _, i := range ifaces {
-		quoted = append(quoted, fmt.Sprintf("%q", i))
+		quoted = append(quoted, fmt.Sprintf("%q", nftSafe(i)))
 	}
 	b.WriteString("\tchain forward {\n")
 	b.WriteString("\t\ttype filter hook forward priority mangle; policy accept;\n")
@@ -225,7 +268,7 @@ func BuildEgressRuleset(cfg model.Config) string {
 	// The whole overlay range, so a linker's traffic is translated by the same
 	// rule as the backend's. On a site with no linkers MatchPrefix is the
 	// backend's own address and this renders exactly as it always did.
-	fmt.Fprintf(&b, "\t\tip saddr %s oifname %q ", cfg.Overlay.MatchPrefix(), cfg.Frontend.PublicIface)
+	fmt.Fprintf(&b, "\t\tip saddr %s oifname %q ", cfg.Overlay.MatchPrefix(), nftSafe(cfg.Frontend.PublicIface))
 	if cfg.Frontend.PublicIP != "" {
 		fmt.Fprintf(&b, "snat to %s\n", cfg.Frontend.PublicIP)
 	} else {
@@ -314,7 +357,7 @@ func BuildBackendEgressRuleset(cidrs, ifaces []string, overlayIP string) string 
 	set := func(items []string) string {
 		quoted := make([]string, 0, len(items))
 		for _, i := range items {
-			quoted = append(quoted, fmt.Sprintf("%q", i))
+			quoted = append(quoted, fmt.Sprintf("%q", nftSafe(i)))
 		}
 		return "{ " + strings.Join(quoted, ", ") + " }"
 	}
@@ -446,7 +489,7 @@ func BuildReturnRuleset(ifaces []string) string {
 	if len(ifaces) > 0 {
 		quoted := make([]string, 0, len(ifaces))
 		for _, i := range ifaces {
-			quoted = append(quoted, fmt.Sprintf("%q", i))
+			quoted = append(quoted, fmt.Sprintf("%q", nftSafe(i)))
 		}
 		// `ct direction original` is load-bearing, not decoration. Without it
 		// this also stamps connections the backend *started* down the tunnel -

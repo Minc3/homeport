@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -178,12 +179,30 @@ func sendWebhook(ctx context.Context, cfg model.NotifyConfig, title, body string
 	return do(req)
 }
 
+// client is the one outbound HTTP client alerts go through. Its own rather
+// than http.DefaultClient, for two reasons that both matter here. The default
+// follows redirects, and a Telegram bot token lives in the URL path, so a
+// redirect handed the token to whoever answered; Go strips a bearer header on
+// a cross-host redirect, and strips nothing from a path. And DefaultClient is
+// process-wide state: a package that set a proxy or loosened TLS on it would
+// change where alerts go with nothing in this file saying so. A redirect is a
+// >= 300 status here and is reported as a failed delivery.
+var client = &http.Client{
+	Timeout: 15 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 func do(req *http.Request) error {
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	// Drained, bounded, so the connection can be reused; nothing in the body
+	// is read for its content.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("notification endpoint returned %s", resp.Status)
 	}

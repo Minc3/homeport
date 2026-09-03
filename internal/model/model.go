@@ -1145,6 +1145,13 @@ type ProtectStatus struct {
 	Counters []ProtectCounter `json:"counters,omitempty"`
 	Blocked  []BlockedSource  `json:"blocked,omitempty"`
 
+	// BlockedTotal is how many sources are parked. Blocked carries at most a
+	// bounded share of them (the readback caps what it hands back, since the
+	// set is sized for a quarter of a million and a flood is when this is
+	// read every five seconds), so the count is what the portal reports and
+	// the list is what it shows.
+	BlockedTotal int `json:"blocked_total,omitempty"`
+
 	// GeoLocked lists the ports whose automatic region lock is currently
 	// engaged. Reported for the same reason the counters are: an engaged lock
 	// looks exactly like the service being down to everybody outside the
@@ -1245,10 +1252,14 @@ type QueryCacheState struct {
 	// flood this is the number climbing. Unanswered counts correctly
 	// challenged queries the cache had nothing fresh to serve - a steady
 	// climb here with the age high is the fingerprint of the upstream being
-	// unreachable.
+	// unreachable. Paced counts correctly challenged queries from a source
+	// that had already drawn its reply-byte budget (qcache/pace.go): a
+	// climb here is one real address asking far faster than any browser
+	// does, and it is the number that would have been uplink bytes.
 	Answered   uint64 `json:"answered"`
 	Challenged uint64 `json:"challenged"`
 	Unanswered uint64 `json:"unanswered"`
+	Paced      uint64 `json:"paced"`
 
 	// The ages are how old each cached reply is, -1 for never fetched. The
 	// cache stops serving a reply past its staleness bound, so a port can be
@@ -1263,6 +1274,12 @@ type QueryCacheState struct {
 	// which had already drifted from the shipped default and was wrong in
 	// both directions the moment the bound was configurable.
 	StaleSec float64 `json:"stale_sec"`
+
+	// RulesStaleSec is the bound RULES is served under, which is a multiple
+	// of StaleSec because RULES is refreshed at a multiple of the interval.
+	// The RULES age has to be judged against this and not StaleSec, or a
+	// reply being served perfectly well reads as stale for most of its life.
+	RulesStaleSec float64 `json:"rules_stale_sec"`
 
 	// Error is a port whose socket could not be bound: something else on the
 	// frontend holds it, and every query to it is being redirected to nothing.

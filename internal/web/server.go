@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,8 @@ type Server struct {
 
 	mu       sync.Mutex
 	attempts map[string]*attemptRecord
+	// loginSem bounds concurrent password checks; see handleLogin.
+	loginSem chan struct{}
 }
 
 type attemptRecord struct {
@@ -91,6 +94,7 @@ func New(eng *engine.Engine, st *store.Store, log *slog.Logger, psk string) *Ser
 		geoBase:   geoFetchBase,
 		geoClient: defaultGeoClient(),
 		attempts:  map[string]*attemptRecord{},
+		loginSem:  make(chan struct{}, maxConcurrentLogins),
 	}
 }
 
@@ -264,12 +268,43 @@ func securityHeaders(next http.Handler) http.Handler {
 
 func (s *Server) requireAuth(trusted bool, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if trusted || s.authenticated(r) {
+		if trusted {
 			h(w, r)
 			return
 		}
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+		if !s.authenticated(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && crossSite(r) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-site request refused"})
+			return
+		}
+		h(w, r)
 	})
+}
+
+// crossSite reports a state-changing request that a browser says came from
+// another site. The session cookie is SameSite=Lax, which stops a cross-site
+// POST in a current browser, and that was the whole of the CSRF defence: it
+// stops holding on an older mobile browser, which is exactly the lost phone
+// the login is written for, and "same site" includes every other port on the
+// portal's address. A cross-site POST here is `/api/revert` or arming the
+// data plane. Browsers send Sec-Fetch-Site on every request and Origin on
+// every POST, and a request from neither a browser nor the same origin
+// (failoverctl over the socket, curl from a shell) carries neither header,
+// so nothing that is not a browser is affected.
+func crossSite(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+		return true
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && origin != "null" {
+		u, err := url.Parse(origin)
+		if err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) authenticated(r *http.Request) bool {
@@ -295,6 +330,11 @@ func (s *Server) sessionUser(r *http.Request) (string, bool) {
 // perimeter, and a rule that pushes an operator towards a password they have to
 // write down would make things worse rather than better.
 const minPasswordLen = 10
+
+// maxConcurrentLogins is how many password hashes may run at once. Each is
+// 600k PBKDF2 iterations, a few hundred milliseconds of one core, in the
+// process that also runs the probers and the decision loop.
+const maxConcurrentLogins = 2
 
 type passwordRequest struct {
 	Username string `json:"username,omitempty"` // trusted socket only
@@ -393,8 +433,25 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad request"})
 		return
 	}
-	if !s.st.CheckPassword(req.Username, req.Password) {
-		s.recordFailure(host)
+	// The attempt is counted before the hash rather than after it. Counted
+	// after, a burst of concurrent requests all passed the lockout check
+	// above before any of them had been counted, and each cost a full
+	// PBKDF2 in the process that is also running the probers. A success
+	// clears the count, so a correct login is never locked out by its own
+	// reservation. The semaphore bounds how many hashes run at once: past
+	// it the answer is the same 429 the lockout gives, without touching the
+	// store, so an unauthenticated peer on the admin tunnel cannot hold the
+	// frontend's CPU with parallel requests.
+	s.recordFailure(host)
+	select {
+	case s.loginSem <- struct{}{}:
+	default:
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many attempts, try again shortly"})
+		return
+	}
+	ok := s.st.CheckPassword(req.Username, req.Password)
+	<-s.loginSem
+	if !ok {
 		s.log.Warn("failed login", "user", req.Username, "remote", host)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		return
@@ -479,6 +536,11 @@ func (s *Server) clearFailures(host string) {
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	// Two of these bodies carry secrets: the shared secret on /api/psk and
+	// the notification token inside /api/config. Nothing tells a browser
+	// not to keep a JSON body, and the device this portal is opened on is
+	// the lost phone the login is written for.
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }

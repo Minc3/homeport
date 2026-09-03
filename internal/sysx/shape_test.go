@@ -115,7 +115,8 @@ func TestAShaperLostWithTheInterfaceIsRestored(t *testing.T) {
 // with nothing in the configuration to explain why the link is capped.
 func TestClearingTheRateRemovesTheShaper(t *testing.T) {
 	f := &shapeRunner{replies: map[string]string{
-		"tc qdisc show": "qdisc cake 8003: root refcnt 2 bandwidth 18Mbit besteffort",
+		"tc qdisc show": "qdisc cake 8003: root refcnt 2 bandwidth 18Mbit besteffort triple-isolate " +
+			"nonat nowash no-ack-filter split-gso rtt 100ms noatm overhead 80",
 	}}
 	changed, err := EnsureQdisc(context.Background(), f, "wg-lte1", 0)
 	if err != nil {
@@ -139,6 +140,35 @@ func TestAForeignQdiscIsNotRemoved(t *testing.T) {
 	}
 	if changed || f.ran("tc qdisc del") {
 		t.Errorf("removed a queue discipline this agent did not install: %v", f.calls)
+	}
+}
+
+// A CAKE the operator installed by hand is somebody else's too. The zero-rate
+// branch is reached for every unshaped path on every settings save and every
+// config push, so "any cake is ours" removed an operator's own shaping from a
+// tunnel on a site that never set a rate in the portal, with a "changed" line
+// as the only trace. The agent's shaper is recognised by the exact parameters
+// EnsureQdisc writes: overhead 80 and besteffort.
+func TestAHandInstalledCakeIsNotRemovedByAZeroRate(t *testing.T) {
+	f := &shapeRunner{replies: map[string]string{
+		"tc qdisc show": "qdisc cake 8003: root refcnt 2 bandwidth 50Mbit diffserv3 triple-isolate " +
+			"nonat nowash no-ack-filter split-gso rtt 100ms raw overhead 0",
+	}}
+	changed, err := EnsureQdisc(context.Background(), f, "wg-main", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if changed || f.ran("tc qdisc del") {
+		t.Errorf("removed a CAKE this agent did not install: %v", f.calls)
+	}
+	// A configured rate is the operator asking for this shaper, so the
+	// foreign one is replaced rather than left in the way.
+	g := &shapeRunner{replies: f.replies}
+	if _, err := EnsureQdisc(context.Background(), g, "wg-main", 18); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !g.ran("tc qdisc replace dev wg-main root cake bandwidth 18mbit") {
+		t.Errorf("did not install the configured shaper over a foreign cake: %v", g.calls)
 	}
 }
 

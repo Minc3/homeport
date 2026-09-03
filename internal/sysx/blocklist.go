@@ -117,7 +117,7 @@ func BuildBlocklistRuleset(spec BlocklistSpec) string {
 
 	b.WriteString("\tchain raw {\n")
 	fmt.Fprintf(&b, "\t\ttype filter hook prerouting priority %d; policy accept;\n", blocklistPriority)
-	fmt.Fprintf(&b, "\t\tiifname != %q accept\n", iface)
+	fmt.Fprintf(&b, "\t\tiifname != %q accept\n", nftSafe(iface))
 	if len(allow) > 0 {
 		b.WriteString("\t\t# The operator's exceptions, ahead of the feed: the feed is the one\n")
 		b.WriteString("\t\t# list here nobody in this deployment reviewed, and a false positive\n")
@@ -176,6 +176,61 @@ func BuildBlocklistElements(networks []string) string {
 // loaded figure, so it has to come from the same arithmetic.
 func CountBlocklistElements(networks []string) int {
 	return len(mergeCIDRs(dropNonInternet(EgressNetworks(networks))))
+}
+
+// BlocklistMinPrefix and BlocklistMaxCoverage bound what a feed can take
+// off the air. The parse and the shrink guard both count entries, and
+// neither says anything about how much address space an entry covers: nine
+// syntactically perfect lines (1.0.0.0/8, 32.0.0.0/3, 128.0.0.0/3 and their
+// like) cover half the routable internet, pass whole-or-nothing, and are
+// nine entries against thousands. A poisoned CDN response or an upstream
+// aggregation bug is enough to produce them, and what they drop is every
+// TCP connection to every published port from half the world.
+//
+// The floor is applied to what would be loaded, after dropNonInternet, and
+// that ordering is load-bearing: the honest level1 feed carries
+// 224.0.0.0/4 and 240.0.0.0/4 from its bogon source, both shorter than /8
+// and both stripped as reserved space, so a floor applied to the raw list
+// would refuse the real feed every day. No allocated /7 or shorter exists
+// to be listed, so a survivor shorter than /8 is never honest.
+//
+// The ceiling is on the merged address count. level1 after the reserved
+// strip is a few tens of millions of addresses at most (Spamhaus DROP is a
+// few hundred /16 to /22 networks, dshield twenty /24s, and the bogon list
+// is mostly the reserved space that has already been removed), so 2^27,
+// about three percent of IPv4, is several times the honest figure while
+// staying far below anything that would take a meaningful share of players
+// off the air.
+const (
+	BlocklistMinPrefix   = 8
+	BlocklistMaxCoverage = uint64(1) << 27
+)
+
+// CheckBlocklist applies the prefix floor and the coverage ceiling to what
+// BuildBlocklistElements would load from networks, and reports the loaded
+// count on success. The count is the same arithmetic CountBlocklistElements
+// does, handed back so a caller does not merge two hundred thousand entries
+// twice.
+func CheckBlocklist(networks []string) (int, error) {
+	elems := mergeCIDRs(dropNonInternet(EgressNetworks(networks)))
+	var covered uint64
+	for _, c := range elems {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			continue // mergeCIDRs only emits what parsed
+		}
+		ones, bits := n.Mask.Size()
+		if ones < BlocklistMinPrefix {
+			return 0, fmt.Errorf("network %s is shorter than /%d; no honest feed lists a block that size",
+				c, BlocklistMinPrefix)
+		}
+		covered += uint64(1) << uint(bits-ones)
+	}
+	if covered > BlocklistMaxCoverage {
+		return 0, fmt.Errorf("the list covers %d addresses, more than the %d this is willing to drop from",
+			covered, BlocklistMaxCoverage)
+	}
+	return len(elems), nil
 }
 
 // dropNonInternet removes feed entries that overlap space no legitimate

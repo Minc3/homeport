@@ -660,9 +660,9 @@ func BuildLinkerEgressRuleset(cidrs []string, lanIface, overlayIP, overlaySubnet
 	b.WriteString("\t\ttype nat hook postrouting priority -10; policy accept;\n")
 	for _, c := range cidrs {
 		if overlaySubnet != "" {
-			fmt.Fprintf(&b, "\t\tip saddr %s ip daddr %s oifname %q snat to %s\n", c, overlaySubnet, lanIface, overlayIP)
+			fmt.Fprintf(&b, "\t\tip saddr %s ip daddr %s oifname %q snat to %s\n", c, overlaySubnet, nftSafe(lanIface), overlayIP)
 		}
-		fmt.Fprintf(&b, "\t\tip saddr %s %s oifname %q snat to %s\n", c, internetOnly, lanIface, overlayIP)
+		fmt.Fprintf(&b, "\t\tip saddr %s %s oifname %q snat to %s\n", c, internetOnly, nftSafe(lanIface), overlayIP)
 	}
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")

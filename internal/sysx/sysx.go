@@ -30,15 +30,44 @@ type ExecRunner struct {
 	Log *slog.Logger
 }
 
+// maxCommandOutput bounds what one command may hand back. The readbacks are
+// small by construction - the protection listing is terse and the state sets
+// are fetched by name - but a listing is still the kernel's answer to a
+// question, and a set an attacker filled is a large answer. A command that
+// exceeds this fails, which every caller treats as a failed read, rather than
+// growing the process by whatever the kernel had to say.
+const maxCommandOutput = 64 << 20
+
+// cappedBuffer is a bytes.Buffer that refuses to grow past maxCommandOutput.
+// The refusal fails the command: exec reports the write error, and the
+// output seen so far is discarded with it, because half a listing is not a
+// listing.
+type cappedBuffer struct {
+	bytes.Buffer
+	overflow bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if c.Len()+len(p) > maxCommandOutput {
+		c.overflow = true
+		return 0, fmt.Errorf("output exceeds %d bytes", maxCommandOutput)
+	}
+	return c.Buffer.Write(p)
+}
+
 // Run executes a command and returns its combined output.
 func (r *ExecRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
-	var out bytes.Buffer
+	var out cappedBuffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	err := cmd.Run()
+	if out.overflow {
+		err = fmt.Errorf("output exceeds %d bytes", maxCommandOutput)
+		out.Reset()
+	}
 	text := strings.TrimSpace(out.String())
 	if err != nil {
 		if r.Log != nil {
@@ -121,13 +150,16 @@ func isReadOnly(name string, args []string) bool {
 		return args[0] == "show" || args[0] == "showconf"
 	case "ip", "tc":
 		// Both put the verb after a subsystem word - `ip route show`,
-		// `tc qdisc show` - so the whole argument list is scanned. None of the
-		// mutating forms carry any of these words.
-		for _, a := range args {
-			if a == "show" || a == "get" || a == "list" {
-				return true
-			}
-		}
+		// `tc qdisc show` - with output flags (-o, -j, -4, -br) ahead of
+		// the subsystem. The verb is read from that position and nowhere
+		// else. This used to scan every argument for show, get or list,
+		// and every one of those is a legal Linux interface name: a path
+		// whose tunnel was called `list` turned `ip route replace ... dev
+		// list` into a read, which observe mode then ran for real. That is
+		// the one direction observe mode must never fail in, and an
+		// interface name is operator text.
+		verb := ipVerb(args)
+		return verb == "show" || verb == "get" || verb == "list" || verb == ""
 	case "nft":
 		// The verb, skipping the output flags: `-a` for handles and `-j` for
 		// JSON both come before it, and testing args[0] alone read the flag.
@@ -136,6 +168,20 @@ func isReadOnly(name string, args []string) bool {
 		return args[0] == "-n" // -w is the write form
 	}
 	return false
+}
+
+// ipVerb returns the command word of an `ip` or `tc` invocation: the token
+// after the subsystem word, which is itself the first token that is not an
+// option. `ip route` with no verb at all is a show, and reports as "".
+func ipVerb(args []string) string {
+	rest := args
+	for len(rest) > 0 && strings.HasPrefix(rest[0], "-") {
+		rest = rest[1:]
+	}
+	if len(rest) < 2 {
+		return ""
+	}
+	return rest[1]
 }
 
 // nftVerb returns nft's command word, which is the first argument that is not

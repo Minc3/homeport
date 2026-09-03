@@ -202,10 +202,13 @@ type Engine struct {
 	// protectOn records that the edge filtering table is really loaded, so the
 	// counters are only read when there is something to read. protectCounters
 	// and protectBlocked are the last sample of what the kernel reports.
-	protectOn        bool
-	protectCounters  []model.ProtectCounter
-	protectBlocked   []model.BlockedSource
-	protectGeoLocked []model.GeoLockedPort
+	protectOn       bool
+	protectCounters []model.ProtectCounter
+	protectBlocked  []model.BlockedSource
+	// protectBlockedTotal is how many sources the kernel reported parked;
+	// protectBlocked holds at most sysx's bounded share of them.
+	protectBlockedTotal int
+	protectGeoLocked    []model.GeoLockedPort
 	// statusAt is when the portal last asked for status, in unix nanoseconds.
 	// Atomic rather than under e.mu because Status reads that lock and would
 	// have to take it for writing to record this. See protectSampleIdleAfter.
@@ -290,14 +293,15 @@ type Engine struct {
 	// count before the load runs, so without this a refused load read as N
 	// networks, loaded, no error, while the kernel dropped nothing.
 	blLoadErr string
-	// blShrinkRefused is set while the feed keeps serving a list the shrink
+	// blRefused is set while the feed keeps serving a list the shrink guard
+	// or the coverage ceiling refuses; see refuseBlocklist. Formerly the shrink
 	// guard refuses. The state does not resolve itself, so the refusal is
 	// retried at the refresh interval rather than the failure cadence and
 	// said out loud once per streak rather than on every attempt: at fifteen
 	// minutes it was a full download, an Error line and an event row nearly
 	// a hundred times a day, pushing real events out of the Activity tab.
-	blShrinkRefused bool
-	blCounter       model.ProtectCounter
+	blRefused bool
+	blCounter model.ProtectCounter
 	// blMu serialises the two blocklist writers, applyBlocklist and the
 	// refresher, and it is a lock of its own rather than applyMu because the
 	// element load touches no route: an interval set of tens of thousands of
@@ -1445,7 +1449,7 @@ func (e *Engine) sampleProtect(ctx context.Context) {
 	if !on {
 		return
 	}
-	counters, blocked, locked, err := sysx.ProtectState(ctx, e.realRunner())
+	counters, blocked, blockedTotal, locked, err := sysx.ProtectState(ctx, e.realRunner())
 	if err != nil {
 		e.log.Debug("cannot read protection state", "err", err)
 		// The table may be gone underneath the agent - flushed by hand, or
@@ -1476,6 +1480,7 @@ func (e *Engine) sampleProtect(ctx context.Context) {
 	e.protectOn = true
 	e.protectCounters = counters
 	e.protectBlocked = blocked
+	e.protectBlockedTotal = blockedTotal
 	e.protectGeoLocked = locked
 	e.mu.Unlock()
 }
@@ -2242,9 +2247,28 @@ func (e *Engine) RevokeApproval(pathID int) error {
 func (e *Engine) Pin(pathID int) error {
 	e.mu.Lock()
 	if pathID != 0 {
-		if _, ok := e.cfg.PathByID(pathID); !ok {
+		p, ok := e.cfg.PathByID(pathID)
+		if !ok {
 			e.mu.Unlock()
 			return fmt.Errorf("unknown path %d", pathID)
+		}
+		// A pin to a path that is down, degraded or quarantined is an
+		// operator override and stays one: selectPath honours it and says
+		// so. A pin to a path that is over quota or disabled is different
+		// in kind. Quota is a policy block with a time-boxed approval
+		// beside it precisely so that a 2am click cannot switch enforcement
+		// off for the month, and a pin has no expiry, so honouring it here
+		// was that outcome by another button. Disabled is the operator's
+		// own instruction, contradicted. Both are refused with the button
+		// that does the job named. Read under the lock evaluate writes it
+		// under, so the verdict is the one the decision loop holds.
+		switch e.blocks[pathID] {
+		case model.BlockQuota:
+			e.mu.Unlock()
+			return fmt.Errorf("%s is over quota; approve the overage instead, which is time-boxed", p.Name)
+		case model.BlockDisabled:
+			e.mu.Unlock()
+			return fmt.Errorf("%s is disabled; enable it in settings before pinning it", p.Name)
 		}
 	}
 	e.pinned = pathID
@@ -2696,9 +2720,10 @@ func (e *Engine) protectStatus() *model.ProtectStatus {
 		return nil
 	}
 	return &model.ProtectStatus{
-		Counters:  e.protectCounters,
-		Blocked:   e.protectBlocked,
-		GeoLocked: e.protectGeoLocked,
+		Counters:     e.protectCounters,
+		Blocked:      e.protectBlocked,
+		BlockedTotal: e.protectBlockedTotal,
+		GeoLocked:    e.protectGeoLocked,
 	}
 }
 

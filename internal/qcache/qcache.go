@@ -45,11 +45,18 @@ type Config struct {
 	// redirected queries reach these sockets.
 	Bind string
 
-	// RefreshEvery is the upstream poll interval while a port is being
-	// queried, and it is the staleness a browser normally sees. The refresh
-	// stream rides the active tunnel, so it is billed during an LTE failover:
-	// at the shipped 3s an actively queried port costs about 25 MB a month,
-	// and an idle port costs nothing at all, which is what IdleAfter is for.
+	// RefreshEvery is the upstream poll interval for INFO and PLAYER while a
+	// port is being queried, and it is the staleness a browser normally
+	// sees. RULES is polled at rulesRefreshMultiplier times this, because it
+	// changes on a map change and not per second, and it is by far the
+	// largest of the three replies. The refresh stream rides the active
+	// tunnel, so it is billed during an LTE failover. At the shipped 3s an
+	// actively queried port costs INFO plus PLAYER every 3s, a few hundred
+	// bytes each way on a quiet server and low single-digit KB with a full
+	// player list, so roughly 10 to 100 MB a month, plus RULES every 15s,
+	// which on a heavily modded server is tens of KB a time and can be the
+	// larger share. An idle port costs nothing at all, which is what
+	// IdleAfter is for.
 	RefreshEvery time.Duration
 
 	// IdleAfter stops refreshing a port this long after its last query. The
@@ -70,6 +77,13 @@ type Config struct {
 	// UpstreamTimeout bounds one refresh round trip.
 	UpstreamTimeout time.Duration
 
+	// PaceBurst and PaceRefill size the per-source reply-byte budget
+	// (pace.go), in bytes and bytes per second. Zero takes the shipped
+	// figures; they exist for the tests, which cannot send half a megabyte
+	// to watch a bucket empty.
+	PaceBurst  int
+	PaceRefill int
+
 	Log *slog.Logger
 }
 
@@ -82,6 +96,19 @@ const (
 	DefaultStaleAfter      = 10 * time.Second
 	defaultIdleAfter       = 60 * time.Second
 	defaultUpstreamTimeout = 2 * time.Second
+
+	// rulesRefreshMultiplier stretches both the RULES refresh interval and
+	// its staleness bound. RULES is the reply that made the metered cost of
+	// the refresh stream real: a modded server's rules dump is routinely tens
+	// of KB and up to maxFragments datagrams, and INFO's cadence polled it
+	// down the billed tunnel twenty times a minute for as long as any real
+	// address kept asking. It changes on a map change, so a browser reading
+	// one fifteen seconds old is not reading anything wrong. The staleness
+	// bound scales with it for the reason the engine holds the three-interval
+	// floor: between polls every answer is served from the window, and a
+	// window sized for INFO's cadence would have RULES go dark for most of
+	// its own.
+	rulesRefreshMultiplier = 5
 )
 
 // Cacher runs one responder and one refresher per port. Build with New, run
@@ -112,6 +139,12 @@ func New(cfg Config) *Cacher {
 	if cfg.UpstreamTimeout <= 0 {
 		cfg.UpstreamTimeout = defaultUpstreamTimeout
 	}
+	if cfg.PaceBurst <= 0 {
+		cfg.PaceBurst = paceBurstBytes
+	}
+	if cfg.PaceRefill <= 0 {
+		cfg.PaceRefill = paceRefillPerSec
+	}
 	log := cfg.Log
 	if log == nil {
 		log = slog.Default()
@@ -125,7 +158,8 @@ func New(cfg Config) *Cacher {
 	}
 	c := &Cacher{cfg: cfg, log: log, secret: secret, bound: make(chan struct{})}
 	for _, p := range cfg.Ports {
-		pc := &portCache{cfg: p, c: c, nudge: make(chan struct{}, 1)}
+		pc := &portCache{cfg: p, c: c, nudge: make(chan struct{}, 1),
+			pace: newPacer(cfg.PaceBurst, cfg.PaceRefill, paceIdleAfter, paceMaxSources)}
 		pc.info.fetchOK = true
 		pc.player.fetchOK = true
 		pc.rules.fetchOK = true
@@ -169,17 +203,19 @@ func (c *Cacher) Snapshot() []model.QueryCacheState {
 	out := make([]model.QueryCacheState, 0, len(c.ports))
 	for _, p := range c.ports {
 		st := model.QueryCacheState{
-			Port:         p.cfg.Port,
-			Service:      p.cfg.Service,
-			Target:       p.cfg.Target,
-			Answered:     p.answered.Load(),
-			Challenged:   p.challenged.Load(),
-			Unanswered:   p.unanswered.Load(),
-			InfoAgeSec:   p.info.ageSec(now),
-			PlayerAgeSec: p.player.ageSec(now),
-			RulesAgeSec:  p.rules.ageSec(now),
-			StaleSec:     c.cfg.StaleAfter.Seconds(),
-			Error:        p.bindErrString(),
+			Port:          p.cfg.Port,
+			Service:       p.cfg.Service,
+			Target:        p.cfg.Target,
+			Answered:      p.answered.Load(),
+			Challenged:    p.challenged.Load(),
+			Unanswered:    p.unanswered.Load(),
+			Paced:         p.paced.Load(),
+			InfoAgeSec:    p.info.ageSec(now),
+			PlayerAgeSec:  p.player.ageSec(now),
+			RulesAgeSec:   p.rules.ageSec(now),
+			StaleSec:      c.cfg.StaleAfter.Seconds(),
+			RulesStaleSec: c.rulesStaleAfter().Seconds(),
+			Error:         p.bindErrString(),
 		}
 		if st.RefreshError = p.info.lastErr(); st.RefreshError == "" {
 			if st.RefreshError = p.player.lastErr(); st.RefreshError == "" {
@@ -192,7 +228,17 @@ func (c *Cacher) Snapshot() []model.QueryCacheState {
 	return out
 }
 
-// cacheEntry is one cached reply (INFO or PLAYER) for one port. The
+// rulesRefreshEvery and rulesStaleAfter are the RULES cadence and window,
+// both the INFO figure stretched by rulesRefreshMultiplier.
+func (c *Cacher) rulesRefreshEvery() time.Duration {
+	return c.cfg.RefreshEvery * rulesRefreshMultiplier
+}
+
+func (c *Cacher) rulesStaleAfter() time.Duration {
+	return c.cfg.StaleAfter * rulesRefreshMultiplier
+}
+
+// cacheEntry is one cached reply (INFO, PLAYER or RULES) for one port. The
 // datagrams are stored exactly as the upstream sent them, multi-packet
 // fragments included, and replayed verbatim: the cache never parses a
 // payload it serves, so there is no reassembly of its own to get wrong.
@@ -263,6 +309,11 @@ type portCache struct {
 	answered   atomic.Uint64
 	challenged atomic.Uint64
 	unanswered atomic.Uint64
+	paced      atomic.Uint64
+
+	// pace is the per-source reply-byte budget, the half of the
+	// anti-amplification story the challenge does not cover. See pace.go.
+	pace *pacer
 
 	// nudge wakes the refresher the moment a query finds the cache cold, so
 	// the client's retry after its challenge usually finds it warm. Buffered
@@ -331,11 +382,11 @@ func (p *portCache) serve(ctx context.Context) {
 		case queryInfoBare, queryPlayerBare, queryRulesBare:
 			p.sendChallenge(src, now)
 		case queryInfoChallenged:
-			p.answerOrChallenge(&p.info, src, ch, now)
+			p.answerOrChallenge(&p.info, src, ch, now, p.c.cfg.StaleAfter)
 		case queryPlayerChallenged:
-			p.answerOrChallenge(&p.player, src, ch, now)
+			p.answerOrChallenge(&p.player, src, ch, now, p.c.cfg.StaleAfter)
 		case queryRulesChallenged:
-			p.answerOrChallenge(&p.rules, src, ch, now)
+			p.answerOrChallenge(&p.rules, src, ch, now, p.c.rulesStaleAfter())
 		}
 	}
 }
@@ -357,7 +408,7 @@ func (p *portCache) verify(src *net.UDPAddr, got []byte, now time.Time) bool {
 	return false
 }
 
-func (p *portCache) answerOrChallenge(e *cacheEntry, src *net.UDPAddr, ch []byte, now time.Time) {
+func (p *portCache) answerOrChallenge(e *cacheEntry, src *net.UDPAddr, ch []byte, now time.Time, staleAfter time.Duration) {
 	if !p.verify(src, ch, now) {
 		// A wrong challenge is an expired one, or a spoofer guessing. Either
 		// way the answer is a fresh challenge, never a payload - and never a
@@ -366,13 +417,29 @@ func (p *portCache) answerOrChallenge(e *cacheEntry, src *net.UDPAddr, ch []byte
 		return
 	}
 	e.stampDemand(now)
-	datagrams := e.fresh(now, p.c.cfg.StaleAfter)
+	datagrams := e.fresh(now, staleAfter)
 	if datagrams == nil {
 		// Correctly challenged and nothing fresh to say. Dropping is the
 		// honest answer - a stale reply advertises a server that may be gone -
 		// and the nudge means the client's next retry usually lands warm.
 		p.maybeNudge()
 		p.unanswered.Add(1)
+		return
+	}
+	// A verified source is a real address, and the challenge has nothing to
+	// say about how much a real address may draw: it proved itself once per
+	// bucket and could then take the whole reply, up to maxFragments
+	// datagrams, for every 9-byte query it cared to send. The bucket is
+	// charged for the whole reply or not at all, so a browser never receives
+	// half a multi-packet reply to wait on. Dropped, not challenged: the
+	// source has already proved itself, and a challenge would be a fresh
+	// round trip for a client that has simply been served enough.
+	total := 0
+	for _, d := range datagrams {
+		total += len(d)
+	}
+	if !p.pace.allow(src.IP, total, now) {
+		p.paced.Add(1)
 		return
 	}
 	for _, d := range datagrams {
@@ -395,13 +462,13 @@ func (p *portCache) refresh(ctx context.Context) {
 		case <-t.C:
 		}
 		now := time.Now()
-		p.refreshEntry(ctx, &p.info, "info", infoRequest, now)
-		p.refreshEntry(ctx, &p.player, "players", playerRequest, now)
-		p.refreshEntry(ctx, &p.rules, "rules", rulesRequest, now)
+		p.refreshEntry(ctx, &p.info, "info", infoRequest, now, p.c.cfg.RefreshEvery)
+		p.refreshEntry(ctx, &p.player, "players", playerRequest, now, p.c.cfg.RefreshEvery)
+		p.refreshEntry(ctx, &p.rules, "rules", rulesRequest, now, p.c.rulesRefreshEvery())
 	}
 }
 
-func (p *portCache) refreshEntry(ctx context.Context, e *cacheEntry, what string, build func([]byte) []byte, now time.Time) {
+func (p *portCache) refreshEntry(ctx context.Context, e *cacheEntry, what string, build func([]byte) []byte, now time.Time, every time.Duration) {
 	e.mu.Lock()
 	wanted := !e.demand.IsZero() && now.Sub(e.demand) <= p.c.cfg.IdleAfter
 	// Due is measured from the last attempt, not the last success: the ticker
@@ -409,7 +476,7 @@ func (p *portCache) refreshEntry(ctx context.Context, e *cacheEntry, what string
 	// fetched alone a failing upstream was due again on every tick - see the
 	// field. A zero attempted (never tried) is due at once, which is what the
 	// cold-cache nudge exists for.
-	due := e.attempted.IsZero() || now.Sub(e.attempted) >= p.c.cfg.RefreshEvery
+	due := e.attempted.IsZero() || now.Sub(e.attempted) >= every
 	e.mu.Unlock()
 	if !wanted || !due {
 		return

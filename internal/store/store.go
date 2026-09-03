@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -700,26 +701,48 @@ func (s *Store) HasUsers() (bool, error) {
 	return n > 0, nil
 }
 
-// CheckPassword verifies credentials in constant time.
+// CheckPassword verifies credentials in constant time, and in constant cost:
+// an unknown account is charged the same hash a wrong password is. Without
+// that, a missing row answered in microseconds against hundreds of
+// milliseconds for a real one, and the response text being identical did not
+// make the timing so. What it gives away is small (whether the shipped
+// account name was changed), and the fix is one hash against a fixed salt.
 func (s *Store) CheckPassword(username, password string) bool {
 	var saltHex, hashHex string
 	err := s.db.QueryRow(`SELECT salt, hash FROM users WHERE username = ?`, username).Scan(&saltHex, &hashHex)
 	if err != nil {
-		return false
+		return burnHash(password)
 	}
 	salt, err := hex.DecodeString(saltHex)
 	if err != nil {
-		return false
+		return burnHash(password)
 	}
 	want, err := hex.DecodeString(hashHex)
 	if err != nil {
-		return false
+		return burnHash(password)
 	}
+	hashesSpent.Add(1)
 	got, err := pbkdf2.Key(sha256.New, password, salt, pbkdf2Iterations, 32)
 	if err != nil {
 		return false
 	}
 	return subtle.ConstantTimeCompare(got, want) == 1
+}
+
+// hashesSpent counts password hashes, so the constant-cost property can be
+// pinned structurally rather than by a clock that is flaky on CI.
+var hashesSpent atomic.Int64
+
+// HashesSpent reports how many password hashes this process has computed.
+func HashesSpent() int64 { return hashesSpent.Load() }
+
+// burnHash spends the cost of a real check and answers false. The salt is
+// fixed and public because nothing derived from it is ever compared or
+// stored; it exists to make the two branches take the same time.
+func burnHash(password string) bool {
+	hashesSpent.Add(1)
+	_, _ = pbkdf2.Key(sha256.New, password, []byte("no-such-account-"), pbkdf2Iterations, 32)
+	return false
 }
 
 // NewSession issues a session token.

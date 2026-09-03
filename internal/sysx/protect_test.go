@@ -368,7 +368,7 @@ func TestProtectStateIsReadFromTheKernel(t *testing.T) {
 		"nft -j list set ip failover_protect geo_lockdown_udp": lockSet,
 	}}
 
-	counters, blocked, locked, err := ProtectState(context.Background(), f)
+	counters, blocked, _, locked, err := ProtectState(context.Background(), f)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -460,7 +460,7 @@ func TestProtectStateReadsElementsOnlyFromTheSetListings(t *testing.T) {
 		"nft -j list set ip failover_protect blocked": blockedSet,
 	}}
 
-	_, blocked, _, err := ProtectState(context.Background(), f)
+	_, blocked, _, _, err := ProtectState(context.Background(), f)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -484,7 +484,7 @@ func TestProtectStateWithNoStateSetsIsOneCommand(t *testing.T) {
 		"nft -j -t list table ip failover_protect": table,
 	}}
 
-	counters, blocked, locked, err := ProtectState(context.Background(), f)
+	counters, blocked, _, locked, err := ProtectState(context.Background(), f)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -879,7 +880,7 @@ func TestAShrinkRefusalIsRetriedAtTheIntervalAndReportedOnce(t *testing.T) {
 
 	e.refreshBlocklist(context.Background())
 	e.refreshBlocklist(context.Background())
-	if !e.blShrinkRefused {
+	if !e.blRefused {
 		t.Fatal("two refusals did not record a streak")
 	}
 	events, err := e.st.Events(50)
@@ -914,7 +915,7 @@ func TestAShrinkRefusalIsRetriedAtTheIntervalAndReportedOnce(t *testing.T) {
 	// is a new one and is said out loud again.
 	feed.body = strings.Join(loaded, "\n") + "\n"
 	e.refreshBlocklist(context.Background())
-	if e.blShrinkRefused {
+	if e.blRefused {
 		t.Error("an accepted list did not end the refusal streak")
 	}
 }
@@ -989,5 +990,101 @@ func TestTheRunnerSwapWaitsOnARefreshInProgress(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the swap never completed once the load finished")
+	}
+}
+
+// A network shorter than /8 that survives the reserved strip is never honest,
+// so the whole list is refused the way a bad line is, and the loaded list
+// stays. The reserved entries the real feed carries are stripped, not
+// refused: 224.0.0.0/4 and 10.0.0.0/8 are in level1 every day.
+func TestAShortPrefixRefusesTheWholeFeedAndKeepsTheLoadedList(t *testing.T) {
+	e, _ := blocklistEngine(t, t.TempDir())
+	e.rememberBlocklist([]string{"203.0.113.0/24"})
+
+	feed := &feedServer{body: "198.51.100.0/24\n32.0.0.0/3\n192.0.2.0/24\n"}
+	e.blURL = feed.start(t).URL
+	e.blClient = http.DefaultClient
+	e.refreshBlocklist(context.Background())
+	if e.blCount != 1 || e.blNetworks[0] != "203.0.113.0/24" {
+		t.Fatalf("the refused list replaced the loaded one: %v", e.blNetworks)
+	}
+	if !strings.Contains(e.blLastErr, "32.0.0.0/3") {
+		t.Fatalf("the status does not name the entry: %q", e.blLastErr)
+	}
+	if e.blRefused {
+		t.Fatal("a prefix refusal is a failure, retried at the failure cadence, not a state")
+	}
+
+	feed.body = "224.0.0.0/4\n10.0.0.0/8\n198.51.100.0/24\n"
+	e.refreshBlocklist(context.Background())
+	if e.blCount != 1 || e.blLastErr != "" {
+		t.Fatalf("the honest reserved entries were refused: count=%d err=%q", e.blCount, e.blLastErr)
+	}
+}
+
+// Coverage over the ceiling is a state like a shrink: the feed serves the
+// same list until somebody looks, so it is said once per streak, retried at
+// the refresh interval, and ends when a list is accepted.
+func TestCoverageOverTheCeilingIsRefusedAsAState(t *testing.T) {
+	e, _ := blocklistEngine(t, t.TempDir())
+	e.rememberBlocklist([]string{"203.0.113.0/24"})
+
+	var wide []string
+	for i := 1; i <= 9; i++ {
+		wide = append(wide, fmt.Sprintf("%d.0.0.0/8", i*3))
+	}
+	feed := &feedServer{body: strings.Join(wide, "\n") + "\n"}
+	e.blURL = feed.start(t).URL
+	e.blClient = http.DefaultClient
+
+	e.refreshBlocklist(context.Background())
+	e.refreshBlocklist(context.Background())
+	if !e.blRefused || e.blCount != 1 {
+		t.Fatalf("coverage refusal did not hold as a state with the loaded list kept: refused=%v count=%d", e.blRefused, e.blCount)
+	}
+	if !strings.Contains(e.blLastErr, "covers") {
+		t.Fatalf("status does not say why: %q", e.blLastErr)
+	}
+	events, err := e.st.Events(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusals := 0
+	for _, ev := range events {
+		if strings.Contains(fmt.Sprintf("%+v", ev), "refused") {
+			refusals++
+		}
+	}
+	if refusals != 1 {
+		t.Fatalf("two refusals in one streak wrote %d event rows, want 1", refusals)
+	}
+	e.blLastTry = time.Now().Add(-blocklistRetryEvery - time.Minute)
+	before := feed.requests
+	e.maybeRefreshBlocklist(context.Background())
+	if feed.requests != before {
+		t.Error("a coverage refusal was retried at the failure cadence rather than the refresh interval")
+	}
+	feed.body = "203.0.113.0/24\n198.51.100.0/24\n"
+	e.refreshBlocklist(context.Background())
+	if e.blRefused || e.blCount != 2 {
+		t.Fatalf("an accepted list did not end the streak: refused=%v count=%d", e.blRefused, e.blCount)
+	}
+}
+
+// The cache is installed at boot without a fetch, so a list a build without
+// these guards wrote to disk goes through them on the way in. Refused, the
+// engine starts with no list rather than that one, and the refresher fetches
+// and judges the feed's copy within the minute.
+func TestARefusedCachedListIsNotInstalledAtBoot(t *testing.T) {
+	dir := t.TempDir()
+	cache := blocklistCache{Networks: []string{"203.0.113.0/24", "32.0.0.0/3"}, Fetched: time.Now()}
+	raw, _ := json.Marshal(cache)
+	if err := os.WriteFile(filepath.Join(dir, blocklistCacheFile), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := blocklistEngine(t, dir)
+	e.loadBlocklistCache()
+	if e.blCount != 0 || len(e.blNetworks) != 0 {
+		t.Fatalf("a refused cache was installed: %v", e.blNetworks)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -234,6 +235,14 @@ func validate(cfg *model.Config) error {
 	if cfg.Frontend.BackendEgress && trimmed(cfg.Frontend.PublicIface) == "" {
 		return errors.New("backend egress needs the frontend's public interface set")
 	}
+	if cfg.Frontend.PublicIface != "" {
+		if err := ifaceName(cfg.Frontend.PublicIface); err != nil {
+			return fmt.Errorf("public interface: %w", err)
+		}
+	}
+	if err := validateNotify(&cfg.Notify); err != nil {
+		return err
+	}
 	// IPv4 specifically, for the reason parseIPv4Network exists a few hundred
 	// lines down: this value is rendered into `table ip failover` as `ip daddr`
 	// and into `table ip failover_egress` as `snat to`, and nft rejects a whole
@@ -441,6 +450,7 @@ func validate(cfg *model.Config) error {
 
 	seenID := map[int]bool{}
 	seenTable := map[int]bool{}
+	seenIface := map[string]string{}
 	seenMark := map[int]bool{}
 	for i := range cfg.Paths {
 		p := &cfg.Paths[i]
@@ -465,6 +475,19 @@ func validate(cfg *model.Config) error {
 		if trimmed(p.Iface) == "" {
 			return fmt.Errorf("path %s needs an interface", p.Name)
 		}
+		if err := ifaceName(p.Iface); err != nil {
+			return fmt.Errorf("path %s: %w", p.Name, err)
+		}
+		// Two paths on one tunnel measure one tunnel, which is the failure
+		// the per-path tables and marks exist to prevent (invariant 3), and
+		// the interface is the one identity of a path that those two checks
+		// do not cover. It is also a repeated element in an anonymous set
+		// in three generated rulesets, which nft rejects whole.
+		if other, dup := seenIface[p.Iface]; dup {
+			return fmt.Errorf("paths %s and %s both use interface %s; each path needs its own tunnel",
+				other, p.Name, p.Iface)
+		}
+		seenIface[p.Iface] = p.Name
 		if p.Table <= 0 || p.Table > 252 {
 			return fmt.Errorf("path %s needs a routing table between 1 and 252", p.Name)
 		}
@@ -1261,6 +1284,19 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		clientErr(w, errors.New("an approval cannot outlast the billing period"))
 		return
 	}
+	// Bounded before the conversion, because the conversion is where the
+	// harm is: a negative, non-finite or oversized figure lands out of int64's
+	// range, which Go converts to MinInt64 on amd64, and a negative ExtraBytes
+	// is read by quota.Evaluate as "no byte limit". That is the one thing the
+	// time box exists to stop a 2am click from doing, reached by typo.
+	if math.IsNaN(req.ExtraGB) || math.IsInf(req.ExtraGB, 0) || req.ExtraGB < 0 {
+		clientErr(w, errors.New("extra data must be a non-negative number of gigabytes"))
+		return
+	}
+	if req.ExtraGB > float64(store.MaxLedgerValue>>30) {
+		clientErr(w, fmt.Errorf("extra data cannot exceed %d GB", store.MaxLedgerValue>>30))
+		return
+	}
 	extra := int64(req.ExtraGB * float64(1<<30))
 	if err := s.eng.Approve(req.PathID, time.Duration(req.Hours*float64(time.Hour)), extra); err != nil {
 		clientErr(w, err)
@@ -1399,4 +1435,78 @@ func cleanNetworkList(items []string, what string) ([]string, error) {
 		cleaned = append(cleaned, netw)
 	}
 	return cleaned, nil
+}
+
+// ifaceName holds an interface name to what the kernel allows and what this
+// system can carry safely. The name reaches nft text (an ifname match, quoted
+// with no escape processing on nft's side), `ip` and `tc` argv, and a sysctl
+// key, all as root, and used to be checked only for being non-empty.
+//
+// The kernel's own rule is 1 to 15 bytes with no slash, whitespace or
+// control character. This is narrower, ASCII letters, digits and the four
+// punctuation marks real names carry (a VLAN's dot, macvlan's @, a bond's
+// hyphen, an alias's colon), because nothing here needs the rest and the
+// generators are cheaper to reason about without it. The three iproute2
+// read verbs are refused too: the observe-mode gate reads its verb by
+// position now, so a tunnel called `list` no longer turns a route replace
+// into a read, but a name that is also a command word is a name waiting for
+// the next scan.
+func ifaceName(name string) error {
+	if len(name) > 15 {
+		return fmt.Errorf("interface name %q is longer than the 15 bytes the kernel allows", name)
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("interface name %q is not a name", name)
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-', c == '_', c == '.', c == ':', c == '@':
+		default:
+			return fmt.Errorf("interface name %q may only contain letters, digits, '-', '_', '.', ':' and '@'", name)
+		}
+	}
+	switch name {
+	case "show", "get", "list":
+		return fmt.Errorf("interface name %q is an ip/tc command word; give the interface another name", name)
+	}
+	return nil
+}
+
+// validateNotify bounds where alerts are sent. The URL names a host this root
+// process posts to, with the bearer token in a header and, for Telegram, the
+// bot token in the path, and it used to go straight from the form into the
+// request with no check at all: any scheme Go's transport accepts, any host,
+// and an unrecognised kind silently meaning "webhook", which is the branch
+// that sends the token to whatever the URL says. Refused rather than
+// defaulted, because a typo in Kind is exactly how the token reaches the
+// wrong host.
+func validateNotify(n *model.NotifyConfig) error {
+	n.Kind = strings.ToLower(trimmed(n.Kind))
+	n.URL = trimmed(n.URL)
+	if !n.Enabled && n.URL == "" {
+		return nil
+	}
+	switch n.Kind {
+	case "webhook", "ntfy", "telegram":
+	case "":
+		return errors.New("notifications need a kind: ntfy, telegram or webhook")
+	default:
+		return fmt.Errorf("notification kind %q is not one of ntfy, telegram or webhook", n.Kind)
+	}
+	if n.URL == "" {
+		return errors.New("notifications need a URL")
+	}
+	u, err := url.Parse(n.URL)
+	if err != nil {
+		return fmt.Errorf("notification URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("notification URL must start with http:// or https://, not %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return errors.New("notification URL has no host")
+	}
+	return nil
 }

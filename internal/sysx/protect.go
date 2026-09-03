@@ -740,7 +740,7 @@ func (p *parkChains) write(b *strings.Builder) {
 		// A rule of its own, deliberately: a full blocklist breaks this one
 		// and leaves the drop below to run. See parkChains.
 		b.WriteString("\t\tadd @blocked { ip saddr }\n")
-		fmt.Fprintf(b, "\t\tcounter drop comment %q\n", c.comment)
+		fmt.Fprintf(b, "\t\tcounter drop comment %q\n", nftSafe(c.comment))
 		b.WriteString("\t}\n\n")
 	}
 }
@@ -906,7 +906,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	var parks parkChains
 	tail := func(comment string) string {
 		if !park {
-			return fmt.Sprintf("counter drop comment %q", comment)
+			return fmt.Sprintf("counter drop comment %q", nftSafe(comment))
 		}
 		return "jump " + parks.target(comment)
 	}
@@ -921,7 +921,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	// --- raw: before conntrack -------------------------------------------
 	rules.WriteString("\tchain raw {\n")
 	rules.WriteString("\t\ttype filter hook prerouting priority raw; policy accept;\n")
-	fmt.Fprintf(&rules, "\t\tiifname != %q accept\n", iface)
+	fmt.Fprintf(&rules, "\t\tiifname != %q accept\n", nftSafe(iface))
 	if park {
 		rules.WriteString("\t\t# Parked sources cost one set lookup and nothing else.\n")
 		fmt.Fprintf(&rules, "\t\tip saddr @blocked counter drop comment %q\n", CounterBlocked)
@@ -968,7 +968,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 				fmt.Fprintf(&rules, "\t\t%s dport %s limit rate over %d/second update @%s { th dport timeout %ds } counter comment %q\n",
 					sv.Proto, portSpec(sv.Port, sv.PortEnd), sv.GeoAutoPPS,
 					geoLockSetName(sv.Proto), spec.geoLockSeconds(),
-					CounterGeoTrip+":"+sv.Name)
+					nftSafe(CounterGeoTrip+":"+sv.Name))
 				lockCond = fmt.Sprintf("th dport @%s ", geoLockSetName(sv.Proto))
 			}
 			if sv.GeoBlock {
@@ -981,7 +981,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 					}
 					fmt.Fprintf(&rules, "\t\t%s dport %s %sip saddr @%s counter drop comment %q\n",
 						sv.Proto, portSpec(sv.Port, sv.PortEnd), lockCond,
-						GeoSetName(name), CounterGeo+":"+sv.Name)
+						GeoSetName(name), nftSafe(CounterGeo+":"+sv.Name))
 				}
 				continue
 			}
@@ -995,7 +995,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 			}
 			fmt.Fprintf(&rules, "\t\t%s dport %s %s%scounter drop comment %q\n",
 				sv.Proto, portSpec(sv.Port, sv.PortEnd), lockCond, matches.String(),
-				CounterGeo+":"+sv.Name)
+				nftSafe(CounterGeo+":"+sv.Name))
 		}
 	}
 	rules.WriteString("\t}\n\n")
@@ -1003,7 +1003,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 	// --- filter: after conntrack, before dstnat ---------------------------
 	rules.WriteString("\tchain filter {\n")
 	rules.WriteString("\t\ttype filter hook prerouting priority mangle; policy accept;\n")
-	fmt.Fprintf(&rules, "\t\tiifname != %q accept\n", iface)
+	fmt.Fprintf(&rules, "\t\tiifname != %q accept\n", nftSafe(iface))
 
 	if spec.DropInvalid {
 		rules.WriteString("\t\t# Packets conntrack cannot place in any connection.\n")
@@ -1076,7 +1076,7 @@ func BuildProtectRuleset(spec ProtectSpec) string {
 		}
 		fmt.Fprintf(&rules, "\t\t%s dport %s limit rate over %d/second burst %d packets counter drop comment %q\n",
 			sv.Proto, portSpec(sv.Port, sv.PortEnd), sv.CeilingPPS, sv.CeilingPPS,
-			CounterCeiling+":"+sv.Name)
+			nftSafe(CounterCeiling+":"+sv.Name))
 	}
 
 	rules.WriteString("\t}\n")
@@ -1139,14 +1139,14 @@ func RemoveProtectRuleset(ctx context.Context, r Runner) {
 // without double-counting the blocklist. Only sets the table listing declares
 // are fetched: on a site with no parking and no automatic locks this stays
 // one command, and a set that is never fetched cannot error for being absent.
-func ProtectState(ctx context.Context, r Runner) ([]model.ProtectCounter, []model.BlockedSource, []model.GeoLockedPort, error) {
+func ProtectState(ctx context.Context, r Runner) ([]model.ProtectCounter, []model.BlockedSource, int, []model.GeoLockedPort, error) {
 	out, err := r.Run(ctx, "nft", "-j", "-t", "list", "table", "ip", NFTProtectTable)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, 0, nil, err
 	}
 	counters, present, err := parseProtectCounters(out)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, 0, nil, err
 	}
 	var blocked []model.BlockedSource
 	var locked []model.GeoLockedPort
@@ -1165,19 +1165,34 @@ func ProtectState(ctx context.Context, r Runner) ([]model.ProtectCounter, []mode
 			// or reloaded underneath the agent. Half a readback is not a
 			// readback, and the caller's answer to any error here (drop the
 			// reload latch, sample again next tick) is the right one.
-			return nil, nil, nil, err
+			return nil, nil, 0, nil, err
 		}
 		b, l, err := parseProtectSetElems(setOut)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, 0, nil, err
 		}
 		blocked = append(blocked, b...)
 		locked = append(locked, l...)
 	}
 	sort.Slice(blocked, func(i, j int) bool { return blocked[i].ExpiresSec > blocked[j].ExpiresSec })
 	sort.Slice(locked, func(i, j int) bool { return locked[i].Port < locked[j].Port })
-	return counters, blocked, locked, nil
+	// The parked list is bounded on the way out, and the count is carried
+	// beside it. The set is sized for sourceSetSize entries, and a flood that
+	// parks a large share of that is exactly when this runs every five
+	// seconds: the whole list was held by the engine and serialised into
+	// every status poll, a multi-megabyte body per second per viewer, while
+	// the engine was deciding failovers. The portal showed twenty of them.
+	total := len(blocked)
+	if total > maxBlockedReported {
+		blocked = blocked[:maxBlockedReported]
+	}
+	return counters, blocked, total, locked, nil
 }
+
+// maxBlockedReported is how many parked sources ProtectState hands back. The
+// longest-remaining are kept, since those are the ones an operator can still
+// act on, and the total says how many there are.
+const maxBlockedReported = 100
 
 // parseProtectCounters reads the rules' counters out of a table listing, and
 // reports which sets the table declares so ProtectState knows what to fetch.

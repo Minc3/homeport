@@ -140,6 +140,7 @@ func TestCheckConfigAppliesNothing(t *testing.T) {
 	file.Protect.Enabled = true
 	file.Protect.Regions = []model.GeoRegion{{Name: "oceania", CIDRs: []string{"203.0.113.0/24"}}}
 	file.Notify.Enabled = true
+	file.Notify.URL = "https://ntfy.example/homeport"
 
 	if rec := postCheck(t, srv, file); rec.Code != http.StatusOK {
 		t.Fatalf("status %d, want 200: %s", rec.Code, rec.Body.String())

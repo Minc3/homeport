@@ -270,6 +270,15 @@ coming back to traffic returning to it, against roughly 100s before. Failover
    reply leaves by the tunnel the request arrived on.
 4. Frontend matches the reply to its outstanding sequence and records an RTT.
    Unanswered probes are resolved as lost after the timeout.
+   The match is on three things: a pending sequence, the nonce that probe
+   carried, and this prober's own path id. The backend echoes the nonce and
+   the frontend used to throw it away, matching on sequence alone, and every
+   generation counted from zero: an authentic reply captured off the wire
+   answered again on any later probe reusing its sequence, injected at the
+   overlay address from any position the backend forwards for, and what it
+   bought was a condemned tunnel that kept resolving its probes as answered.
+   Each generation now also seeds its sequence at random, so a captured
+   reply does not even name a probe the new generation will send.
 5. Results are delivered to the tracker **in sequence order** (`Prober.flush`).
 
 ### The linker control channel (TCP, JSON, linker dials frontend)
@@ -1045,6 +1054,29 @@ reports a version mismatch as `ErrProbeVersion` rather than folding it into
 operator to look at completely different things, and "check that the shared
 secret is identical" during a staged upgrade is the one thing that is fine.
 
+**Every operator string rendered into ruleset text goes through
+`sysx.nftSafe`, because Go's `%q` was not the boundary it looked like.**
+nftables' lexer reads a quoted string as everything up to the next double
+quote with no escape processing at all, so the `\"` Go emits for a quote does
+not neutralise it: the string ends there and the rest of the value is lexed as
+rule text, loaded as root. Service names reach comments and interface names
+reach `ifname` matches that way, and interface names were checked for nothing
+but being non-empty. `web.validate` now holds an interface name to the
+kernel's own shape (`ifaceName`: fifteen bytes, letters, digits and the four
+punctuation marks real names carry, not one of the three iproute2 read verbs)
+and refuses two paths on one interface, and the generators strip quotes,
+backslashes, control and non-ASCII bytes and cap the length regardless of what
+the blob holds, since a blob saved before the check is exactly what reaches
+them. A clean ASCII name is not moved by a byte, which is what keeps every
+existing ruleset identical; `sysx/hardening_test.go` pins both halves.
+
+**The per-interface sysctl keys are in slash form.** `net.ipv4.conf.<iface>.rp_filter`
+splits on every dot, so a VLAN sub-interface (`eth0.100`) named a device that
+does not exist: the write failed on every reconcile tick, `rp_filter` stayed
+at the system default, and the path read as dead for the §8 reason with the
+sysctl error as the only clue. `sysx.rpFilterKey` renders
+`net/ipv4/conf/<iface>/rp_filter`, where sysctl(8) takes dots literally.
+
 **A network pushed down the control channel is re-parsed before it is written,
 and what is written is what came back from the parse.** `sysx.EgressNetworks`
 does it for `BuildBackendEgressRuleset` and `BuildLinkerEgressRuleset` alike.
@@ -1465,6 +1497,46 @@ failover was gone until somebody noticed a restart loop. `Server.listen` retries
 every 5s instead, warning once, and the failoverctl socket is opened *before*
 the portal so the local fallback exists in exactly the situation it is for.
 
+**A login attempt is counted before its hash runs, at most two hashes run at
+once, and an unknown account costs the same hash a wrong password does.**
+Each check is 600k PBKDF2 iterations in the process that also runs the
+probers. Counted after the hash, a burst of concurrent requests all passed
+the lockout before any of them had been counted; `loginSem` refuses what it
+cannot run with the same 429 the lockout gives. `Store.CheckPassword` burns a
+hash against a fixed salt on a missing row, because a response in
+microseconds against hundreds of milliseconds was telling anyone on the admin
+tunnel whether the shipped account name had been changed, and
+`store.HashesSpent` exists so that is pinned structurally rather than by a
+clock.
+
+**A state-changing request a browser says came from another site is refused,
+whatever cookie it carries.** `SameSite=Lax` on the cookie was the whole of
+the CSRF defence, and it stops holding on an older mobile browser, which is
+the lost phone the login is written for, while "same site" includes every
+other port on the portal's address. `crossSite` reads `Sec-Fetch-Site` and
+`Origin`, which browsers send on every POST; failoverctl over the socket and
+curl from a shell send neither and are untouched. Every API response also
+carries `Cache-Control: no-store`, because two of them hold secrets.
+
+**The notification target is validated, and alerts go through a client that
+follows no redirects.** The URL names a host this root process posts a bearer
+token to, and it used to go from the form into the request unchecked, with an
+unrecognised kind silently meaning "webhook", which is the branch that sends
+the token wherever the URL says. `validateNotify` requires one of the three
+kinds, an http or https scheme and a host. `notify.client` is its own client
+rather than `http.DefaultClient` because a Telegram bot token lives in the
+URL path, and a redirect handed it to whoever answered.
+
+**A pin cannot land on a path that is over quota or disabled.** A pin to a
+path that is down is an operator override and stays one. Quota is a policy
+block with a time-boxed approval beside it precisely so that a 2am click
+cannot switch enforcement off for the month, and a pin has no expiry, so
+honouring one there was that outcome by another button; `Engine.Pin` refuses
+it and names the approve button. `handleApprove` bounds the grant's gigabytes
+for the same family of reason: a negative, non-finite or oversized figure
+landed outside int64 on the way to bytes, and a negative `ExtraBytes` is read
+by `quota.Evaluate` as no byte limit at all.
+
 **The first-run password has to be changeable, because of where it is written.**
 It is generated on first start and logged in the clear, so it lives in the
 journal for as long as the journal is kept. Without a way to rotate it, anything
@@ -1658,6 +1730,31 @@ amplifies, and a spoofed sender never sees it, so a spoofed flood gets
 nothing while challenged clients keep being answered from memory. Reflection
 at 1.0 for the equal-sized queries is the floor any UDP responder has, and
 `qcache_test.go` pins the ratio in both directions.
+
+**The challenge bounds a spoofed source and says nothing about a real one,
+which is why a verified source is paced by reply bytes.** An address that has
+echoed its challenge could draw the whole cached reply, up to `maxFragments`
+datagrams of 4 KB, for every 9-byte query it sent, from the frontend's
+public uplink, paced by nothing in this package and only optionally by the
+nft per-source limiter, which is sized for browsers rather than for 64 KB
+replies. `qcache/pace.go` is a token bucket of reply bytes per source address
+per port: a burst a server browser's first look never notices, a refill that
+holds an abuser to 64 KiB/s, charged for the whole reply or not at all so a
+browser is never handed half a multi-packet reply, and dropped rather than
+re-challenged, since the source has already proved itself. The table is
+bounded and pruned because its keys are chosen by whoever sends. The
+`Paced` counter beside `Answered` is what a real address asking faster than
+any browser looks like.
+
+**RULES is refreshed at five times the INFO interval, and served under a
+window stretched the same way.** It changes on a map change and not per
+second, and it is by far the largest of the three replies: on a modded
+server tens of KB a time, polled at INFO's cadence down the billed tunnel
+twenty times a minute for as long as any real address kept asking, which
+made the "25 MB a month" cost note false by an order of magnitude. The
+staleness bound scales with it (`rules_stale_sec` in the snapshot) for the
+reason the three-interval floor exists, or a reply being served perfectly
+well would go dark between its own refreshes.
 
 **All three query types are cached, and that is forced rather than chosen.**
 The redirect is a NAT verdict, and NAT verdicts bind to the conntrack flow:
@@ -1857,6 +1954,23 @@ is every way this list could become wrong in the closed direction:
   it on a running frontend changes nothing, which is what the first hint
   said to do. Accepting the feed's new list means stopping the unit,
   deleting `blocklist-cache.json` and starting it again.
+- **A prefix floor and a coverage ceiling**, for the failure the entry
+  counts cannot see. The parse and the shrink guard both count entries and
+  say nothing about how much address space an entry covers: nine
+  syntactically perfect lines (`1.0.0.0/8`, `32.0.0.0/3`, `128.0.0.0/3` and
+  their like) cover half the routable internet, pass whole-or-nothing, and
+  are nine entries against thousands. `sysx.CheckBlocklist` refuses any
+  survivor shorter than `/8` as a bad line would be refused, and refuses a
+  merged list covering more than 2^27 addresses (about three percent of
+  IPv4, several times the honest level1 figure) the way the shrink guard
+  refuses: a state, once per streak, retried at the refresh interval, with
+  `Engine.blRefused` and `refuseBlocklist` shared between the two. The floor
+  is applied *after* `dropNonInternet`, and that ordering is load-bearing:
+  the honest feed carries `224.0.0.0/4` and `240.0.0.0/4` from its bogon
+  source, which are stripped as reserved space and would otherwise refuse the
+  real list every day. The cached list goes through the same check at boot,
+  because a cache written by a build without it is exactly what boot installs
+  with no fetch.
 - **Carrier-grade NAT and private space stripped before anything is loaded**
   (`sysx.dropNonInternet`). This is the one filter that protects people rather
   than the ruleset: a feed that ever listed a slice of `100.64/10` would drop
@@ -2227,6 +2341,16 @@ parsed only from the per-set listings and never from the table document, which
 is what makes the flag safe to lean on: an nft old enough to ignore `-t` under
 `-j` costs the saving and never a double-counted blocklist.
 
+**And the parked list is bounded on the way out.** The `blocked` set is sized
+for `sourceSetSize` entries, and a flood that parks a large share of that is
+exactly when this runs every five seconds: the whole list was held by the
+engine and serialised into every status poll, a multi-megabyte body per
+second per viewer, while the engine was deciding failovers, and the portal
+showed twenty of them. `ProtectState` hands back `maxBlockedReported`
+longest-remaining sources and the total beside them (`ProtectStatus.
+BlockedTotal`), and `ExecRunner` caps what any command may hand back at
+`maxCommandOutput`, failing the read rather than growing the process.
+
 **And it is skipped entirely when nobody has the portal open.** The counters
 feed `Status` and nothing else - no decision, no alert, nothing written down -
 and the kernel keeps counting whether or not the agent looks, so an unread
@@ -2462,12 +2586,42 @@ Breaking any of these is a correctness bug even if the tests pass.
    `args[0] == "list"` test on the flag. When you add a command here, add it to
    `TestDryRunnerSuppressesMutationsButRunsQueries` in both directions: the
    read list and the mutation list.
+
+   **And the verb is read by position, never by scanning the arguments.**
+   The `ip` and `tc` branch used to call any command a read if any argument
+   was `show`, `get` or `list`, and every one of those is a legal Linux
+   interface name: a path whose tunnel was called `list` turned `ip route
+   replace ... dev list` into a read, which observe mode then ran for real.
+   `sysx.ipVerb` skips the leading option flags, takes the subsystem word,
+   and reads the token after it. `web.validate` refuses those three names
+   too, because a name that is also a command word is a name waiting for the
+   next scan.
 8. **Revert must remove everything the agent installed and touch nothing it did
    not**. In particular, never the WireGuard tunnels, never the overlay
    address (something may be bound to it), and never a queue discipline on a
    tunnel this system was not shaping. `Engine.Revert` removes a shaper only
    from paths that have a rate configured, because an interface the agent never
    shaped carries somebody else's.
+
+   **The apply path has to hold the same line, and for a while it did not.**
+   `EnsureQdisc` with a rate of zero is reached for every unshaped path on
+   every settings save and every config push, and it removed any CAKE it
+   found: an operator who had shaped a tunnel by hand, on a site that never
+   set a rate in the portal, had it taken off on the next save with a
+   "changed" line as the only trace. The agent's shaper is recognised by the
+   exact parameters it writes, `overhead 80` and `besteffort`, read back from
+   `tc qdisc show` (`sysx.qdiscInfo`); a cake without that signature is left
+   alone by a zero rate and replaced by a configured one, since a rate is the
+   operator asking for this shaper on this interface.
+
+   **Two host-wide sysctls are set and deliberately never restored.**
+   `EnsureSysctls` writes `net.ipv4.conf.all.rp_filter=0` and
+   `net.ipv4.ip_forward=1`, and neither revert puts back what was there
+   before. Restoring forwarding could take a host's own routing down with
+   the agent, and `all.rp_filter` interacts with every interface's own
+   value, so the previous figures are not safe to reapply blind. Both
+   outlive an uninstall, and `uninstall.sh`'s summary should be read with
+   that in mind.
 
    **It takes two commands, because there are two hosts.** `failoverctl revert`
    reaches only the frontend; the backend's half is `failover-backend -revert`,
@@ -4102,14 +4256,14 @@ next agent learns which behaviours are deliberate.
   where it would drop a player mid-match. IPv4 because the table is `ip`, like
   everything else here.
 
-  What is genuinely open is that nothing bounds how far the list can drift
-  *upward*: the shrink guard catches a feed that collapses and nothing catches
-  one that grows tenfold, which is the same shape of accident and would drop
-  far more. It has not been built because the only sane response is the same
-  one - keep the previous list - and a growth bound picked from one
-  deployment's numbers would refuse the legitimate day a feed absorbs another
-  source. A sequence-style anchor is the wrong tool here, since the list has
-  no monotonic quantity to anchor to.
+  What bounds upward drift is address *coverage*, not entry count: the
+  prefix floor and the 2^27 ceiling in §6 catch a feed that has absorbed a
+  slice of the internet, however few lines it took. Growth in entry count is
+  still unbounded above `blocklistMaxNetworks`'s kernel cap, deliberately: a
+  growth bound picked from one deployment's numbers would refuse the
+  legitimate day a feed absorbs another source, and a list of many small
+  networks is what that day looks like. A sequence-style anchor is the wrong
+  tool here, since the list has no monotonic quantity to anchor to.
 - **A linker's control channel is minimal on purpose.** It reports liveness,
   hostname and build, and receives the egress networks for its own address. It
   reports no usage - a linker meters nothing, because the tunnels it would be

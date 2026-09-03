@@ -127,6 +127,14 @@ func TestDryRunnerSuppressesMutationsButRunsQueries(t *testing.T) {
 		{"nft", "-f", "/var/lib/failover/blocklist-feed.nft"},
 		{"nft", "delete", "table", "ip", "failover_blocklist"},
 		{"sysctl", "-w", "net.ipv4.ip_forward=1"},
+		// Interface names are operator text and `show`, `get` and `list`
+		// are all legal ones. The verb is read from its position, so a
+		// tunnel called `list` does not turn a route replace into a read
+		// that observe mode then runs for real.
+		{"ip", "route", "replace", "10.99.0.2/32", "dev", "list", "src", "10.99.0.1"},
+		{"ip", "route", "replace", "10.99.0.2/32", "dev", "show"},
+		{"tc", "qdisc", "replace", "dev", "show", "root", "cake", "bandwidth", "18mbit"},
+		{"tc", "qdisc", "del", "dev", "get", "root"},
 		// Nothing issues `wg set` today; this pins that the day something
 		// does, observe mode suppresses it rather than running it for real
 		// because "every wg is a read" happened to be true at the time.
@@ -166,6 +174,13 @@ func TestDryRunnerSuppressesMutationsButRunsQueries(t *testing.T) {
 		{"nft", "-j", "list", "set", "ip", "failover_protect", "blocked"},
 		// The blocklist counter readback, the same terse shape.
 		{"nft", "-j", "-t", "list", "table", "ip", "failover_blocklist"},
+		// The verb is read by position, so a read stays a read whatever the
+		// interface is called, and `ip route get` is a read with its verb
+		// in the same place as `show`.
+		{"ip", "route", "get", "10.99.0.2"},
+		{"ip", "-o", "addr", "show", "dev", "get"},
+		{"ip", "-j", "-d", "link", "show", "list"},
+		{"ip", "route"},
 	}
 	for _, q := range queries {
 		if !isReadOnly(q[0], q[1:]) {
@@ -307,8 +322,8 @@ func TestSysctlsDisableReversePathFilter(t *testing.T) {
 
 	for _, want := range []string{
 		"sysctl -w net.ipv4.conf.all.rp_filter=0",
-		"sysctl -w net.ipv4.conf.wg-main.rp_filter=0",
-		"sysctl -w net.ipv4.conf.wg-lte1.rp_filter=0",
+		"sysctl -w net/ipv4/conf/wg-main/rp_filter=0",
+		"sysctl -w net/ipv4/conf/wg-lte1/rp_filter=0",
 		"sysctl -w net.ipv4.ip_forward=1",
 	} {
 		if !f.ran(want) {
@@ -598,19 +613,19 @@ func TestRemoveProbeRoutesClearsTheDenyBand(t *testing.T) {
 // with a perfectly healthy WireGuard handshake.
 func TestRPFilterIsDisabledAgainAfterATunnelIsRecreated(t *testing.T) {
 	f := &fakeRunner{replies: map[string]string{
-		"sysctl -n net.ipv4.conf.wg-main.rp_filter": "2\n",
+		"sysctl -n net/ipv4/conf/wg-main/rp_filter": "2\n",
 	}}
 	changed, err := RPFilterOff(context.Background(), f, "wg-main")
 	if err != nil || !changed {
 		t.Fatalf("RPFilterOff = %v, %v; want it to report a change", changed, err)
 	}
-	if !f.ran("sysctl -w net.ipv4.conf.wg-main.rp_filter=0") {
+	if !f.ran("sysctl -w net/ipv4/conf/wg-main/rp_filter=0") {
 		t.Errorf("filtering not disabled; calls were %v", f.calls)
 	}
 
 	// Already off: it must not write, or it does so on every tick forever.
 	g := &fakeRunner{replies: map[string]string{
-		"sysctl -n net.ipv4.conf.wg-main.rp_filter": "0\n",
+		"sysctl -n net/ipv4/conf/wg-main/rp_filter": "0\n",
 	}}
 	if changed, err := RPFilterOff(context.Background(), g, "wg-main"); err != nil || changed {
 		t.Errorf("RPFilterOff = %v, %v; want no change when it is already off", changed, err)

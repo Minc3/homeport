@@ -160,6 +160,16 @@ func (e *Engine) loadBlocklistCache() {
 		e.log.Warn("cannot parse the cached blocklist; it will be fetched again", "err", err)
 		return
 	}
+	// The same floor and ceiling the fetch applies, because a cache written
+	// by a build that had neither is a list this build would have refused,
+	// and boot is the one moment it is installed without a fetch. Starting
+	// with no list is the refusal's meaning here: the refresher fetches
+	// within the minute and judges the feed's copy the same way.
+	if _, err := sysx.CheckBlocklist(c.Networks); err != nil {
+		e.log.Error("the cached blocklist is refused and will not be installed; the feed will be fetched again",
+			"err", err, "networks", len(c.Networks))
+		return
+	}
 	e.rememberBlocklist(c.Networks)
 	e.mu.Lock()
 	// The list is kept whatever served it, because an old list beats none and
@@ -275,7 +285,7 @@ func (e *Engine) maybeRefreshBlocklist(ctx context.Context) {
 	updated, lastTry, lastErr := e.blUpdated, e.blLastTry, e.blLastErr
 	have := len(e.blNetworks)
 	loadFailed := e.blLoadFailed
-	shrink := e.blShrinkRefused
+	refused := e.blRefused
 	e.mu.RUnlock()
 
 	// A reverted engine installs and repairs nothing, and fetching a list it
@@ -301,14 +311,14 @@ func (e *Engine) maybeRefreshBlocklist(ctx context.Context) {
 
 	due := updated.Add(blocklistRefreshInterval(cfg.Blocklist))
 	switch {
-	case shrink:
-		// A shrink refusal is a state, not a failure: the feed serves the
-		// same short list until somebody looks, so retrying at the failure
-		// cadence bought nothing and cost a full download, an Error line
-		// and an event row every fifteen minutes. The ETag is deliberately
-		// not advanced on a refusal - a 304 against a list this host never
-		// loaded would read as confirmation - so each attempt is a full
-		// body, at the interval the operator chose.
+	case refused:
+		// A refusal by the shrink guard or the coverage ceiling is a state,
+		// not a failure: the feed serves the same list until somebody looks,
+		// so retrying at the failure cadence bought nothing and cost a full
+		// download, an Error line and an event row every fifteen minutes.
+		// The ETag is deliberately not advanced on a refusal - a 304 against
+		// a list this host never loaded would read as confirmation - so each
+		// attempt is a full body, at the interval the operator chose.
 		due = lastTry.Add(blocklistRefreshInterval(cfg.Blocklist))
 	case lastErr != "" || have == 0:
 		due = lastTry.Add(blocklistRetryEvery)
@@ -378,49 +388,43 @@ func (e *Engine) refreshBlocklist(ctx context.Context) {
 	// Error with an event beside it rather than a Warn: it is the one state
 	// here that does not resolve itself.
 	if previous > 0 && float64(len(networks)) < blocklistShrinkFloor*float64(previous) {
-		e.mu.Lock()
-		e.blLastTry = now
-		e.blLastErr = fmt.Sprintf("feed returned %d networks against %d loaded; refused as an implausible shrink",
-			len(networks), previous)
-		first := !e.blShrinkRefused
-		e.blShrinkRefused = true
-		e.mu.Unlock()
-		// Once per streak at Error with an event beside it, because it is
-		// the one state here that does not resolve itself and somebody has
-		// to look. Every later attempt is the same refusal of the same list,
-		// and a line per attempt for as long as nobody intervenes is the
-		// peer-driven journal volume ControlServer.throttle exists to stop,
-		// with the feed as the peer. The status carries the refusal
-		// throughout, so the portal is not waiting on the log.
-		//
-		// The hint has to be true. The floor is measured against the list
-		// in memory, and the cache file is read once, at start: deleting it
-		// on a running frontend changes nothing, and the first version of
-		// this said it did. Accepting the feed's new list means starting
-		// with no list, which is exactly what a stopped unit, a deleted
-		// cache and a start again produce.
-		if first {
-			e.log.Error("the blocklist feed shrank implausibly; the previous list stays loaded",
-				"returned", len(networks), "loaded", previous, "source", e.blURL,
-				"hint", "check the feed by hand; to accept what it now serves, stop the unit, delete "+
-					blocklistCacheFile+" from the state directory and start it again")
-			_ = e.st.AddEvent(store.EventSystem, 0,
-				"blocklist refresh refused: the feed returned %d networks against %d loaded", len(networks), previous)
-		} else {
-			e.log.Warn("the blocklist feed is still serving an implausibly short list; the previous list stays loaded",
-				"returned", len(networks), "loaded", previous, "source", e.blURL)
-		}
+		e.refuseBlocklist(now, len(networks), previous,
+			fmt.Sprintf("feed returned %d networks against %d loaded; refused as an implausible shrink",
+				len(networks), previous),
+			"the blocklist feed shrank implausibly; the previous list stays loaded")
 		return
 	}
 
-	// The count runs outside the lock; see rememberBlocklist. The window in
-	// which the list is new and the age is not is harmless, because nothing
-	// reads the two together except Status, which renders either truthfully.
-	e.rememberBlocklist(networks)
+	// The prefix floor and the coverage ceiling, on what would actually be
+	// loaded. The floor is a whole-or-nothing failure like a bad line, since
+	// no honest feed produces a survivor that short; the ceiling is a state
+	// like the shrink guard, since a feed that has absorbed too much serves
+	// the same list until somebody looks. Both keep the loaded list. The
+	// count is what rememberBlocklist would compute again, handed on.
+	count, err := sysx.CheckBlocklist(networks)
+	if err != nil {
+		if strings.Contains(err.Error(), "covers") {
+			e.refuseBlocklist(now, len(networks), previous,
+				"refused: "+err.Error(),
+				"the blocklist feed covers too much of the internet; the previous list stays loaded")
+			return
+		}
+		e.mu.Lock()
+		e.blLastTry, e.blLastErr = now, err.Error()
+		e.mu.Unlock()
+		e.log.Warn("could not accept the blocklist; the previous list stays loaded",
+			"err", err, "networks", previous, "source", e.blURL)
+		return
+	}
+
+	// The window in which the list is new and the age is not is harmless,
+	// because nothing reads the two together except Status, which renders
+	// either truthfully.
 	e.mu.Lock()
+	e.blNetworks, e.blCount = networks, count
 	e.blUpdated, e.blLastTry, e.blLastErr = now, now, ""
 	e.blEtag = newEtag
-	e.blShrinkRefused = false
+	e.blRefused = false
 	loaded := e.blCount
 	cache := blocklistCache{Source: e.blURL, Fetched: now, ETag: newEtag, Networks: networks}
 	e.mu.Unlock()
@@ -428,6 +432,42 @@ func (e *Engine) refreshBlocklist(ctx context.Context) {
 
 	e.log.Info("blocklist refreshed", "networks", loaded, "fetched", len(networks), "source", e.blURL)
 	e.installBlocklistElements(ctx)
+}
+
+// refuseBlocklist records a list refused as a state rather than a failure:
+// the shrink guard and the coverage ceiling both mean the feed will serve the
+// same list until somebody looks.
+//
+// Once per streak at Error with an event beside it, because it is the one
+// kind of state here that does not resolve itself and somebody has to look.
+// Every later attempt is the same refusal of the same list, and a line per
+// attempt for as long as nobody intervenes is the peer-driven journal volume
+// ControlServer.throttle exists to stop, with the feed as the peer. The
+// status carries the refusal throughout, so the portal is not waiting on
+// the log.
+//
+// The hint has to be true. The guards are measured against the list in
+// memory, and the cache file is read once, at start: deleting it on a running
+// frontend changes nothing, and the first version of this said it did.
+// Accepting the feed's new list means starting with no list, which is exactly
+// what a stopped unit, a deleted cache and a start again produce.
+func (e *Engine) refuseBlocklist(now time.Time, returned, previous int, status, headline string) {
+	e.mu.Lock()
+	e.blLastTry = now
+	e.blLastErr = status
+	first := !e.blRefused
+	e.blRefused = true
+	e.mu.Unlock()
+	if first {
+		e.log.Error(headline,
+			"returned", returned, "loaded", previous, "source", e.blURL, "reason", status,
+			"hint", "check the feed by hand; to accept what it now serves, stop the unit, delete "+
+				blocklistCacheFile+" from the state directory and start it again")
+		_ = e.st.AddEvent(store.EventSystem, 0, "blocklist refresh refused: %s", status)
+	} else {
+		e.log.Warn("the blocklist feed is still serving a refused list; the previous list stays loaded",
+			"returned", returned, "loaded", previous, "source", e.blURL, "reason", status)
+	}
 }
 
 // fetchBlocklist downloads and parses the feed.
