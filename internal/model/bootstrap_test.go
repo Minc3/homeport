@@ -3,13 +3,30 @@ package model_test
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/quinlan102/homeport/internal/model"
 )
 
+// The example files ship the placeholder secret, which the loader refuses on
+// purpose, so the example is loaded with a generated one substituted: what is
+// being pinned is that everything else in the file parses.
 func TestLinkerExampleLoads(t *testing.T) {
-	b, err := model.LoadBootstrap("../../deploy/linker.json.example")
+	raw, err := os.ReadFile("../../deploy/linker.json.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), model.PSKPlaceholder) {
+		t.Fatalf("the example file should carry the %s placeholder", model.PSKPlaceholder)
+	}
+	p := filepath.Join(t.TempDir(), "linker.json")
+	body := strings.Replace(string(raw), `"CHANGE-ME-openssl-rand-hex-32"`, `"`+strings.Repeat("ab", 32)+`"`, 1)
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := model.LoadBootstrap(p)
 	if err != nil {
 		t.Fatalf("linker example must load: %v", err)
 	}
@@ -255,5 +272,96 @@ func TestBootstrapLeavesAnAbsentSubnetEmpty(t *testing.T) {
 	}
 	if b.Overlay.Subnet != "" {
 		t.Fatalf("overlay.subnet = %q, want it left empty", b.Overlay.Subnet)
+	}
+}
+
+// TestBootstrapRefusesThePlaceholderSecret pins that the value the example
+// files ship with never starts an agent. A host running on it authenticates
+// every probe, decision and control frame against a secret printed in this
+// repository, and nothing has ever legitimately run on it, so refusing costs
+// no existing site anything.
+func TestBootstrapRefusesThePlaceholderSecret(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "frontend.json")
+	if err := os.WriteFile(p, []byte(`{"role":"frontend","psk":"CHANGE-ME-openssl-rand-hex-32"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := model.LoadBootstrap(p)
+	if err == nil || !strings.Contains(err.Error(), "placeholder") {
+		t.Fatalf("placeholder psk loaded: err=%v", err)
+	}
+}
+
+// TestBootstrapReportsAShortSecretWithoutRefusingIt pins the direction of the
+// length check. The key is an unsalted sha256 of the secret, so a short
+// passphrase is brute-forceable offline from one captured probe, but a site
+// already running on one must not be taken down by an upgrade: it is reported,
+// and the installer's 64 hex characters are not.
+func TestBootstrapReportsAShortSecretWithoutRefusingIt(t *testing.T) {
+	dir := t.TempDir()
+	short := filepath.Join(dir, "short.json")
+	if err := os.WriteFile(short, []byte(`{"role":"frontend","psk":"hunter2"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := model.LoadBootstrap(short)
+	if err != nil {
+		t.Fatalf("a short psk must load: %v", err)
+	}
+	found := false
+	for _, w := range b.Warnings {
+		if strings.Contains(w, "psk is 7 characters") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("short psk not reported: %v", b.Warnings)
+	}
+
+	long := filepath.Join(dir, "long.json")
+	if err := os.WriteFile(long, []byte(`{"role":"frontend","psk":"`+strings.Repeat("ab", 32)+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err = model.LoadBootstrap(long)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range b.Warnings {
+		if strings.Contains(w, "psk is") {
+			t.Fatalf("a 64-character psk was reported: %s", w)
+		}
+	}
+}
+
+// TestBootstrapReportsAReadableSecretFile pins the mode check. The installers
+// write the file 0600 and a hand edit that leaves it 0644 hands every local
+// account the key that steers every host's routing, with nothing else in the
+// system able to notice.
+func TestBootstrapReportsAReadableSecretFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no unix mode bits on windows")
+	}
+	dir := t.TempDir()
+	psk := strings.Repeat("ab", 32)
+	open := filepath.Join(dir, "open.json")
+	if err := os.WriteFile(open, []byte(`{"role":"frontend","psk":"`+psk+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b, err := model.LoadBootstrap(open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Warnings) != 1 || !strings.Contains(b.Warnings[0], "0644") {
+		t.Fatalf("0644 file not reported: %v", b.Warnings)
+	}
+
+	closed := filepath.Join(dir, "closed.json")
+	if err := os.WriteFile(closed, []byte(`{"role":"frontend","psk":"`+psk+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err = model.LoadBootstrap(closed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Warnings) != 0 {
+		t.Fatalf("0600 file reported: %v", b.Warnings)
 	}
 }

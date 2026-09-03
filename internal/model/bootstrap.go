@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -39,7 +40,27 @@ type Bootstrap struct {
 	// local fact, it is editable in the portal, and a value that quietly
 	// reappeared on every restart would be worse than no value at all.
 	PublicIface string `json:"public_iface,omitempty"`
+
+	// Warnings is what LoadBootstrap found wrong with the file without
+	// refusing it: a shared secret too short to be the random one the
+	// installer generates, or a file readable by more than root. Neither is
+	// fatal, because both are hardening faults on a host that may be the only
+	// thing keeping traffic flowing, and a refusal on a restart is an outage.
+	// The agents log them at Error so they are not ignorable.
+	Warnings []string `json:"-"`
 }
+
+// PSKPlaceholder is the value the example bootstrap files ship with. A file
+// still carrying it authenticates every probe, decision and control frame
+// against a secret printed in this repository.
+const PSKPlaceholder = "CHANGE-ME"
+
+// MinPSKBytes is the shortest shared secret that is not reported. The key is
+// an unsalted sha256 of the secret, which is fine for the 64 hex characters
+// the installers generate and brute-forceable offline from one captured probe
+// for a short human-chosen passphrase - and a linker's first hop is plaintext
+// TCP on somebody's LAN.
+const MinPSKBytes = 32
 
 // LinkerInfo is the local topology a linker cannot be told over the wire.
 //
@@ -89,6 +110,29 @@ func LoadBootstrap(path string) (Bootstrap, error) {
 	}
 	if b.PSK == "" {
 		return Bootstrap{}, fmt.Errorf("bootstrap config: psk must be set and identical on both hosts")
+	}
+	// Refused outright rather than reported: nothing has ever run on this
+	// value, so no site is taken down by the refusal, and a host that starts
+	// on it is a host whose every authenticated message is forgeable by anyone
+	// who has read the example file.
+	if strings.HasPrefix(b.PSK, PSKPlaceholder) {
+		return Bootstrap{}, fmt.Errorf("bootstrap config: psk is still the example placeholder; generate one with: openssl rand -hex 32")
+	}
+	if len(b.PSK) < MinPSKBytes {
+		b.Warnings = append(b.Warnings, fmt.Sprintf(
+			"psk is %d characters; the installers generate 64 (openssl rand -hex 32), and a short secret is brute-forceable offline from one captured probe",
+			len(b.PSK)))
+	}
+	// The file holds the one secret in the system. A mode that lets any local
+	// account read it hands that account the key that steers every host's
+	// routing, and the installers write it 0600 precisely so it does not.
+	// Windows has no such bits, and it is where development happens.
+	if runtime.GOOS != "windows" {
+		if st, err := os.Stat(path); err == nil && st.Mode().Perm()&0o077 != 0 {
+			b.Warnings = append(b.Warnings, fmt.Sprintf(
+				"%s is mode %04o and readable by more than root; it holds the shared secret, chmod 0600 it",
+				path, st.Mode().Perm()))
+		}
 	}
 	if b.StateDir == "" {
 		b.StateDir = "/var/lib/failover"

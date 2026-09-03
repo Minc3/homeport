@@ -52,6 +52,13 @@ func run(log *slog.Logger, cfgPath, adminUser string) error {
 	if err != nil {
 		return err
 	}
+	// Error rather than Warn: these are the shared secret being weak or
+	// readable, and a line an operator learns to skip is a line that was never
+	// written. Not fatal, because refusing to start is an outage on the host
+	// that may be the only thing keeping traffic flowing.
+	for _, w := range boot.Warnings {
+		log.Error("bootstrap config", "warning", w)
+	}
 	// 0700, because of what ends up in here rather than because of tidiness.
 	// The database holds portal session tokens in the clear beside the password
 	// hashes, so a world-readable state directory is a world-readable login to

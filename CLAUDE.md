@@ -3156,6 +3156,21 @@ agent downtime is still accounted for).
 shared secret, state paths and overlay addressing. Everything else is in the
 portal, on purpose: there is one place to manage the system from.
 
+**The shared secret is checked at load, in two strengths.** The example files
+ship `CHANGE-ME-openssl-rand-hex-32`, and `LoadBootstrap` refuses anything
+starting with `model.PSKPlaceholder` outright: nothing has ever legitimately
+run on it, so no site is taken down by the refusal, and a host that starts on
+it authenticates every probe, decision and control frame against a secret
+printed in this repository. A secret shorter than `model.MinPSKBytes`, and a
+file whose mode has group or world bits, are *reported* (`Bootstrap.Warnings`,
+logged at `Error` by all three agents) rather than refused, because a site
+already running on one must not be turned into an outage by an upgrade. The
+length matters because `Key` is an unsalted `sha256(psk)`: fine for the 64 hex
+characters the installers generate, brute-forceable offline from a single
+captured probe for a short passphrase, and a linker's first hop is plaintext
+TCP on somebody's LAN. `bootstrap_test.go` loads the example with the
+placeholder substituted, so the example keeps carrying it.
+
 **Linker** - no database and no state files at all. `/etc/failover/linker.json`
 carries the shared secret, the overlay addressing, and the two things the
 frontend has no way to discover: this host's own overlay address and the
