@@ -199,8 +199,11 @@ func TestASendFailureIsBookedAsALossAndHeldForOneInterval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new prober: %v", err)
 	}
-	pr.seq = 1
-	pr.pending[1] = time.Now() // sent on the socket before this one, never answered
+	// The sequence starts from a random seed, so the outstanding probe and the
+	// attempt count below are both taken relative to it.
+	start := pr.seq
+	pr.seq++
+	pr.pending[pr.seq] = pendingProbe{sent: time.Now()} // sent on the socket before this one, never answered
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	pr.Run(ctx)
@@ -229,7 +232,7 @@ drain:
 	}
 
 	pr.mu.Lock()
-	seq, pending := pr.seq, len(pr.pending)
+	seq, pending := pr.seq-start, len(pr.pending)
 	pr.mu.Unlock()
 	if seq > most {
 		t.Fatalf("%d probes attempted in one second at a 200ms interval; the prober is spinning on the send failure", seq)

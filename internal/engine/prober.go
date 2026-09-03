@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -49,13 +51,50 @@ type Prober struct {
 	mu       sync.Mutex
 	conn     *net.UDPConn
 	seq      uint64
-	pending  map[uint64]time.Time
+	pending  map[uint64]pendingProbe
 	resolved map[uint64]Result
 	deliver  uint64 // next sequence number to emit, keeps results in order
 	active   bool
 
 	// nudge asks the send loop for a probe now, outside its ticker. See Nudge.
 	nudge chan struct{}
+}
+
+// pendingProbe is one probe in flight: when it left, and the nonce it carried.
+//
+// The nonce is what a reply has to echo before it is believed. The MAC proves
+// a reply was made by somebody holding the key, and the sequence says which
+// probe it claims to answer, but neither says it was made for *this* probe:
+// an authentic reply captured off the wire is still authentic later. Matching
+// on the sequence alone let one such capture answer a probe again the next
+// time this path was at that sequence, which every generation used to reach
+// because it counted from zero. See resolve.
+type pendingProbe struct {
+	sent  time.Time
+	nonce uint64
+}
+
+// seqSeedBits is how much of the sequence space a generation's starting point
+// is drawn from. Sixty-two bits leaves two bits of headroom above the seed,
+// which at four probes a second is longer than the age of the universe before
+// the counter could wrap.
+const seqSeedBits = 62
+
+// seedSeq draws a generation's starting sequence number at random.
+//
+// Every generation used to count from zero, so the sequences a replaced
+// generation had used were exactly the ones its replacement would use next,
+// and a reply captured against one was addressed, as far as the sequence
+// could tell, to the other. The nonce check in resolve is what actually
+// refuses that reply; the random start is the second lock on the same door,
+// so a captured reply does not even name a probe the new generation will send.
+// The clock would be a worse seed than it looks: two generations started
+// within its granularity - a settings save landing beside a mode change - draw
+// the same number.
+func seedSeq() uint64 {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return binary.BigEndian.Uint64(b[:]) & (1<<seqSeedBits - 1)
 }
 
 // NewProber builds a prober for one path.
@@ -66,6 +105,11 @@ func NewProber(p model.PathConfig, probeCfg model.ProbeConfig, ov model.OverlayC
 	if err != nil {
 		return nil, fmt.Errorf("resolve backend probe address: %w", err)
 	}
+	// deliver is the next sequence flush will emit, so it starts one past the
+	// seed: the first send takes seq+1, and flush only skips a sequence that
+	// is below seq, so a deliver left at 1 would sit behind a seed nothing
+	// ever resolves and no result would leave this prober.
+	seq := seedSeq()
 	return &Prober{
 		path:     p,
 		probeCfg: probeCfg,
@@ -75,9 +119,10 @@ func NewProber(p model.PathConfig, probeCfg model.ProbeConfig, ov model.OverlayC
 		log:      log.With("path", p.Name),
 		decision: decision,
 		results:  results,
-		pending:  map[uint64]time.Time{},
+		seq:      seq,
+		pending:  map[uint64]pendingProbe{},
 		resolved: map[uint64]Result{},
-		deliver:  1,
+		deliver:  seq + 1,
 		nudge:    make(chan struct{}, 1),
 	}, nil
 }
@@ -342,11 +387,12 @@ func (p *Prober) currentConn() *net.UDPConn {
 // outstanding in pending whether or not the write succeeded.
 func (p *Prober) send(conn *net.UDPConn) (uint64, error) {
 	activePath, decisionSeq := p.decision()
+	nonce := proto.NewNonce()
 
 	p.mu.Lock()
 	p.seq++
 	seq := p.seq
-	p.pending[seq] = time.Now()
+	p.pending[seq] = pendingProbe{sent: time.Now(), nonce: nonce}
 	p.mu.Unlock()
 
 	pkt := (&proto.Probe{
@@ -356,7 +402,7 @@ func (p *Prober) send(conn *net.UDPConn) (uint64, error) {
 		TxNanos:     time.Now().UnixNano(),
 		ActivePath:  activePath,
 		DecisionSeq: decisionSeq,
-		Nonce:       proto.NewNonce(),
+		Nonce:       nonce,
 	}).Marshal(p.psk)
 
 	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
@@ -376,23 +422,50 @@ func (p *Prober) readLoop(ctx context.Context, conn *net.UDPConn) {
 			return
 		}
 		msg, err := proto.Unmarshal(buf[:n], p.psk)
-		if err != nil || msg.Type != proto.TypeReply {
+		if err != nil {
 			continue // unauthenticated noise; nobody can forge path health
 		}
-		now := time.Now()
-		p.mu.Lock()
-		sent, ok := p.pending[msg.Seq]
-		if ok {
-			delete(p.pending, msg.Seq)
-			p.resolved[msg.Seq] = Result{
-				PathID: p.path.ID,
-				Seq:    msg.Seq,
-				RTT:    now.Sub(sent),
-				At:     now,
-			}
-		}
-		p.mu.Unlock()
+		p.resolve(msg, time.Now())
 	}
+}
+
+// resolve matches one authenticated reply to the probe it answers and books
+// the round trip. It reports whether anything was resolved.
+//
+// A reply counts only if it names a sequence still outstanding, echoes the
+// nonce that probe carried, and is for this path. The MAC has already proved
+// that somebody holding the key made it; these three say it was made for the
+// probe it is being matched to. Sequence alone was not enough for two reasons.
+// The backend echoes the nonce and the frontend used to throw it away, so a
+// reply captured off the wire - which the MAC makes no less authentic a
+// minute later - answered again on any later probe that reused its sequence,
+// and every generation reused all of them because each counted from zero.
+// Injecting that at the frontend's overlay address takes no key at all,
+// only a position the backend forwards for, and what it buys is a condemned
+// tunnel that keeps resolving its probes as answered. The path id closes the
+// other half: a reply is stamped with this prober's own path whatever it
+// carries, so one captured on a working tunnel could be replayed at a dead
+// one. Anything else is dropped as the noise an unauthenticated packet
+// already is. There is no log line here, because this runs per packet on a
+// socket anybody in that position can write to.
+func (p *Prober) resolve(msg *proto.Probe, now time.Time) bool {
+	if msg.Type != proto.TypeReply || msg.PathID != uint16(p.path.ID) {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	entry, ok := p.pending[msg.Seq]
+	if !ok || entry.nonce != msg.Nonce {
+		return false
+	}
+	delete(p.pending, msg.Seq)
+	p.resolved[msg.Seq] = Result{
+		PathID: p.path.ID,
+		Seq:    msg.Seq,
+		RTT:    now.Sub(entry.sent),
+		At:     now,
+	}
+	return true
 }
 
 // expire resolves probes that have been outstanding past the timeout.
@@ -401,8 +474,8 @@ func (p *Prober) expire() {
 	cutoff := time.Now().Add(-timeout)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for seq, sent := range p.pending {
-		if sent.Before(cutoff) {
+	for seq, entry := range p.pending {
+		if entry.sent.Before(cutoff) {
 			p.markLost(seq)
 		}
 	}
