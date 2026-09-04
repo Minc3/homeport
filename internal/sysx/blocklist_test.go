@@ -293,15 +293,24 @@ func TestBlocklistElementsWithNothingUsableRenderNothing(t *testing.T) {
 }
 
 // The portal reports the loaded figure, so it has to come from the same
-// arithmetic the loaded set does rather than from len().
-func TestCountBlocklistElementsMatchesWhatIsLoaded(t *testing.T) {
+// arithmetic the loaded set does rather than from len(): the elements
+// CheckBlocklist hands back are what RenderBlocklistElements loads, and
+// their count is what the card shows.
+func TestCheckBlocklistElementsMatchWhatIsLoaded(t *testing.T) {
 	in := []string{"203.0.113.0/24", "203.0.113.16/28", "10.0.0.0/8", "198.51.100.0/24"}
-	if got, want := CountBlocklistElements(in), 2; got != want {
+	elems, err := CheckBlocklist(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(elems), 2; got != want {
 		t.Fatalf("counted %d networks, want %d", got, want)
 	}
-	out := BuildBlocklistElements(in)
+	out := RenderBlocklistElements(elems)
 	if n := strings.Count(out, "/"); n != 2 {
 		t.Fatalf("the rendered file holds %d networks, which the count disagrees with:\n%s", n, out)
+	}
+	if out != BuildBlocklistElements(in) {
+		t.Fatal("rendering the checked elements differs from building from the raw list")
 	}
 }
 
@@ -368,9 +377,9 @@ func TestBlocklistRefusesAShortPrefixOnlyAfterTheReservedStrip(t *testing.T) {
 		!strings.Contains(err.Error(), "32.0.0.0/3") {
 		t.Fatalf("a /3 survived the floor: %v", err)
 	}
-	n, err := CheckBlocklist([]string{"224.0.0.0/4", "240.0.0.0/4", "10.0.0.0/8", "0.0.0.0/8", "203.0.113.0/24"})
-	if err != nil || n != 1 {
-		t.Fatalf("the honest reserved entries were refused rather than stripped: n=%d err=%v", n, err)
+	elems, err := CheckBlocklist([]string{"224.0.0.0/4", "240.0.0.0/4", "10.0.0.0/8", "0.0.0.0/8", "203.0.113.0/24"})
+	if err != nil || len(elems) != 1 {
+		t.Fatalf("the honest reserved entries were refused rather than stripped: n=%d err=%v", len(elems), err)
 	}
 	if _, err := CheckBlocklist([]string{"1.0.0.0/8"}); err != nil {
 		t.Fatalf("a /8 exactly is the floor and must pass: %v", err)
@@ -391,13 +400,14 @@ func TestBlocklistRefusesCoverageOverTheCeiling(t *testing.T) {
 	if _, err := CheckBlocklist(honest); err != nil {
 		t.Fatalf("an ordinary list was refused: %v", err)
 	}
-	// Nine /8s is 2^27 exactly, at the ceiling; the tenth is over it.
+	// A /8 is 2^24 addresses, so eight /8s are 2^27 exactly, at the
+	// ceiling, and nine are over it.
 	var wide []string
 	for i := 1; i <= 9; i++ {
 		wide = append(wide, fmt.Sprintf("%d.0.0.0/8", i*3))
 	}
 	if _, err := CheckBlocklist(wide); err == nil {
-		t.Fatal("2^27 addresses in ten /8s passed the ceiling")
+		t.Fatal("nine /8s, one over the 2^27 ceiling, passed it")
 	}
 	// Precisely 2^27 is admitted: eight /8s.
 	if _, err := CheckBlocklist(wide[:8]); err != nil {

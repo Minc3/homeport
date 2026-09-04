@@ -104,13 +104,8 @@ func RemoveQdisc(ctx context.Context, r Runner, iface string) {
 // other readback here exists: `wg-quick down` deletes the interface and the
 // queue discipline goes with it, and the agent's own belief about it survives
 // the loss perfectly intact.
-func QdiscRate(ctx context.Context, r Runner, iface string) (float64, string, error) {
-	rate, kind, _, err := qdiscInfo(ctx, r, iface)
-	return rate, kind, err
-}
-
-// qdiscInfo is QdiscRate plus whether the shaper is recognisably this
-// agent's. EnsureQdisc installs exactly `cake bandwidth X overhead 80
+//
+// It also reports whether the shaper is recognisably this agent's. EnsureQdisc installs exactly `cake bandwidth X overhead 80
 // besteffort`, and tc prints the overhead and the priority mode back, so a
 // cake carrying both is treated as ours and one carrying neither is somebody
 // else's shaping that happens to use the same discipline.

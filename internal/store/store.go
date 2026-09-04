@@ -681,7 +681,7 @@ func (s *Store) CreateUser(username, password string) error {
 	if _, err := rand.Read(salt); err != nil {
 		return err
 	}
-	sum, err := pbkdf2.Key(sha256.New, password, salt, pbkdf2Iterations, 32)
+	sum, err := derive(password, salt)
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
@@ -707,26 +707,52 @@ func (s *Store) HasUsers() (bool, error) {
 // milliseconds for a real one, and the response text being identical did not
 // make the timing so. What it gives away is small (whether the shipped
 // account name was changed), and the fix is one hash against a fixed salt.
+//
+// Both branches are one code path: the credentials are looked up, a missing
+// or unreadable row substitutes a fixed salt, and exactly one derive runs
+// either way. Written as separate returns the property lived in four sites
+// and two counters that had to be kept in step by inspection.
 func (s *Store) CheckPassword(username, password string) bool {
-	var saltHex, hashHex string
-	err := s.db.QueryRow(`SELECT salt, hash FROM users WHERE username = ?`, username).Scan(&saltHex, &hashHex)
-	if err != nil {
-		return burnHash(password)
+	salt, want, found := s.credentials(username)
+	if !found {
+		// Fixed and public, because nothing derived from it is ever
+		// compared or stored; it exists to make the two branches take the
+		// same time.
+		salt = []byte("no-such-account-")
 	}
-	salt, err := hex.DecodeString(saltHex)
-	if err != nil {
-		return burnHash(password)
-	}
-	want, err := hex.DecodeString(hashHex)
-	if err != nil {
-		return burnHash(password)
-	}
-	hashesSpent.Add(1)
-	got, err := pbkdf2.Key(sha256.New, password, salt, pbkdf2Iterations, 32)
+	got, err := derive(password, salt)
 	if err != nil {
 		return false
 	}
-	return subtle.ConstantTimeCompare(got, want) == 1
+	return found && subtle.ConstantTimeCompare(got, want) == 1
+}
+
+// credentials reads one account's salt and hash. Any failure, a missing row
+// or a corrupt one, reads as not found, and the caller charges the same hash
+// for either.
+func (s *Store) credentials(username string) (salt, hash []byte, found bool) {
+	var saltHex, hashHex string
+	if err := s.db.QueryRow(`SELECT salt, hash FROM users WHERE username = ?`, username).Scan(&saltHex, &hashHex); err != nil {
+		return nil, nil, false
+	}
+	salt, err := hex.DecodeString(saltHex)
+	if err != nil {
+		return nil, nil, false
+	}
+	hash, err = hex.DecodeString(hashHex)
+	if err != nil {
+		return nil, nil, false
+	}
+	return salt, hash, true
+}
+
+// derive is the one PBKDF2 call in this package, and the one place the hash
+// counter is advanced: CreateUser and both branches of CheckPassword go
+// through it, so the constant-cost property is structural rather than a
+// matter of two call sites carrying the same parameters.
+func derive(password string, salt []byte) ([]byte, error) {
+	hashesSpent.Add(1)
+	return pbkdf2.Key(sha256.New, password, salt, pbkdf2Iterations, 32)
 }
 
 // hashesSpent counts password hashes, so the constant-cost property can be
@@ -735,15 +761,6 @@ var hashesSpent atomic.Int64
 
 // HashesSpent reports how many password hashes this process has computed.
 func HashesSpent() int64 { return hashesSpent.Load() }
-
-// burnHash spends the cost of a real check and answers false. The salt is
-// fixed and public because nothing derived from it is ever compared or
-// stored; it exists to make the two branches take the same time.
-func burnHash(password string) bool {
-	hashesSpent.Add(1)
-	_, _ = pbkdf2.Key(sha256.New, password, []byte("no-such-account-"), pbkdf2Iterations, 32)
-	return false
-}
 
 // NewSession issues a session token.
 func (s *Store) NewSession(username string, ttl time.Duration) (string, error) {

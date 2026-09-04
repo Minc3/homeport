@@ -160,9 +160,9 @@ func New(cfg Config) *Cacher {
 	for _, p := range cfg.Ports {
 		pc := &portCache{cfg: p, c: c, nudge: make(chan struct{}, 1),
 			pace: newPacer(cfg.PaceBurst, cfg.PaceRefill, paceIdleAfter, paceMaxSources)}
-		pc.info.fetchOK = true
-		pc.player.fetchOK = true
-		pc.rules.fetchOK = true
+		pc.info.fetchOK, pc.info.scale = true, 1
+		pc.player.fetchOK, pc.player.scale = true, 1
+		pc.rules.fetchOK, pc.rules.scale = true, rulesRefreshMultiplier
 		c.ports = append(c.ports, pc)
 	}
 	return c
@@ -214,7 +214,7 @@ func (c *Cacher) Snapshot() []model.QueryCacheState {
 			PlayerAgeSec:  p.player.ageSec(now),
 			RulesAgeSec:   p.rules.ageSec(now),
 			StaleSec:      c.cfg.StaleAfter.Seconds(),
-			RulesStaleSec: c.rulesStaleAfter().Seconds(),
+			RulesStaleSec: p.rules.window(c.cfg.StaleAfter).Seconds(),
 			Error:         p.bindErrString(),
 		}
 		if st.RefreshError = p.info.lastErr(); st.RefreshError == "" {
@@ -226,16 +226,6 @@ func (c *Cacher) Snapshot() []model.QueryCacheState {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Port < out[j].Port })
 	return out
-}
-
-// rulesRefreshEvery and rulesStaleAfter are the RULES cadence and window,
-// both the INFO figure stretched by rulesRefreshMultiplier.
-func (c *Cacher) rulesRefreshEvery() time.Duration {
-	return c.cfg.RefreshEvery * rulesRefreshMultiplier
-}
-
-func (c *Cacher) rulesStaleAfter() time.Duration {
-	return c.cfg.StaleAfter * rulesRefreshMultiplier
 }
 
 // cacheEntry is one cached reply (INFO, PLAYER or RULES) for one port. The
@@ -265,6 +255,23 @@ type cacheEntry struct {
 	// reason is a question, not a report.
 	fetchOK  bool
 	fetchErr string
+
+	// scale stretches this entry's refresh interval and staleness window
+	// from the configured INFO figures: 1 for INFO and PLAYER,
+	// rulesRefreshMultiplier for RULES. It lives on the entry rather than
+	// being passed beside it, because passed beside it the pairing was
+	// positional: &p.rules with the INFO window compiled, and served RULES
+	// under a window sized for a cadence five times faster than its own.
+	scale int
+}
+
+// window is the configured INFO figure stretched to this entry's cadence,
+// for both the refresh interval and the staleness bound.
+func (e *cacheEntry) window(base time.Duration) time.Duration {
+	if e.scale <= 1 {
+		return base
+	}
+	return base * time.Duration(e.scale)
 }
 
 func (e *cacheEntry) lastErr() string {
@@ -382,11 +389,11 @@ func (p *portCache) serve(ctx context.Context) {
 		case queryInfoBare, queryPlayerBare, queryRulesBare:
 			p.sendChallenge(src, now)
 		case queryInfoChallenged:
-			p.answerOrChallenge(&p.info, src, ch, now, p.c.cfg.StaleAfter)
+			p.answerOrChallenge(&p.info, src, ch, now)
 		case queryPlayerChallenged:
-			p.answerOrChallenge(&p.player, src, ch, now, p.c.cfg.StaleAfter)
+			p.answerOrChallenge(&p.player, src, ch, now)
 		case queryRulesChallenged:
-			p.answerOrChallenge(&p.rules, src, ch, now, p.c.rulesStaleAfter())
+			p.answerOrChallenge(&p.rules, src, ch, now)
 		}
 	}
 }
@@ -408,7 +415,7 @@ func (p *portCache) verify(src *net.UDPAddr, got []byte, now time.Time) bool {
 	return false
 }
 
-func (p *portCache) answerOrChallenge(e *cacheEntry, src *net.UDPAddr, ch []byte, now time.Time, staleAfter time.Duration) {
+func (p *portCache) answerOrChallenge(e *cacheEntry, src *net.UDPAddr, ch []byte, now time.Time) {
 	if !p.verify(src, ch, now) {
 		// A wrong challenge is an expired one, or a spoofer guessing. Either
 		// way the answer is a fresh challenge, never a payload - and never a
@@ -417,7 +424,7 @@ func (p *portCache) answerOrChallenge(e *cacheEntry, src *net.UDPAddr, ch []byte
 		return
 	}
 	e.stampDemand(now)
-	datagrams := e.fresh(now, staleAfter)
+	datagrams := e.fresh(now, e.window(p.c.cfg.StaleAfter))
 	if datagrams == nil {
 		// Correctly challenged and nothing fresh to say. Dropping is the
 		// honest answer - a stale reply advertises a server that may be gone -
@@ -462,13 +469,13 @@ func (p *portCache) refresh(ctx context.Context) {
 		case <-t.C:
 		}
 		now := time.Now()
-		p.refreshEntry(ctx, &p.info, "info", infoRequest, now, p.c.cfg.RefreshEvery)
-		p.refreshEntry(ctx, &p.player, "players", playerRequest, now, p.c.cfg.RefreshEvery)
-		p.refreshEntry(ctx, &p.rules, "rules", rulesRequest, now, p.c.rulesRefreshEvery())
+		p.refreshEntry(ctx, &p.info, "info", infoRequest, now)
+		p.refreshEntry(ctx, &p.player, "players", playerRequest, now)
+		p.refreshEntry(ctx, &p.rules, "rules", rulesRequest, now)
 	}
 }
 
-func (p *portCache) refreshEntry(ctx context.Context, e *cacheEntry, what string, build func([]byte) []byte, now time.Time, every time.Duration) {
+func (p *portCache) refreshEntry(ctx context.Context, e *cacheEntry, what string, build func([]byte) []byte, now time.Time) {
 	e.mu.Lock()
 	wanted := !e.demand.IsZero() && now.Sub(e.demand) <= p.c.cfg.IdleAfter
 	// Due is measured from the last attempt, not the last success: the ticker
@@ -476,7 +483,7 @@ func (p *portCache) refreshEntry(ctx context.Context, e *cacheEntry, what string
 	// fetched alone a failing upstream was due again on every tick - see the
 	// field. A zero attempted (never tried) is due at once, which is what the
 	// cold-cache nudge exists for.
-	due := e.attempted.IsZero() || now.Sub(e.attempted) >= every
+	due := e.attempted.IsZero() || now.Sub(e.attempted) >= e.window(p.c.cfg.RefreshEvery)
 	e.mu.Unlock()
 	if !wanted || !due {
 		return

@@ -1062,8 +1062,9 @@ not neutralise it: the string ends there and the rest of the value is lexed as
 rule text, loaded as root. Service names reach comments and interface names
 reach `ifname` matches that way, and interface names were checked for nothing
 but being non-empty. `web.validate` now holds an interface name to the
-kernel's own shape (`ifaceName`: fifteen bytes, letters, digits and the four
-punctuation marks real names carry, not one of the three iproute2 read verbs)
+kernel's own shape (`ifaceName`: fifteen bytes, letters, digits and the five
+punctuation marks real names carry, not one of the iproute2 read verbs, which
+it takes from `sysx.IPReadVerb` rather than from a copy)
 and refuses two paths on one interface, and the generators strip quotes,
 backslashes, control and non-ASCII bytes and cap the length regardless of what
 the blob holds, since a blob saved before the check is exactly what reaches
@@ -1515,7 +1516,14 @@ the CSRF defence, and it stops holding on an older mobile browser, which is
 the lost phone the login is written for, while "same site" includes every
 other port on the portal's address. `crossSite` reads `Sec-Fetch-Site` and
 `Origin`, which browsers send on every POST; failoverctl over the socket and
-curl from a shell send neither and are untouched. Every API response also
+curl from a shell send neither and are untouched. Two shapes the headers
+alone admitted are refused as well, and the second is the one the check
+exists for: `Origin: null` is an opaque origin (a sandboxed iframe, a
+file:// page) and never this portal's own page, and a browser old enough to
+send neither header on a cross-site form POST still sends the form's content
+type, one of the three a form can produce and none of which this API
+accepts. A shell posting JSON without naming its type still passes; one that
+lets curl default to a form type is told why. Every API response also
 carries `Cache-Control: no-store`, because two of them hold secrets.
 
 **The notification target is validated, and alerts go through a client that
@@ -3840,7 +3848,7 @@ where a subtle regression would be invisible in production until an outage:
   reaching the file while the usable entry beside it still does, and - the one
   that guards against the silent failure - nothing usable rendering nothing at
   all rather than a transaction that would flush the set empty. Plus that
-  `CountBlocklistElements` agrees with what the file actually holds, since the
+  `CheckBlocklist`'s element count agrees with what the file actually holds, since the
   portal reports that figure and `len()` is not it.
 - `engine/blocklist_test.go` - the feed: a netset parses with comments, blanks
   and bare addresses widened to /32; one bad line fails the whole file with

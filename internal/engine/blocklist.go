@@ -166,14 +166,12 @@ func (e *Engine) loadBlocklistCache() {
 	// and boot is the one moment it is installed without a fetch. Starting
 	// with no list is the refusal's meaning here: the refresher fetches
 	// within the minute and judges the feed's copy the same way.
-	count, err := sysx.CheckBlocklist(c.Networks)
-	if err != nil {
+	if err := e.rememberBlocklist(c.Networks); err != nil {
 		e.log.Error("the cached blocklist is refused and will not be installed; the feed will be fetched again",
 			"err", err, "networks", len(c.Networks))
 		return
 	}
 	e.mu.Lock()
-	e.blNetworks, e.blCount = c.Networks, count
 	// The list is kept whatever served it, because an old list beats none and
 	// that is this feature's rule everywhere else. The age and the ETag are
 	// not: both describe a conversation with one particular host. Carried
@@ -198,25 +196,35 @@ func (e *Engine) loadBlocklistCache() {
 	e.mu.Unlock()
 }
 
-// rememberBlocklist records a new list together with the number of networks
-// that will really be loaded from it.
+// rememberBlocklist judges a new list by the prefix floor and the coverage
+// ceiling and, if it passes, records it together with the merged elements
+// that will really be loaded from it. It is the one writer of that pair, in
+// production and in the tests, so a list nothing here would accept cannot be
+// seeded past the check: the cache at boot, the feed on a refresh and a test
+// fixture all arrive through the same door. On a refusal nothing is changed.
 //
-// The count is stored rather than derived on demand because Status is polled
-// once a second and holds the state lock while it renders: deriving it there
-// meant parsing, filtering and sorting several thousand networks under that
-// lock, every second, for a number that changes a few times a day.
+// The elements are stored rather than derived on demand because Status is
+// polled once a second and holds the state lock while it renders: deriving
+// the count there meant parsing, filtering and sorting several thousand
+// networks under that lock, every second, for a number that changes a few
+// times a day. And they are stored rather than re-derived at load time
+// because the merge is the expensive half of accepting a feed.
 //
-// It takes the lock itself, after the count, and that is the same reasoning
-// from the other side: the count is the whole parse, filter and merge over
+// It takes the lock itself, after the check, and that is the same reasoning
+// from the other side: the check is the whole parse, filter and merge over
 // up to two hundred thousand entries, and held under the write lock it
 // stalled the decision loop, every probe result and every status request
 // for the duration - strictly worse than the read lock Status used to hold.
 // The caller must not hold e.mu.
-func (e *Engine) rememberBlocklist(nets []string) {
-	count := sysx.CountBlocklistElements(nets)
+func (e *Engine) rememberBlocklist(nets []string) error {
+	elems, err := sysx.CheckBlocklist(nets)
+	if err != nil {
+		return err
+	}
 	e.mu.Lock()
-	e.blNetworks, e.blCount = nets, count
+	e.blNetworks, e.blElems, e.blCount = nets, elems, len(elems)
 	e.mu.Unlock()
+	return nil
 }
 
 // saveBlocklistCache writes the last good list, whole or not at all.
@@ -401,10 +409,8 @@ func (e *Engine) refreshBlocklist(ctx context.Context) {
 	// loaded. The floor is a whole-or-nothing failure like a bad line, since
 	// no honest feed produces a survivor that short; the ceiling is a state
 	// like the shrink guard, since a feed that has absorbed too much serves
-	// the same list until somebody looks. Both keep the loaded list. The
-	// count is what rememberBlocklist would compute again, handed on.
-	count, err := sysx.CheckBlocklist(networks)
-	if err != nil {
+	// the same list until somebody looks. Both keep the loaded list.
+	if err := e.rememberBlocklist(networks); err != nil {
 		if errors.Is(err, sysx.ErrBlocklistCoverage) {
 			e.refuseBlocklist(now, len(networks), previous,
 				"refused: "+err.Error(),
@@ -423,7 +429,6 @@ func (e *Engine) refreshBlocklist(ctx context.Context) {
 	// because nothing reads the two together except Status, which renders
 	// either truthfully.
 	e.mu.Lock()
-	e.blNetworks, e.blCount = networks, count
 	e.blUpdated, e.blLastTry, e.blLastErr = now, now, ""
 	e.blEtag = newEtag
 	e.blRefused = false
@@ -709,13 +714,13 @@ func (e *Engine) forgetBlocklistTable() {
 func (e *Engine) loadBlocklistElements(ctx context.Context, gated sysx.Runner) {
 	e.mu.RLock()
 	on := e.blOn
-	nets := e.blNetworks
+	nets, elems := e.blNetworks, e.blElems
 	e.mu.RUnlock()
 	if !on || !gated.Applying() || len(nets) == 0 {
 		e.forgetBlocklistLoadFailure()
 		return
 	}
-	elements := sysx.BuildBlocklistElements(nets)
+	elements := sysx.RenderBlocklistElements(elems)
 	if elements == "" {
 		// Nothing survived the parse and the merge. A fault, not an
 		// instruction: the set keeps whatever it holds. The list came

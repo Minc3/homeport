@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/quinlan102/homeport/internal/model"
@@ -151,13 +152,25 @@ func BuildBlocklistRuleset(spec BlocklistSpec) string {
 // is better than none. Emptying the set deliberately is what rebuilding the
 // table does.
 func BuildBlocklistElements(networks []string) string {
-	// The same treatment the operator's own lists get, for a list that has
-	// had far less scrutiny: every element re-parsed and re-rendered, so no
-	// unexamined byte from a third party's file reaches something nft loads
-	// as root, and merged because the feed aggregates several sources whose
-	// networks routinely nest - one contained duplicate and nft refuses the
-	// whole transaction.
-	elems := mergeCIDRs(dropNonInternet(EgressNetworks(networks)))
+	return RenderBlocklistElements(blocklistElements(networks))
+}
+
+// blocklistElements is the parse, filter and merge every blocklist load goes
+// through: the same treatment the operator's own lists get, for a list that
+// has had far less scrutiny. Every element is re-parsed and re-rendered, so
+// no unexamined byte from a third party's file reaches something nft loads
+// as root, and merged because the feed aggregates several sources whose
+// networks routinely nest: one contained duplicate and nft refuses the whole
+// transaction.
+func blocklistElements(networks []string) []string {
+	return mergeCIDRs(dropNonInternet(EgressNetworks(networks)))
+}
+
+// RenderBlocklistElements renders elements CheckBlocklist has already
+// produced, so a list is parsed and merged once per accept rather than once
+// to judge it and again to load it: on the level1 feed that is two hundred
+// thousand entries sorted twice, at boot and under blMu on every refresh.
+func RenderBlocklistElements(elems []string) string {
 	if len(elems) == 0 {
 		return ""
 	}
@@ -169,14 +182,6 @@ func BuildBlocklistElements(networks []string) string {
 	fmt.Fprintf(&b, "add element ip %s %s {\n\t\t\t%s\n}\n",
 		NFTBlocklistTable, BlocklistFeedSet, geoElements(elems))
 	return b.String()
-}
-
-// CountBlocklistElements reports how many networks BuildBlocklistElements
-// would really load, which is not len(networks): the parse drops what nft
-// cannot use and the merge collapses what nests. The portal reports the
-// loaded figure, so it has to come from the same arithmetic.
-func CountBlocklistElements(networks []string) int {
-	return len(mergeCIDRs(dropNonInternet(EgressNetworks(networks))))
 }
 
 // BlocklistMinPrefix and BlocklistMaxCoverage bound what a feed can take
@@ -214,30 +219,33 @@ const (
 var ErrBlocklistCoverage = errors.New("blocklist covers too much address space")
 
 // CheckBlocklist applies the prefix floor and the coverage ceiling to what
-// BuildBlocklistElements would load from networks, and reports the loaded
-// count on success. The count is the same arithmetic CountBlocklistElements
-// does, handed back so a caller does not merge two hundred thousand entries
-// twice.
-func CheckBlocklist(networks []string) (int, error) {
-	elems := mergeCIDRs(dropNonInternet(EgressNetworks(networks)))
+// would be loaded from networks, and hands back the merged elements on
+// success. Their count is the loaded figure the portal reports, which is not
+// len(networks): the parse drops what nft cannot use and the merge collapses
+// what nests. The elements are returned rather than the count alone so the
+// caller renders from them (RenderBlocklistElements) instead of merging the
+// same list a second time.
+func CheckBlocklist(networks []string) ([]string, error) {
+	elems := blocklistElements(networks)
 	var covered uint64
 	for _, c := range elems {
-		_, n, err := net.ParseCIDR(c)
-		if err != nil {
-			continue // mergeCIDRs only emits what parsed
+		// mergeCIDRs emits net.IPNet.String(), so the prefix length is the
+		// figure after the slash and needs no second parse.
+		ones, err := strconv.Atoi(c[strings.LastIndexByte(c, '/')+1:])
+		if err != nil || ones < 0 || ones > 32 {
+			continue
 		}
-		ones, bits := n.Mask.Size()
 		if ones < BlocklistMinPrefix {
-			return 0, fmt.Errorf("network %s is shorter than /%d; no honest feed lists a block that size",
+			return nil, fmt.Errorf("network %s is shorter than /%d; no honest feed lists a block that size",
 				c, BlocklistMinPrefix)
 		}
-		covered += uint64(1) << uint(bits-ones)
+		covered += uint64(1) << uint(32-ones)
 	}
 	if covered > BlocklistMaxCoverage {
-		return 0, fmt.Errorf("%w: %d addresses, more than the %d this is willing to drop from",
+		return nil, fmt.Errorf("%w: %d addresses, more than the %d this is willing to drop from",
 			ErrBlocklistCoverage, covered, BlocklistMaxCoverage)
 	}
-	return len(elems), nil
+	return elems, nil
 }
 
 // dropNonInternet removes feed entries that overlap space no legitimate

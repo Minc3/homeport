@@ -52,13 +52,7 @@ func run(log *slog.Logger, cfgPath string, revert bool) error {
 	if err != nil {
 		return err
 	}
-	// Error rather than Warn: these are the shared secret being weak or
-	// readable, and a line an operator learns to skip is a line that was never
-	// written. Not fatal, because refusing to start is an outage on the host
-	// that may be the only thing keeping traffic flowing.
-	for _, w := range boot.Warnings {
-		log.Error("bootstrap config", "warning", w)
-	}
+	boot.LogWarnings(log)
 	// A frontend or backend config here would start an agent that installs a
 	// rule for an address this host does not hold, which is a quiet way to do
 	// nothing at all.

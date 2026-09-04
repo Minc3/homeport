@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"runtime"
@@ -48,6 +49,19 @@ type Bootstrap struct {
 	// thing keeping traffic flowing, and a refusal on a restart is an outage.
 	// The agents log them at Error so they are not ignorable.
 	Warnings []string `json:"-"`
+}
+
+// LogWarnings writes what LoadBootstrap reported, and it is the one place
+// that decides how: at Error rather than Warn, because these are the shared
+// secret being weak or readable, and a line an operator learns to skip is a
+// line that was never written. Not fatal, because refusing to start is an
+// outage on a host that may be the only thing keeping traffic flowing. All
+// three agents call it, so the decision cannot be made differently on the
+// host whose first hop is plaintext LAN.
+func (b Bootstrap) LogWarnings(log *slog.Logger) {
+	for _, w := range b.Warnings {
+		log.Error("bootstrap config", "warning", w)
+	}
 }
 
 // PSKPlaceholder is the value the example bootstrap files ship with. A file

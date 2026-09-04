@@ -152,9 +152,22 @@ func TestCrossSiteStateChangesAreRefused(t *testing.T) {
 	if code := try(map[string]string{"Origin": "http://10.98.0.2:9999"}); code != http.StatusForbidden {
 		t.Errorf("same-site other-port POST answered %d, want 403", code)
 	}
+	// An opaque origin is a sandboxed iframe or a file:// page, never this
+	// portal's own page.
+	if code := try(map[string]string{"Origin": "null"}); code != http.StatusForbidden {
+		t.Errorf("Origin: null POST answered %d, want 403", code)
+	}
+	// A browser too old to send either header still sends its form's content
+	// type, and no form type is anything this API accepts.
+	for _, ct := range []string{"application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "text/plain"} {
+		if code := try(map[string]string{"Content-Type": ct}); code != http.StatusForbidden {
+			t.Errorf("headerless form POST (%s) answered %d, want 403", ct, code)
+		}
+	}
 	for name, h := range map[string]map[string]string{
 		"same origin": {"Sec-Fetch-Site": "same-origin", "Origin": "http://10.98.0.2:8088"},
 		"no browser":  {},
+		"shell json":  {"Content-Type": "application/json"},
 	} {
 		if code := try(h); code == http.StatusForbidden {
 			t.Errorf("%s POST was refused as cross-site", name)

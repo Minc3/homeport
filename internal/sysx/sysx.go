@@ -159,7 +159,7 @@ func isReadOnly(name string, args []string) bool {
 		// the one direction observe mode must never fail in, and an
 		// interface name is operator text.
 		verb := ipVerb(args)
-		return verb == "show" || verb == "get" || verb == "list" || verb == ""
+		return verb == "" || IPReadVerb(verb)
 	case "nft":
 		// The verb, skipping the output flags: `-a` for handles and `-j` for
 		// JSON both come before it, and testing args[0] alone read the flag.
@@ -168,6 +168,16 @@ func isReadOnly(name string, args []string) bool {
 		return args[0] == "-n" // -w is the write form
 	}
 	return false
+}
+
+// IPReadVerb reports whether word is one of the ip/tc command words the
+// observe-mode gate reads as a query. It is exported for web.validate, which
+// refuses an interface by any of these names: the gate reads its verb by
+// position, so such a name no longer turns a mutation into a read, but a
+// name that is also a command word is a name waiting for the next scan, and
+// the list the refusal keys on has to be this one rather than a copy.
+func IPReadVerb(word string) bool {
+	return word == "show" || word == "get" || word == "list"
 }
 
 // ipVerb returns the command word of an `ip` or `tc` invocation: the token

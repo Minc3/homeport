@@ -1443,9 +1443,9 @@ func cleanNetworkList(items []string, what string) ([]string, error) {
 // key, all as root, and used to be checked only for being non-empty.
 //
 // The kernel's own rule is 1 to 15 bytes with no slash, whitespace or
-// control character. This is narrower, ASCII letters, digits and the four
+// control character. This is narrower, ASCII letters, digits and the five
 // punctuation marks real names carry (a VLAN's dot, macvlan's @, a bond's
-// hyphen, an alias's colon), because nothing here needs the rest and the
+// hyphen, an alias's colon, systemd's underscore), because nothing here needs the rest and the
 // generators are cheaper to reason about without it. The three iproute2
 // read verbs are refused too: the observe-mode gate reads its verb by
 // position now, so a tunnel called `list` no longer turns a route replace
@@ -1467,8 +1467,7 @@ func ifaceName(name string) error {
 			return fmt.Errorf("interface name %q may only contain letters, digits, '-', '_', '.', ':' and '@'", name)
 		}
 	}
-	switch name {
-	case "show", "get", "list":
+	if sysx.IPReadVerb(name) {
 		return fmt.Errorf("interface name %q is an ip/tc command word; give the interface another name", name)
 	}
 	return nil

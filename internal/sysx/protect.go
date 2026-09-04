@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -1182,9 +1183,12 @@ func ProtectState(ctx context.Context, r Runner) ([]model.ProtectCounter, []mode
 	// seconds: the whole list was held by the engine and serialised into
 	// every status poll, a multi-megabyte body per second per viewer, while
 	// the engine was deciding failovers. The portal showed twenty of them.
+	// Cloned rather than resliced: a reslice keeps the whole parsed array
+	// and every address string in it reachable for as long as the engine
+	// holds the sample, which is the memory the bound exists to release.
 	total := len(blocked)
 	if total > maxBlockedReported {
-		blocked = blocked[:maxBlockedReported]
+		blocked = slices.Clone(blocked[:maxBlockedReported])
 	}
 	return counters, blocked, total, locked, nil
 }

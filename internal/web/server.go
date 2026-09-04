@@ -294,13 +294,31 @@ func (s *Server) requireAuth(trusted bool, h http.HandlerFunc) http.Handler {
 // every POST, and a request from neither a browser nor the same origin
 // (failoverctl over the socket, curl from a shell) carries neither header,
 // so nothing that is not a browser is affected.
+//
+// Two shapes the headers alone would admit are refused as well. `Origin:
+// null` is what a browser sends from an opaque origin, a sandboxed iframe or
+// a file:// page, and it is never what this portal's own page sends. And a
+// browser old enough to send neither header on a cross-site form POST, which
+// is the browser this check exists for, still sends the form's content type:
+// one of the three a form can produce, none of which this API accepts. A
+// shell that posts JSON without naming the type is untouched; one that lets
+// curl default to a form type is told why.
 func crossSite(r *http.Request) bool {
 	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
 		return true
 	}
-	if origin := r.Header.Get("Origin"); origin != "" && origin != "null" {
+	if origin := r.Header.Get("Origin"); origin != "" {
+		if origin == "null" {
+			return true
+		}
 		u, err := url.Parse(origin)
 		if err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return true
+		}
+	}
+	ct := strings.ToLower(r.Header.Get("Content-Type"))
+	for _, form := range []string{"application/x-www-form-urlencoded", "multipart/form-data", "text/plain"} {
+		if strings.HasPrefix(ct, form) {
 			return true
 		}
 	}

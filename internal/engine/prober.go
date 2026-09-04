@@ -2,8 +2,6 @@ package engine
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"net"
@@ -92,9 +90,9 @@ const seqSeedBits = 62
 // within its granularity - a settings save landing beside a mode change - draw
 // the same number.
 func seedSeq() uint64 {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return binary.BigEndian.Uint64(b[:]) & (1<<seqSeedBits - 1)
+	// The same source the nonce comes from, so there is one place that
+	// decides what a failed random read means.
+	return proto.NewNonce() & (1<<seqSeedBits - 1)
 }
 
 // NewProber builds a prober for one path.

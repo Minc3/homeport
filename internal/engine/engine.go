@@ -270,10 +270,13 @@ type Engine struct {
 	// sampleBlocklistCounter is what corrects the record in both directions
 	// from the kernel itself.
 	blNetworks []string
-	// blCount is how many of them will really be loaded, kept beside the list
-	// rather than derived on demand: Status is polled once a second and holds
-	// the state lock while it renders, and the two figures differ because the
-	// feed aggregates sources whose networks nest.
+	// blElems is what will really be loaded from it: the list parsed, filtered
+	// and merged, kept beside the raw list rather than derived on demand
+	// because the merge is the expensive half of accepting a feed and Status
+	// holds the state lock while it renders. blCount is len(blElems), which
+	// differs from len(blNetworks) because the feed aggregates sources whose
+	// networks nest. rememberBlocklist is the one writer of all three.
+	blElems   []string
 	blCount   int
 	blUpdated time.Time
 	blEtag    string
