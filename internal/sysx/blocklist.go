@@ -3,6 +3,7 @@ package sysx
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -206,6 +207,12 @@ const (
 	BlocklistMaxCoverage = uint64(1) << 27
 )
 
+// ErrBlocklistCoverage is wrapped by CheckBlocklist when the merged list
+// covers more than BlocklistMaxCoverage, so a caller can tell the ceiling,
+// which is a state the feed will keep serving, from the prefix floor, which
+// is a bad line.
+var ErrBlocklistCoverage = errors.New("blocklist covers too much address space")
+
 // CheckBlocklist applies the prefix floor and the coverage ceiling to what
 // BuildBlocklistElements would load from networks, and reports the loaded
 // count on success. The count is the same arithmetic CountBlocklistElements
@@ -227,8 +234,8 @@ func CheckBlocklist(networks []string) (int, error) {
 		covered += uint64(1) << uint(bits-ones)
 	}
 	if covered > BlocklistMaxCoverage {
-		return 0, fmt.Errorf("the list covers %d addresses, more than the %d this is willing to drop from",
-			covered, BlocklistMaxCoverage)
+		return 0, fmt.Errorf("%w: %d addresses, more than the %d this is willing to drop from",
+			ErrBlocklistCoverage, covered, BlocklistMaxCoverage)
 	}
 	return len(elems), nil
 }

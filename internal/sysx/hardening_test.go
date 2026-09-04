@@ -69,6 +69,17 @@ func TestTwoPathsOnOneInterfaceRenderItOnce(t *testing.T) {
 	if !strings.Contains(rs, want) {
 		t.Fatalf("clamp set not deduplicated; want %s in:\n%s", want, rs)
 	}
+	// The backend renders the list the frontend pushed, so its two sets are
+	// deduplicated too.
+	dup := []string{"wg-main", "wg-lte1", "wg-main"}
+	for name, rs := range map[string]string{
+		"return": BuildReturnRuleset(dup),
+		"egress": BuildBackendEgressRuleset([]string{"172.18.0.0/16"}, dup, "10.99.0.2"),
+	} {
+		if strings.Contains(rs, `"wg-main", "wg-lte1", "wg-main"`) {
+			t.Fatalf("%s ruleset repeats an interface in a set:\n%s", name, rs)
+		}
+	}
 }
 
 // The dotted sysctl key splits on every dot, so a VLAN sub-interface's

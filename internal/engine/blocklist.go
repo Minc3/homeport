@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -165,13 +166,14 @@ func (e *Engine) loadBlocklistCache() {
 	// and boot is the one moment it is installed without a fetch. Starting
 	// with no list is the refusal's meaning here: the refresher fetches
 	// within the minute and judges the feed's copy the same way.
-	if _, err := sysx.CheckBlocklist(c.Networks); err != nil {
+	count, err := sysx.CheckBlocklist(c.Networks)
+	if err != nil {
 		e.log.Error("the cached blocklist is refused and will not be installed; the feed will be fetched again",
 			"err", err, "networks", len(c.Networks))
 		return
 	}
-	e.rememberBlocklist(c.Networks)
 	e.mu.Lock()
+	e.blNetworks, e.blCount = c.Networks, count
 	// The list is kept whatever served it, because an old list beats none and
 	// that is this feature's rule everywhere else. The age and the ETag are
 	// not: both describe a conversation with one particular host. Carried
@@ -403,7 +405,7 @@ func (e *Engine) refreshBlocklist(ctx context.Context) {
 	// count is what rememberBlocklist would compute again, handed on.
 	count, err := sysx.CheckBlocklist(networks)
 	if err != nil {
-		if strings.Contains(err.Error(), "covers") {
+		if errors.Is(err, sysx.ErrBlocklistCoverage) {
 			e.refuseBlocklist(now, len(networks), previous,
 				"refused: "+err.Error(),
 				"the blocklist feed covers too much of the internet; the previous list stays loaded")

@@ -4212,6 +4212,48 @@ where a subtle regression would be invisible in production until an outage:
   rather than UTC, which would draw the billing boundary ten hours from where
   the carrier draws it.
 
+- `sysx/hardening_test.go` - the generator boundary: a quote, backslash,
+  newline and semicolon in a service or interface name never leave a quoted
+  token, a clean name is not moved by a byte; two paths on one interface
+  render one set element on both hosts; a dotted interface name keeps its
+  whole name in the sysctl key; the parked-source readback is bounded with
+  the total beside it; and command output past the cap fails the read.
+  Beside it in `route_test.go`, the positional verb: `dev list` and `dev
+  show` are mutations, `ip route get` and `ip -o addr show dev get` are
+  reads. And in `shape_test.go`, a CAKE without this agent's signature is
+  left alone by a zero rate and replaced by a configured one.
+- `sysx/blocklist_test.go` and `engine/blocklist_test.go` also hold the
+  prefix floor and the coverage ceiling: a `/3` beside good entries refuses
+  the whole list with the entry named while the honest feed's `224.0.0.0/4`
+  and `10.0.0.0/8` are stripped rather than refused, a `/8` exactly passes,
+  coverage at 2^27 passes and one more `/8` does not, a coverage refusal is
+  a state (one event per streak, retried at the refresh interval, ended by an
+  accepted list), and a cached list that would be refused is not installed
+  at boot.
+- `qcache/pace_test.go` - a verified source is paced by reply bytes and
+  refused past its burst, a reply the bucket cannot cover is dropped whole
+  rather than sent in part, budgets are per source and refill exactly when
+  they cover the reply, the table is bounded and pruned, and RULES is polled
+  at a fraction of the INFO cadence while staying served across its longer
+  window.
+- `engine/prober_replay_test.go` - a reply with the wrong nonce, another
+  path id, or captured from a previous generation on the same sequence is
+  not resolved, an honest one still is, each generation seeds its own
+  sequence, and a seeded sequence still delivers results in order.
+- `engine/pin_test.go` - a pin to an over-quota or disabled path is refused
+  naming the button that does the job, and a pin to a down path is honoured
+  as held.
+- `web/hardening_test.go` - interface names are held to the kernel's rules
+  and cannot be shared by two paths, the notify target is bounded and the
+  shipped configuration still saves, an unbounded approval is refused, a
+  cross-site state change is refused while same-origin and headerless
+  requests pass, API bodies are `no-store`, concurrent logins are bounded
+  and a burst is counted before any hash finishes, and an unknown account
+  costs a hash. `notify/notify_test.go` holds that a redirect is not
+  followed. `model/bootstrap_test.go` holds the placeholder refusal, the
+  short-secret and readable-file warnings, and that the example still
+  loads with the placeholder substituted.
+
 When you add behaviour to the selector or the trackers, add a test that states
 the *reason* in its name and comment. The existing ones do; that is how the
 next agent learns which behaviours are deliberate.

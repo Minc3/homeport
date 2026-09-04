@@ -156,15 +156,27 @@ func serviceScope(cfg model.Config) string {
 // service down over a save that validated.
 func pathIfaces(cfg model.Config) []string {
 	ifaces := make([]string, 0, len(cfg.Paths))
-	seen := map[string]bool{}
 	for _, p := range cfg.Paths {
-		if seen[p.Iface] {
-			continue
-		}
-		seen[p.Iface] = true
 		ifaces = append(ifaces, p.Iface)
 	}
-	return ifaces
+	return uniqueIfaces(ifaces)
+}
+
+// uniqueIfaces drops repeats, first occurrence kept. Every anonymous set of
+// interface names here goes through it, on the backend as on the frontend,
+// because the backend renders the list the frontend pushed and a blob saved
+// before the validate refusal can still carry two paths on one tunnel.
+func uniqueIfaces(ifaces []string) []string {
+	out := make([]string, 0, len(ifaces))
+	seen := map[string]bool{}
+	for _, i := range ifaces {
+		if seen[i] {
+			continue
+		}
+		seen[i] = true
+		out = append(out, i)
+	}
+	return out
 }
 
 // nftSafe is what every operator-supplied string goes through before it is
@@ -223,6 +235,7 @@ const nftMaxString = 120
 // originates on its own address already sizes itself from the route. Only
 // where there are tunnels to leave by, which is every site.
 func writeMSSClamp(b *strings.Builder, ifaces []string) {
+	ifaces = uniqueIfaces(ifaces)
 	if len(ifaces) == 0 {
 		return
 	}
@@ -355,6 +368,7 @@ func BuildBackendEgressRuleset(cidrs, ifaces []string, overlayIP string) string 
 		return ""
 	}
 	set := func(items []string) string {
+		items = uniqueIfaces(items)
 		quoted := make([]string, 0, len(items))
 		for _, i := range items {
 			quoted = append(quoted, fmt.Sprintf("%q", nftSafe(i)))
@@ -488,7 +502,7 @@ func BuildReturnRuleset(ifaces []string) string {
 
 	if len(ifaces) > 0 {
 		quoted := make([]string, 0, len(ifaces))
-		for _, i := range ifaces {
+		for _, i := range uniqueIfaces(ifaces) {
 			quoted = append(quoted, fmt.Sprintf("%q", nftSafe(i)))
 		}
 		// `ct direction original` is load-bearing, not decoration. Without it
